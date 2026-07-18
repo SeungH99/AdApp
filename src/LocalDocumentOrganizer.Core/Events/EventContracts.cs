@@ -176,6 +176,12 @@ public sealed record ConcurrencyConflict(
     StreamVersion ExpectedVersion,
     StreamVersion ActualVersion) : AppendEventsResult;
 
+public sealed record AlreadyApplied(StreamVersion ExistingVersion) : AppendEventsResult;
+
+public sealed record OperationConflict(OperationId OperationId) : AppendEventsResult;
+
+public sealed record OperationComparisonUnavailable(OperationId OperationId) : AppendEventsResult;
+
 public sealed record StorageBusy : AppendEventsResult;
 
 public interface IEventStore

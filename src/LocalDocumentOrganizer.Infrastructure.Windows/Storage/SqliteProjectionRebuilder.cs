@@ -1,5 +1,6 @@
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
+using LocalDocumentOrganizer.Infrastructure.Windows.Crypto;
 using Microsoft.Data.Sqlite;
 using System.Globalization;
 
@@ -12,20 +13,33 @@ internal sealed class SqliteProjectionRebuilder
     private readonly string _connectionString;
     private readonly EventSchemaRegistry _schemaRegistry;
     private readonly IReadOnlyList<ISqliteProjection> _projections;
+    private readonly SqliteEventPayloadProtectionProvider _payloads;
 
     public SqliteProjectionRebuilder(
         string connectionString,
         EventSchemaRegistry schemaRegistry,
-        IReadOnlyList<ISqliteProjection> projections)
+        IReadOnlyList<ISqliteProjection> projections,
+        SqliteEventPayloadProtectionProvider payloads)
     {
         _connectionString = connectionString;
         _schemaRegistry = schemaRegistry;
         _projections = projections;
+        _payloads = payloads;
     }
 
     public async Task<ProjectionRebuildResult> RebuildAsync(
         CancellationToken cancellationToken)
     {
+        await using var lease = await _payloads.KeyRing.MaintenanceGate.AcquireAsync(cancellationToken);
+        try
+        {
+            await _payloads.ValidateKeyRingAsync(cancellationToken);
+        }
+        catch (VaultKeyRingException exception)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
+
         SqliteConnection? connection = null;
         SqliteTransaction? transaction = null;
         try
@@ -34,6 +48,7 @@ internal sealed class SqliteProjectionRebuilder
                 _connectionString,
                 cancellationToken);
             transaction = connection.BeginTransaction(deferred: false);
+            await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
 
             foreach (var projection in _projections)
             {
@@ -63,8 +78,11 @@ internal sealed class SqliteProjectionRebuilder
 
                 foreach (var rawEvent in batch)
                 {
-                    ValidateAndAdvanceHead(streamHeads, rawEvent.StoredEvent);
-                    var currentEvent = Upcast(rawEvent.StoredEvent, rawEvent.OperationId);
+                    ValidateAndAdvanceHead(streamHeads, rawEvent.Persisted.Metadata);
+                    var replayEvent = await _payloads.UnprotectAsync(rawEvent.Persisted, cancellationToken);
+                    if (replayEvent is ShreddedEvent) throw new ShreddedProjectionReplayNotSupportedException();
+
+                    var currentEvent = _schemaRegistry.UpcastToCurrent((DecryptedEvent)replayEvent);
                     foreach (var projection in _projections)
                     {
                         await projection.ApplyAsync(
@@ -144,33 +162,9 @@ internal sealed class SqliteProjectionRebuilder
         }
     }
 
-    private StoredEvent Upcast(StoredEvent rawEvent, OperationId operationId)
-    {
-        var currentEvent = _schemaRegistry.UpcastToCurrent(new DecryptedEvent(
-            new EventMetadata(
-                rawEvent.StreamId,
-                rawEvent.StreamVersion,
-                rawEvent.EventId,
-                rawEvent.EventType,
-                rawEvent.SchemaVersion,
-                rawEvent.RecordedAtUtc,
-                operationId,
-                null,
-                0),
-            rawEvent.Payload));
-        return new StoredEvent(
-            currentEvent.Metadata.StreamId,
-            currentEvent.Metadata.StreamVersion,
-            currentEvent.Metadata.EventId,
-            currentEvent.Metadata.EventType,
-            currentEvent.Metadata.SchemaVersion,
-            currentEvent.Payload,
-            currentEvent.Metadata.RecordedAtUtc);
-    }
-
     private static void ValidateAndAdvanceHead(
         IDictionary<StreamId, StreamVersion> streamHeads,
-        StoredEvent storedEvent)
+        EventMetadata storedEvent)
     {
         var expectedVersion = streamHeads.TryGetValue(storedEvent.StreamId, out var head)
             ? head.Next()
@@ -195,9 +189,10 @@ internal sealed class SqliteProjectionRebuilder
         command.Transaction = transaction;
         command.CommandText = """
             SELECT e.global_position, e.stream_id, e.stream_version, e.event_id, e.event_type,
-                   e.schema_version, e.payload_json, e.recorded_at_utc, m.operation_id
+                   e.schema_version, e.recorded_at_utc, e.operation_id, e.protection_kind,
+                   e.owner_kind, e.owner_id, e.key_id, e.envelope_version, e.payload_nonce,
+                   e.payload_ciphertext, e.payload_tag
             FROM timeline_events e
-            LEFT JOIN event_operation_ids m ON m.event_id = e.event_id
             WHERE e.global_position > $after_global_position
             ORDER BY e.global_position ASC
             LIMIT $batch_size;
@@ -209,23 +204,9 @@ internal sealed class SqliteProjectionRebuilder
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
-            var eventId = new EventId(Guid.Parse(reader.GetString(3)));
             batch.Add(new RawTimelineEvent(
                 reader.GetInt64(0),
-                new StoredEvent(
-                    new StreamId(Guid.Parse(reader.GetString(1))),
-                    new StreamVersion(reader.GetInt64(2)),
-                    eventId,
-                    reader.GetString(4),
-                    reader.GetInt32(5),
-                    reader.GetFieldValue<byte[]>(6),
-                    DateTimeOffset.Parse(
-                        reader.GetString(7),
-                        CultureInfo.InvariantCulture,
-                        DateTimeStyles.RoundtripKind)),
-                reader.IsDBNull(8)
-                    ? new OperationId(eventId.Value)
-                    : new OperationId(Guid.Parse(reader.GetString(8)))));
+                ReadPersistedForRebuild(reader)));
         }
 
         return batch;
@@ -301,8 +282,25 @@ internal sealed class SqliteProjectionRebuilder
         }
     }
 
-    private sealed record RawTimelineEvent(
-        long GlobalPosition,
-        StoredEvent StoredEvent,
-        OperationId OperationId);
+    private static PersistedProtectedEvent ReadPersistedForRebuild(SqliteDataReader reader)
+    {
+        var stream = new StreamId(SqliteEventStore.ParseCanonicalGuid(reader.GetString(1)));
+        var metadata = new EventMetadata(
+            stream, new StreamVersion(reader.GetInt64(2)), new EventId(SqliteEventStore.ParseCanonicalGuid(reader.GetString(3))),
+            reader.GetString(4), reader.GetInt32(5),
+            DateTimeOffset.Parse(reader.GetString(6), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind).ToUniversalTime(),
+            new OperationId(SqliteEventStore.ParseCanonicalGuid(reader.GetString(7))),
+            reader.IsDBNull(11) ? null : new DataKeyId(SqliteEventStore.ParseCanonicalGuid(reader.GetString(11))), reader.GetInt32(12));
+        var kind = reader.GetInt32(8) switch { 0 => PersistedProtectionKind.Structural, 1 => PersistedProtectionKind.Shreddable, _ => throw new VaultRecoveryRequiredException() };
+        SensitiveObjectRef? owner = kind == PersistedProtectionKind.Structural ? null : new SensitiveObjectRef((SensitiveObjectKind)reader.GetInt32(9), new SensitiveObjectId(SqliteEventStore.ParseCanonicalGuid(reader.GetString(10))));
+        return new PersistedProtectedEvent(metadata, kind, owner, reader.IsDBNull(13) ? null : reader.GetFieldValue<byte[]>(13), reader.GetFieldValue<byte[]>(14), reader.IsDBNull(15) ? null : reader.GetFieldValue<byte[]>(15));
+    }
+
+    private sealed record RawTimelineEvent(long GlobalPosition, PersistedProtectedEvent Persisted);
+}
+
+public sealed class ShreddedProjectionReplayNotSupportedException : InvalidOperationException
+{
+    public ShreddedProjectionReplayNotSupportedException()
+        : base("Projection replay requires shredded-event handling.") { }
 }

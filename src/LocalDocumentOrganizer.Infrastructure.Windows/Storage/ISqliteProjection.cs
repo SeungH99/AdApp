@@ -13,7 +13,7 @@ public interface ISqliteProjection
         CancellationToken cancellationToken);
 
     Task ApplyAsync(
-        StoredEvent storedEvent,
+        DecryptedEvent decryptedEvent,
         long globalPosition,
         SqliteConnection connection,
         SqliteTransaction transaction,
