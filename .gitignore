@@ -18,4 +18,9 @@ log.md
 index.md
 .gstack/
 *.md
+!.gitlab/
+!.gitlab/issue_templates/
+!.gitlab/issue_templates/*.md
+!.gitlab/merge_request_templates/
+!.gitlab/merge_request_templates/*.md
 .context/
