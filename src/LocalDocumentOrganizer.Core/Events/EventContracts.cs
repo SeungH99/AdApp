@@ -54,6 +54,8 @@ public readonly record struct StreamVersion
 
 public sealed record EventToAppend
 {
+    private readonly byte[] _payload;
+
     public EventToAppend(
         EventId eventId,
         string eventType,
@@ -67,7 +69,7 @@ public sealed record EventToAppend
         EventId = eventId;
         EventType = eventType;
         SchemaVersion = schemaVersion;
-        Payload = payload.ToArray();
+        _payload = payload.ToArray();
     }
 
     public EventId EventId { get; }
@@ -76,11 +78,13 @@ public sealed record EventToAppend
 
     public int SchemaVersion { get; }
 
-    public ReadOnlyMemory<byte> Payload { get; }
+    public ReadOnlyMemory<byte> Payload => _payload.ToArray();
 }
 
 public sealed record StoredEvent
 {
+    private readonly byte[] _payload;
+
     public StoredEvent(
         StreamId streamId,
         StreamVersion streamVersion,
@@ -100,7 +104,7 @@ public sealed record StoredEvent
         EventId = eventId;
         EventType = eventType;
         SchemaVersion = schemaVersion;
-        Payload = payload.ToArray();
+        _payload = payload.ToArray();
         RecordedAtUtc = recordedAtUtc.ToUniversalTime();
     }
 
@@ -114,7 +118,7 @@ public sealed record StoredEvent
 
     public int SchemaVersion { get; }
 
-    public ReadOnlyMemory<byte> Payload { get; }
+    public ReadOnlyMemory<byte> Payload => _payload.ToArray();
 
     public DateTimeOffset RecordedAtUtc { get; }
 }
