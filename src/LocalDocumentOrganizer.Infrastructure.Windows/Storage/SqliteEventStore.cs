@@ -117,6 +117,19 @@ public sealed class SqliteEventStore : IEventStore
                 _connectionString, cancellationToken);
             transaction = connection.BeginTransaction(deferred: false);
 
+            var rebuildRequirement =
+                await SqliteProjectionCheckpointStore.FindRebuildRequirementAsync(
+                    connection,
+                    transaction,
+                    _projections,
+                    cancellationToken);
+            if (rebuildRequirement.ProjectionNames.Count != 0)
+            {
+                throw new ProjectionRebuildRequiredException(
+                    rebuildRequirement.ProjectionNames,
+                    rebuildRequirement.RequiredGlobalPosition);
+            }
+
             var newVersion = new StreamVersion(
                 checked(command.ExpectedVersion.Value + command.Events.Count));
             var actualVersion = await ReserveStreamAsync(

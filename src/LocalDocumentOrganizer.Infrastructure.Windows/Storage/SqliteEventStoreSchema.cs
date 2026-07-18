@@ -45,14 +45,6 @@ internal static class SqliteEventStoreSchema
         CancellationToken cancellationToken)
     {
         await using var connection = await OpenConnectionAsync(connectionString, cancellationToken);
-        var version = Convert.ToInt32(
-            await ExecuteScalarAsync(connection, null, "PRAGMA user_version;", cancellationToken));
-        if (version > CurrentVersion)
-        {
-            throw new InvalidOperationException(
-                $"Database schema version {version} is newer than supported version {CurrentVersion}.");
-        }
-
         var builder = new SqliteConnectionStringBuilder(connectionString);
         if (builder.Mode != SqliteOpenMode.Memory &&
             !string.Equals(builder.DataSource, ":memory:", StringComparison.OrdinalIgnoreCase))
@@ -64,6 +56,18 @@ internal static class SqliteEventStoreSchema
         await using var transaction = connection.BeginTransaction(deferred: false);
         try
         {
+            var version = Convert.ToInt32(
+                await ExecuteScalarAsync(
+                    connection,
+                    transaction,
+                    "PRAGMA user_version;",
+                    cancellationToken));
+            if (version > CurrentVersion)
+            {
+                throw new InvalidOperationException(
+                    $"Database schema version {version} is newer than supported version {CurrentVersion}.");
+            }
+
             if (version < CurrentVersion)
             {
                 await ExecuteNonQueryAsync(connection, transaction, VersionOneSql, cancellationToken);
