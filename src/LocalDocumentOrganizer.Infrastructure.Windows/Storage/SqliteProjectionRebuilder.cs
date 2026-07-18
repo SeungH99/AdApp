@@ -1,4 +1,5 @@
 using LocalDocumentOrganizer.Core.Events;
+using LocalDocumentOrganizer.Core.Security;
 using Microsoft.Data.Sqlite;
 using System.Globalization;
 
@@ -143,15 +144,29 @@ internal sealed class SqliteProjectionRebuilder
         }
     }
 
-    private StoredEvent Upcast(StoredEvent rawEvent) =>
-        new(
-            rawEvent.StreamId,
-            rawEvent.StreamVersion,
-            rawEvent.EventId,
-            rawEvent.EventType,
-            _schemaRegistry.GetCurrentVersion(rawEvent.EventType),
-            _schemaRegistry.UpcastToCurrent(rawEvent),
-            rawEvent.RecordedAtUtc);
+    private StoredEvent Upcast(StoredEvent rawEvent)
+    {
+        var currentEvent = _schemaRegistry.UpcastToCurrent(new DecryptedEvent(
+            new EventMetadata(
+                rawEvent.StreamId,
+                rawEvent.StreamVersion,
+                rawEvent.EventId,
+                rawEvent.EventType,
+                rawEvent.SchemaVersion,
+                rawEvent.RecordedAtUtc,
+                new OperationId(rawEvent.EventId.Value),
+                null,
+                0),
+            rawEvent.Payload));
+        return new StoredEvent(
+            currentEvent.Metadata.StreamId,
+            currentEvent.Metadata.StreamVersion,
+            currentEvent.Metadata.EventId,
+            currentEvent.Metadata.EventType,
+            currentEvent.Metadata.SchemaVersion,
+            currentEvent.Payload,
+            currentEvent.Metadata.RecordedAtUtc);
+    }
 
     private static void ValidateAndAdvanceHead(
         IDictionary<StreamId, StreamVersion> streamHeads,

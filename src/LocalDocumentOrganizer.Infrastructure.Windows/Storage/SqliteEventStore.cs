@@ -1,4 +1,5 @@
 using LocalDocumentOrganizer.Core.Events;
+using LocalDocumentOrganizer.Core.Security;
 using Microsoft.Data.Sqlite;
 using System.Globalization;
 
@@ -58,7 +59,7 @@ public sealed class SqliteEventStore : IEventStore
             _schemaRegistry,
             _projections).RebuildAsync(cancellationToken);
 
-    public async Task<IReadOnlyList<StoredEvent>> ReadStreamAsync(
+    public async Task<IReadOnlyList<EventForReplay>> ReadStreamAsync(
         StreamId streamId,
         CancellationToken cancellationToken)
     {
@@ -74,29 +75,26 @@ public sealed class SqliteEventStore : IEventStore
             """;
         command.Parameters.AddWithValue("$stream_id", streamId.Value.ToString("D"));
 
-        var events = new List<StoredEvent>();
+        var events = new List<EventForReplay>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
-            var rawEvent = new StoredEvent(
+            var eventId = new EventId(Guid.Parse(reader.GetString(1)));
+            var metadata = new EventMetadata(
                 streamId,
                 new StreamVersion(reader.GetInt64(0)),
-                new EventId(Guid.Parse(reader.GetString(1))),
+                eventId,
                 reader.GetString(2),
                 reader.GetInt32(3),
-                reader.GetFieldValue<byte[]>(4),
                 DateTimeOffset.Parse(
                     reader.GetString(5),
                     CultureInfo.InvariantCulture,
-                    DateTimeStyles.RoundtripKind));
-            events.Add(new StoredEvent(
-                rawEvent.StreamId,
-                rawEvent.StreamVersion,
-                rawEvent.EventId,
-                rawEvent.EventType,
-                _schemaRegistry.GetCurrentVersion(rawEvent.EventType),
-                _schemaRegistry.UpcastToCurrent(rawEvent),
-                rawEvent.RecordedAtUtc));
+                    DateTimeStyles.RoundtripKind).ToUniversalTime(),
+                new OperationId(eventId.Value),
+                null,
+                0);
+            events.Add(_schemaRegistry.UpcastToCurrent(
+                new DecryptedEvent(metadata, reader.GetFieldValue<byte[]>(4))));
         }
 
         return events;
