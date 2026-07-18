@@ -9,5 +9,6 @@
     <ProjectReference Include="..\LocalDocumentOrganizer.Core\LocalDocumentOrganizer.Core.csproj" />
     <PackageReference Include="Microsoft.Data.Sqlite" />
     <PackageReference Include="Microsoft.Extensions.Logging" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" />
   </ItemGroup>
 </Project>
