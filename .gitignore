@@ -15,3 +15,7 @@ Templates/
 _Claude.md
 Home.md
 log.md
+index.md
+.gstack/
+*.md
+.context/
