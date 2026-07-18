@@ -117,7 +117,9 @@ public sealed class VaultKeyRingStore
     {
         ValidateOwner(owner);
         ArgumentNullException.ThrowIfNull(callback);
-        MaintenanceGate.Validate(lease);
+        await using var operation = await MaintenanceGate
+            .EnterOperationAsync(lease, cancellationToken)
+            .ConfigureAwait(false);
         CleanupOrphans(requireCanonical: true);
         var oldImage = await ReadCanonicalAsync(cancellationToken).ConfigureAwait(false);
         using var state = Deserialize(oldImage);
@@ -169,7 +171,9 @@ public sealed class VaultKeyRingStore
     {
         ArgumentNullException.ThrowIfNull(receipt);
         receipt.Validate();
-        MaintenanceGate.Validate(lease);
+        await using var operation = await MaintenanceGate
+            .EnterOperationAsync(lease, cancellationToken)
+            .ConfigureAwait(false);
         CleanupOrphans(requireCanonical: true);
         var oldImage = await ReadCanonicalAsync(cancellationToken).ConfigureAwait(false);
         using var state = Deserialize(oldImage);
@@ -209,7 +213,9 @@ public sealed class VaultKeyRingStore
     {
         ArgumentNullException.ThrowIfNull(receipt);
         receipt.Validate();
-        MaintenanceGate.Validate(lease);
+        await using var operation = await MaintenanceGate
+            .EnterOperationAsync(lease, cancellationToken)
+            .ConfigureAwait(false);
         CleanupOrphans(requireCanonical: true);
         var oldImage = await ReadCanonicalAsync(cancellationToken).ConfigureAwait(false);
         using var state = Deserialize(oldImage);
@@ -286,6 +292,18 @@ public sealed class VaultKeyRingStore
 
     private byte[] Serialize(KeyRingState state)
     {
+        ValidateSerializableState(state);
+        long destroyedReasonBytes = 0;
+        foreach (var receipt in state.Destroyed)
+        {
+            destroyedReasonBytes = checked(destroyedReasonBytes + receipt.ReasonCode.Length);
+        }
+
+        var expectedImageSize = ValidateSerializationBounds(
+            state.Active.Count,
+            state.Destroyed.Count,
+            state.ProtectedRoot.Length,
+            destroyedReasonBytes);
         state.Active.Sort(ActiveEntryComparer.Instance);
         state.Destroyed.Sort(DestroyedEntryComparer.Instance);
         using var stream = new MemoryStream();
@@ -321,7 +339,15 @@ public sealed class VaultKeyRingStore
         try
         {
             var tag = HMACSHA256.HashData(authenticationKey, authenticated);
-            return [.. authenticated, .. tag];
+            var image = new byte[checked(authenticated.Length + tag.Length)];
+            authenticated.CopyTo(image, 0);
+            tag.CopyTo(image, authenticated.Length);
+            if (image.Length != expectedImageSize)
+            {
+                throw new VaultKeyRingFormatException("The serialized Vault keyring size is inconsistent.");
+            }
+
+            return image;
         }
         finally
         {
@@ -483,23 +509,16 @@ public sealed class VaultKeyRingStore
     {
         try
         {
-            var info = new FileInfo(_path);
-            if (!info.Exists)
+            return await ReadBoundedFileAsync(_path, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+        {
+            if (FindOrphans().Count != 0)
             {
-                if (FindOrphans().Count != 0)
-                {
-                    throw new VaultKeyRingRecoveryRequiredException();
-                }
-
-                throw new VaultKeyRingNotFoundException();
+                throw new VaultKeyRingRecoveryRequiredException(exception);
             }
 
-            if (info.Length > MaximumFileSize)
-            {
-                throw new VaultKeyRingFormatException("The Vault keyring size is invalid.");
-            }
-
-            return await File.ReadAllBytesAsync(_path, cancellationToken).ConfigureAwait(false);
+            throw new VaultKeyRingNotFoundException();
         }
         catch (VaultKeyRingException)
         {
@@ -513,6 +532,137 @@ public sealed class VaultKeyRingStore
         {
             throw new VaultKeyRingPersistenceException("The Vault keyring could not be read.", exception);
         }
+    }
+
+    internal static Task<byte[]> ReadBoundedFileForTestAsync(
+        string path,
+        CancellationToken cancellationToken) =>
+        ReadBoundedFileAsync(path, cancellationToken);
+
+    private static async Task<byte[]> ReadBoundedFileAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        await using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read | FileShare.Delete,
+            bufferSize: 4096,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var length = ValidateOpenedLength(stream.Length);
+        var image = new byte[length];
+        var offset = 0;
+        while (offset < image.Length)
+        {
+            var read = await stream.ReadAsync(image.AsMemory(offset), cancellationToken)
+                .ConfigureAwait(false);
+            if (read == 0)
+            {
+                throw new VaultKeyRingFormatException("The Vault keyring changed or was truncated while reading.");
+            }
+
+            offset += read;
+        }
+
+        var probe = new byte[1];
+        if (await stream.ReadAsync(probe, cancellationToken).ConfigureAwait(false) != 0
+            || stream.Length != length)
+        {
+            throw new VaultKeyRingFormatException("The Vault keyring changed or grew while reading.");
+        }
+
+        return image;
+    }
+
+    private static byte[] ReadBoundedFile(string path)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read | FileShare.Delete,
+            bufferSize: 4096,
+            FileOptions.SequentialScan);
+        var length = ValidateOpenedLength(stream.Length);
+        var image = new byte[length];
+        var offset = 0;
+        while (offset < image.Length)
+        {
+            var read = stream.Read(image, offset, image.Length - offset);
+            if (read == 0)
+            {
+                throw new VaultKeyRingFormatException("The Vault keyring changed or was truncated while reading.");
+            }
+
+            offset += read;
+        }
+
+        if (stream.ReadByte() != -1 || stream.Length != length)
+        {
+            throw new VaultKeyRingFormatException("The Vault keyring changed or grew while reading.");
+        }
+
+        return image;
+    }
+
+    private static int ValidateOpenedLength(long length)
+    {
+        if (length < 0 || length > MaximumFileSize)
+        {
+            throw new VaultKeyRingFormatException("The Vault keyring size is invalid.");
+        }
+
+        return checked((int)length);
+    }
+
+    internal static void ValidateSerializationBoundsForTest(
+        int activeCount,
+        int destroyedCount,
+        int protectedRootSize,
+        long destroyedReasonBytes) =>
+        _ = ValidateSerializationBounds(activeCount, destroyedCount, protectedRootSize, destroyedReasonBytes);
+
+    private static int ValidateSerializationBounds(
+        int activeCount,
+        int destroyedCount,
+        int protectedRootSize,
+        long destroyedReasonBytes)
+    {
+        if (activeCount is < 0 or > MaximumRecords
+            || destroyedCount is < 0 or > MaximumRecords)
+        {
+            throw new VaultKeyRingFormatException("A keyring record count is excessive.");
+        }
+
+        if (protectedRootSize is <= 0 or > MaximumProtectedRootSize
+            || destroyedReasonBytes < destroyedCount
+            || destroyedReasonBytes > (long)destroyedCount * 32)
+        {
+            throw new VaultKeyRingFormatException("A serialized keyring field length is invalid.");
+        }
+
+        long imageSize;
+        try
+        {
+            imageSize = checked(
+                64L
+                + protectedRootSize
+                + ((long)activeCount * 100)
+                + ((long)destroyedCount * 84)
+                + destroyedReasonBytes);
+        }
+        catch (OverflowException exception)
+        {
+            throw new VaultKeyRingFormatException("The serialized Vault keyring size is invalid.", exception);
+        }
+
+        if (imageSize > MaximumFileSize)
+        {
+            throw new VaultKeyRingFormatException("The serialized Vault keyring is excessive.");
+        }
+
+        return checked((int)imageSize);
     }
 
     private async Task PublishAsync(byte[] image, byte[]? oldImage, CancellationToken cancellationToken)
@@ -560,6 +710,11 @@ public sealed class VaultKeyRingStore
                     throw new VaultKeyRingPersistenceException("The Vault keyring could not be published.", exception);
                 }
 
+                if (oldImage is null && publicationState == PublicationState.Missing)
+                {
+                    throw new VaultKeyRingPersistenceException("The Vault keyring could not be published.", exception);
+                }
+
                 throw new VaultAtomicPublicationException(exception);
             }
         }
@@ -592,7 +747,7 @@ public sealed class VaultKeyRingStore
         try
         {
             if (!File.Exists(_path)) return PublicationState.Missing;
-            var canonical = File.ReadAllBytes(_path);
+            var canonical = ReadBoundedFile(_path);
             using var canonicalState = Deserialize(canonical);
             using var nextState = Deserialize(next);
             if (canonicalState.Revision == nextState.Revision
@@ -632,7 +787,7 @@ public sealed class VaultKeyRingStore
         {
             try
             {
-                using var canonical = Deserialize(File.ReadAllBytes(_path));
+                using var canonical = Deserialize(ReadBoundedFile(_path));
             }
             catch (Exception exception) when (exception is IOException
                 or UnauthorizedAccessException
@@ -658,21 +813,33 @@ public sealed class VaultKeyRingStore
 
     private List<string> FindOrphans()
     {
-        var directory = Path.GetDirectoryName(_path)!;
-        if (!Directory.Exists(directory)) return [];
-        var prefix = Path.GetFileName(_path) + ".tmp-";
-        return Directory.EnumerateFiles(directory, prefix + "*")
-            .Where(path =>
-            {
-                var name = Path.GetFileName(path);
-                var suffix = name.AsSpan(prefix.Length);
-                return name.StartsWith(prefix, OperatingSystem.IsWindows()
-                        ? StringComparison.OrdinalIgnoreCase
-                        : StringComparison.Ordinal)
-                    && suffix.Length == 32
-                    && IsHex(suffix);
-            })
-            .ToList();
+        try
+        {
+            var directory = Path.GetDirectoryName(_path)!;
+            var prefix = Path.GetFileName(_path) + ".tmp-";
+            return Directory.EnumerateFiles(directory, prefix + "*")
+                .Where(path =>
+                {
+                    var name = Path.GetFileName(path);
+                    var suffix = name.AsSpan(prefix.Length);
+                    return name.StartsWith(prefix, OperatingSystem.IsWindows()
+                            ? StringComparison.OrdinalIgnoreCase
+                            : StringComparison.Ordinal)
+                        && suffix.Length == 32
+                        && IsHex(suffix);
+                })
+                .ToList();
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return [];
+        }
+        catch (Exception exception) when (exception is IOException
+            or UnauthorizedAccessException
+            or System.Security.SecurityException)
+        {
+            throw new VaultKeyRingRecoveryRequiredException(exception);
+        }
     }
 
     private static bool IsHex(ReadOnlySpan<char> value)
@@ -683,6 +850,40 @@ public sealed class VaultKeyRingStore
         }
 
         return true;
+    }
+
+    private static void ValidateSerializableState(KeyRingState state)
+    {
+        if (state.Revision == 0 || state.Root.Length != VaultKeyRing.RootSize
+            || state.ProtectedRoot.Length is <= 0 or > MaximumProtectedRootSize)
+        {
+            throw new VaultKeyRingFormatException("The keyring state is invalid for serialization.");
+        }
+
+        var owners = new HashSet<SensitiveObjectRef>();
+        var keyIds = new HashSet<DataKeyId>();
+        foreach (var entry in state.Active)
+        {
+            ValidateOwner(entry.Owner);
+            if (entry.KeyId.Value == Guid.Empty
+                || entry.Nonce.Length != NonceSize
+                || entry.WrappedKey.Length != VaultKeyRing.DataKeySize
+                || entry.Tag.Length != AesTagSize
+                || !owners.Add(entry.Owner)
+                || !keyIds.Add(entry.KeyId))
+            {
+                throw new VaultKeyRingFormatException("An active keyring record is invalid.");
+            }
+        }
+
+        foreach (var receipt in state.Destroyed)
+        {
+            receipt.Validate();
+            if (!owners.Add(receipt.Owner) || !keyIds.Add(receipt.KeyId))
+            {
+                throw new VaultKeyRingFormatException("A destroyed keyring record is invalid.");
+            }
+        }
     }
 
     private static bool SameReceiptIdentity(

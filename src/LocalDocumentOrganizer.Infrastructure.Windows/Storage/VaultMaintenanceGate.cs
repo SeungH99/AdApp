@@ -80,6 +80,14 @@ public sealed class VaultMaintenanceGate
             throw new InvalidVaultMaintenanceLeaseException();
         }
     }
+
+    internal ValueTask<VaultMaintenanceOperation> EnterOperationAsync(
+        VaultMaintenanceLease lease,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        return lease.EnterOperationAsync(_identity, cancellationToken);
+    }
 }
 
 public sealed class VaultMaintenanceLease : IAsyncDisposable
@@ -87,6 +95,8 @@ public sealed class VaultMaintenanceLease : IAsyncDisposable
     private readonly string _identity;
     private SemaphoreSlim? _processGate;
     private FileStream? _lockStream;
+    private readonly SemaphoreSlim _operationGate = new(1, 1);
+    private int _disposeStarted;
 
     internal VaultMaintenanceLease(
         string identity,
@@ -100,18 +110,65 @@ public sealed class VaultMaintenanceLease : IAsyncDisposable
 
     internal bool IsValidFor(string identity) =>
         string.Equals(_identity, identity, StringComparison.Ordinal)
+        && Volatile.Read(ref _disposeStarted) == 0
         && Volatile.Read(ref _lockStream) is not null;
+
+    internal async ValueTask<VaultMaintenanceOperation> EnterOperationAsync(
+        string identity,
+        CancellationToken cancellationToken)
+    {
+        if (!IsValidFor(identity))
+        {
+            throw new InvalidVaultMaintenanceLeaseException();
+        }
+
+        await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (!IsValidFor(identity))
+        {
+            _operationGate.Release();
+            throw new InvalidVaultMaintenanceLeaseException();
+        }
+
+        return new VaultMaintenanceOperation(_operationGate);
+    }
 
     public ValueTask DisposeAsync()
     {
-        var stream = Interlocked.Exchange(ref _lockStream, null);
-        if (stream is null)
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
         {
             return ValueTask.CompletedTask;
         }
 
-        stream.Dispose();
-        Interlocked.Exchange(ref _processGate, null)?.Release();
+        return DisposeCoreAsync();
+    }
+
+    private async ValueTask DisposeCoreAsync()
+    {
+        await _operationGate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            Interlocked.Exchange(ref _lockStream, null)?.Dispose();
+            Interlocked.Exchange(ref _processGate, null)?.Release();
+        }
+        finally
+        {
+            _operationGate.Release();
+        }
+    }
+}
+
+internal sealed class VaultMaintenanceOperation : IAsyncDisposable
+{
+    private SemaphoreSlim? _operationGate;
+
+    internal VaultMaintenanceOperation(SemaphoreSlim operationGate)
+    {
+        _operationGate = operationGate;
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        Interlocked.Exchange(ref _operationGate, null)?.Release();
         return ValueTask.CompletedTask;
     }
 }
