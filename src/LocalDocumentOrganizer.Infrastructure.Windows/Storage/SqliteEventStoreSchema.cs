@@ -6,14 +6,6 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 internal static class SqliteEventStoreSchema
 {
     private const int CurrentVersion = 2;
-    private static readonly string[] RequiredEventColumns =
-    [
-        "global_position", "event_id", "stream_id", "stream_version", "event_type",
-        "schema_version", "recorded_at_utc", "operation_id", "protection_kind",
-        "owner_kind", "owner_id", "key_id", "envelope_version", "payload_nonce",
-        "payload_ciphertext", "payload_tag",
-    ];
-
     private const string VersionTwoSql = """
         CREATE TABLE event_streams(
             stream_id TEXT PRIMARY KEY CHECK(stream_id <> '00000000-0000-0000-0000-000000000000' AND length(stream_id) = 36 AND stream_id = lower(stream_id) AND substr(stream_id,9,1)='-' AND substr(stream_id,14,1)='-' AND substr(stream_id,19,1)='-' AND substr(stream_id,24,1)='-' AND length(replace(stream_id,'-','')) = 32 AND replace(stream_id,'-','') NOT GLOB '*[^0-9a-f]*'),
@@ -28,6 +20,8 @@ internal static class SqliteEventStoreSchema
             schema_version INTEGER NOT NULL CHECK(schema_version >= 1),
             recorded_at_utc TEXT NOT NULL CHECK(length(recorded_at_utc) > 0),
             operation_id TEXT NOT NULL CHECK(operation_id <> '00000000-0000-0000-0000-000000000000' AND length(operation_id) = 36 AND operation_id = lower(operation_id) AND substr(operation_id,9,1)='-' AND substr(operation_id,14,1)='-' AND substr(operation_id,19,1)='-' AND substr(operation_id,24,1)='-' AND length(replace(operation_id,'-','')) = 32 AND replace(operation_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+            operation_index INTEGER NOT NULL CHECK(operation_index >= 0),
+            operation_count INTEGER NOT NULL CHECK(operation_count > 0),
             protection_kind INTEGER NOT NULL CHECK(protection_kind IN (0, 1)),
             owner_kind INTEGER,
             owner_id TEXT,
@@ -37,7 +31,9 @@ internal static class SqliteEventStoreSchema
             payload_ciphertext BLOB NOT NULL CHECK(typeof(payload_ciphertext) = 'blob'),
             payload_tag BLOB,
             UNIQUE(stream_id, stream_version),
+            UNIQUE(operation_id, operation_index),
             FOREIGN KEY(stream_id) REFERENCES event_streams(stream_id),
+            CHECK(operation_index < operation_count),
             CHECK(
                 (protection_kind = 0
                     AND owner_kind IS NULL AND owner_id IS NULL AND key_id IS NULL
@@ -67,6 +63,47 @@ internal static class SqliteEventStoreSchema
         PRAGMA user_version = 2;
         """;
 
+    private const string VersionOneSql = """
+        CREATE TABLE event_streams(
+            stream_id TEXT PRIMARY KEY,
+            head_version INTEGER NOT NULL CHECK(head_version >= 0)
+        );
+        CREATE TABLE timeline_events(
+            global_position INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT UNIQUE NOT NULL,
+            stream_id TEXT NOT NULL,
+            stream_version INTEGER NOT NULL CHECK(stream_version >= 0),
+            event_type TEXT NOT NULL,
+            schema_version INTEGER NOT NULL CHECK(schema_version >= 1),
+            recorded_at_utc TEXT NOT NULL,
+            payload_json BLOB NOT NULL,
+            UNIQUE(stream_id, stream_version),
+            FOREIGN KEY(stream_id) REFERENCES event_streams(stream_id)
+        );
+        CREATE TABLE projection_checkpoints(
+            projection_name TEXT PRIMARY KEY,
+            last_global_position INTEGER NOT NULL CHECK(last_global_position >= 0)
+        );
+        CREATE TABLE event_operation_ids(
+            event_id TEXT PRIMARY KEY,
+            operation_id TEXT NOT NULL,
+            FOREIGN KEY(event_id) REFERENCES timeline_events(event_id)
+        );
+        CREATE TRIGGER timeline_events_immutable_update
+        BEFORE UPDATE ON timeline_events
+        BEGIN SELECT RAISE(ABORT, 'timeline_events is immutable'); END;
+        CREATE TRIGGER timeline_events_immutable_delete
+        BEFORE DELETE ON timeline_events
+        BEGIN SELECT RAISE(ABORT, 'timeline_events is immutable'); END;
+        CREATE TRIGGER event_operation_ids_immutable_update
+        BEFORE UPDATE ON event_operation_ids
+        BEGIN SELECT RAISE(ABORT, 'event_operation_ids is immutable'); END;
+        CREATE TRIGGER event_operation_ids_immutable_delete
+        BEFORE DELETE ON event_operation_ids
+        BEGIN SELECT RAISE(ABORT, 'event_operation_ids is immutable'); END;
+        PRAGMA user_version = 1;
+        """;
+
     public static async Task InitializeAsync(
         string connectionString,
         IReadOnlyList<ISqliteProjection> projections,
@@ -74,8 +111,12 @@ internal static class SqliteEventStoreSchema
         CancellationToken cancellationToken)
     {
         ValidateConnectionString(connectionString);
-        await using var firstLease = await keyRing.MaintenanceGate.AcquireAsync(cancellationToken);
-        var inspection = await InspectBeforeMutationAsync(connectionString, cancellationToken);
+        VaultSchemaInspection inspection;
+        await using (var firstLease = await keyRing.MaintenanceGate.AcquireAsync(cancellationToken))
+        {
+            inspection = await InspectBeforeMutationAsync(connectionString, cancellationToken);
+        }
+
         if (inspection.Kind == VaultSchemaKind.LegacyNonEmpty)
         {
             throw new LegacyPlaintextVaultRecoveryRequiredException();
@@ -86,24 +127,23 @@ internal static class SqliteEventStoreSchema
             throw new VaultRecoveryRequiredException();
         }
 
-        await firstLease.DisposeAsync();
-        VaultKeyRing ring;
+        VaultKeyRing bootstrapRing;
         if (inspection.Kind is VaultSchemaKind.New or VaultSchemaKind.EmptyV1)
         {
             try
             {
-                try { ring = await keyRing.CreateAsync(cancellationToken); }
-                catch (VaultKeyRingPersistenceException) { ring = await keyRing.OpenAsync(cancellationToken); }
+                try { bootstrapRing = await keyRing.CreateAsync(cancellationToken); }
+                catch (VaultKeyRingPersistenceException) { bootstrapRing = await keyRing.OpenAsync(cancellationToken); }
             }
             catch (VaultKeyRingException exception)
             {
                 throw new VaultRecoveryRequiredException(exception);
             }
-            if (ring.ActiveKeys.Count != 0 || ring.DestroyedReceipts.Count != 0) throw new VaultRecoveryRequiredException();
+            if (!IsEmpty(bootstrapRing)) throw new VaultRecoveryRequiredException();
         }
         else
         {
-            try { ring = await keyRing.OpenAsync(cancellationToken); }
+            try { bootstrapRing = await keyRing.OpenAsync(cancellationToken); }
             catch (VaultKeyRingException exception) { throw new VaultRecoveryRequiredException(exception); }
         }
 
@@ -115,9 +155,18 @@ internal static class SqliteEventStoreSchema
             var finalInspection = await InspectInsideTransactionAsync(connection, transaction, cancellationToken);
             if (finalInspection.Kind is VaultSchemaKind.Unknown or VaultSchemaKind.Malformed or VaultSchemaKind.LegacyNonEmpty)
                 throw new VaultRecoveryRequiredException();
+
+            VaultKeyRing authoritativeRing;
+            try { authoritativeRing = await keyRing.OpenAsync(cancellationToken); }
+            catch (VaultKeyRingException exception) { throw new VaultRecoveryRequiredException(exception); }
+            if (finalInspection.Kind is VaultSchemaKind.New or VaultSchemaKind.EmptyV1)
+            {
+                if (!IsEmpty(authoritativeRing)) throw new VaultRecoveryRequiredException();
+            }
+
             if (finalInspection.Kind == VaultSchemaKind.EmptyV1)
             {
-                await DropApplicationTablesAsync(connection, transaction, cancellationToken);
+                await DropVersionOneCoreAsync(connection, transaction, cancellationToken);
             }
 
             if (finalInspection.Kind is VaultSchemaKind.New or VaultSchemaKind.EmptyV1)
@@ -134,6 +183,8 @@ internal static class SqliteEventStoreSchema
                 await projection.InitializeAsync(connection, transaction, cancellationToken);
             }
 
+            await ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
+            await SqliteEventStore.ValidateAllOperationGroupsAsync(connection, transaction, cancellationToken);
             await transaction.CommitAsync(cancellationToken);
         }
         catch
@@ -142,6 +193,9 @@ internal static class SqliteEventStoreSchema
             throw;
         }
     }
+
+    private static bool IsEmpty(VaultKeyRing ring) =>
+        ring.ActiveKeys.Count == 0 && ring.DestroyedReceipts.Count == 0;
 
     public static async Task<SqliteConnection> OpenConnectionAsync(
         string connectionString,
@@ -154,17 +208,17 @@ internal static class SqliteEventStoreSchema
             await connection.OpenAsync(cancellationToken);
             await RequirePragmaAsync(connection, "foreign_keys = ON", "foreign_keys", "1", cancellationToken);
             await RequirePragmaAsync(connection, "secure_delete = ON", "secure_delete", "1", cancellationToken);
-            var builder = new SqliteConnectionStringBuilder(connectionString);
-            if (builder.Mode != SqliteOpenMode.Memory && !string.Equals(builder.DataSource, ":memory:", StringComparison.OrdinalIgnoreCase))
-            {
-                await RequirePragmaAsync(connection, "journal_mode = WAL", "journal_mode", "wal", cancellationToken);
-            }
+            await RequirePragmaAsync(connection, "journal_mode = WAL", "journal_mode", "wal", cancellationToken);
 
             return connection;
         }
-        catch
+        catch (Exception exception)
         {
             await connection.DisposeAsync();
+            if (exception is VaultRecoveryRequiredException) throw;
+            if (exception is SqliteException sqliteException && sqliteException.SqliteErrorCode is 5 or 6) throw;
+            if (exception is SqliteException or InvalidCastException or FormatException or OverflowException)
+                throw new VaultRecoveryRequiredException(exception);
             throw;
         }
     }
@@ -172,106 +226,333 @@ internal static class SqliteEventStoreSchema
     private static async Task<VaultSchemaInspection> InspectBeforeMutationAsync(string connectionString, CancellationToken cancellationToken)
     {
         var builder = new SqliteConnectionStringBuilder(connectionString);
-        if (builder.Mode == SqliteOpenMode.Memory || string.Equals(builder.DataSource, ":memory:", StringComparison.OrdinalIgnoreCase))
-        {
-            return new VaultSchemaInspection(VaultSchemaKind.New);
-        }
+        var path = Path.GetFullPath(builder.DataSource);
+        if (!File.Exists(path)) return new VaultSchemaInspection(VaultSchemaKind.New);
+        if (new FileInfo(path).Length == 0) return new VaultSchemaInspection(VaultSchemaKind.New);
 
-        if (!File.Exists(builder.DataSource)) return new VaultSchemaInspection(VaultSchemaKind.New);
-        builder.Mode = SqliteOpenMode.ReadOnly;
-        await using var connection = new SqliteConnection(builder.ToString());
-        await connection.OpenAsync(cancellationToken);
-        var version = Convert.ToInt32(await ExecuteScalarAsync(connection, null, "PRAGMA user_version;", cancellationToken));
-        var tables = await ReadApplicationTablesAsync(connection, null, cancellationToken);
-        if (version == 0 && tables.Count == 0) return new VaultSchemaInspection(VaultSchemaKind.New);
-        if (version == 1) return new VaultSchemaInspection(await AreAllTablesEmptyAsync(connection, tables, cancellationToken)
-            ? VaultSchemaKind.EmptyV1 : VaultSchemaKind.LegacyNonEmpty);
-        if (version == 2) return new VaultSchemaInspection(VaultSchemaKind.V2);
-        return new VaultSchemaInspection(version > 2 || version < 0 ? VaultSchemaKind.Unknown : VaultSchemaKind.Malformed);
+        var snapshotDirectory = Path.Combine(
+            Path.GetTempPath(), $"local-document-organizer-vault-probe-{Guid.NewGuid():N}");
+        var snapshotPath = Path.Combine(snapshotDirectory, "vault.db");
+        Directory.CreateDirectory(snapshotDirectory);
+        try
+        {
+            CopyProbeFile(path, snapshotPath);
+            foreach (var suffix in new[] { "-journal", "-wal", "-shm" })
+            {
+                if (File.Exists(path + suffix)) CopyProbeFile(path + suffix, snapshotPath + suffix);
+            }
+
+            builder.DataSource = snapshotPath;
+            builder.Mode = SqliteOpenMode.ReadWrite;
+            builder.Cache = SqliteCacheMode.Private;
+            builder.Pooling = false;
+            await using (var connection = new SqliteConnection(builder.ToString()))
+            {
+                await connection.OpenAsync(cancellationToken);
+                var version = Convert.ToInt32(await ExecuteScalarAsync(connection, null, "PRAGMA user_version;", cancellationToken));
+                if (version == 0)
+                {
+                    return await CountApplicationObjectsAsync(connection, null, cancellationToken) == 0
+                        ? new VaultSchemaInspection(VaultSchemaKind.New)
+                        : new VaultSchemaInspection(VaultSchemaKind.Malformed);
+                }
+
+                if (version == 1)
+                {
+                    return new VaultSchemaInspection(await ClassifyExactVersionOneAsync(connection, null, cancellationToken));
+                }
+
+                if (version == CurrentVersion)
+                {
+                    await ValidateExistingVersionTwoAsync(connection, null, cancellationToken);
+                    return new VaultSchemaInspection(VaultSchemaKind.V2);
+                }
+
+                return new VaultSchemaInspection(VaultSchemaKind.Unknown);
+            }
+        }
+        catch (VaultRecoveryRequiredException)
+        {
+            return new VaultSchemaInspection(VaultSchemaKind.Malformed);
+        }
+        catch (Exception exception) when (exception is SqliteException or InvalidCastException or FormatException or OverflowException)
+        {
+            _ = exception;
+            return new VaultSchemaInspection(VaultSchemaKind.Malformed);
+        }
+        finally
+        {
+            await DeleteProbeDirectoryAsync(snapshotDirectory, cancellationToken);
+        }
+    }
+
+    private static void CopyProbeFile(string source, string destination)
+    {
+        using var input = new FileStream(
+            source, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete, bufferSize: 64 * 1024,
+            FileOptions.SequentialScan);
+        using var output = new FileStream(
+            destination, FileMode.CreateNew, FileAccess.Write,
+            FileShare.None, bufferSize: 64 * 1024,
+            FileOptions.WriteThrough);
+        input.CopyTo(output);
+        output.Flush(flushToDisk: true);
+    }
+
+    private static async Task DeleteProbeDirectoryAsync(string path, CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                Directory.Delete(path, recursive: true);
+                return;
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                if (attempt == 2) throw new VaultRecoveryRequiredException(exception);
+                await Task.Delay(TimeSpan.FromMilliseconds(10), cancellationToken);
+            }
+        }
     }
 
     private static async Task<VaultSchemaInspection> InspectInsideTransactionAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
     {
         var version = Convert.ToInt32(await ExecuteScalarAsync(connection, transaction, "PRAGMA user_version;", cancellationToken));
-        var tables = await ReadApplicationTablesAsync(connection, transaction, cancellationToken);
-        if (version == 0 && tables.Count == 0) return new VaultSchemaInspection(VaultSchemaKind.New);
+        if (version == 0 && await CountApplicationObjectsAsync(connection, transaction, cancellationToken) == 0)
+            return new VaultSchemaInspection(VaultSchemaKind.New);
         if (version == 1)
         {
-            foreach (var table in tables)
-            {
-                await using var command = connection.CreateCommand();
-                command.Transaction = transaction;
-                command.CommandText = $"SELECT EXISTS(SELECT 1 FROM \"{table.Replace("\"", "\"\"")}\" LIMIT 1);";
-                if (Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken)) != 0) return new VaultSchemaInspection(VaultSchemaKind.LegacyNonEmpty);
-            }
-            return new VaultSchemaInspection(VaultSchemaKind.EmptyV1);
+            return new VaultSchemaInspection(await ClassifyExactVersionOneAsync(connection, transaction, cancellationToken));
         }
-        return version == 2 ? new VaultSchemaInspection(VaultSchemaKind.V2) : new VaultSchemaInspection(VaultSchemaKind.Unknown);
-    }
-
-    internal static async Task ValidateExistingVersionTwoAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
-    {
-        var version = Convert.ToInt32(await ExecuteScalarAsync(connection, transaction, "PRAGMA user_version;", cancellationToken));
-        if (version != CurrentVersion) throw new VaultRecoveryRequiredException();
-        var columns = new HashSet<string>(StringComparer.Ordinal);
-        await using (var command = connection.CreateCommand())
+        if (version == CurrentVersion)
         {
-            command.Transaction = transaction;
-            command.CommandText = "PRAGMA table_info(timeline_events);";
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken)) columns.Add(reader.GetString(1));
+            await ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
+            return new VaultSchemaInspection(VaultSchemaKind.V2);
         }
-        if (columns.Contains("payload_json") || !RequiredEventColumns.All(columns.Contains)) throw new VaultRecoveryRequiredException();
-        var master = await ReadMasterSqlAsync(connection, transaction, cancellationToken);
-        if (!master.Contains("timeline_events_operation_position", StringComparison.Ordinal)
-            || !master.Contains("timeline_events_immutable_update", StringComparison.Ordinal)
-            || !master.Contains("timeline_events_immutable_delete", StringComparison.Ordinal)
-            || !master.Contains("STRICT", StringComparison.OrdinalIgnoreCase)) throw new VaultRecoveryRequiredException();
+
+        return new VaultSchemaInspection(VaultSchemaKind.Unknown);
     }
 
-    private static async Task DropApplicationTablesAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
+    internal static async Task ValidateExistingVersionTwoAsync(SqliteConnection connection, SqliteTransaction? transaction, CancellationToken cancellationToken)
     {
-        var tables = await ReadApplicationTablesAsync(connection, transaction, cancellationToken);
-        foreach (var table in tables)
+        try
         {
-            await ExecuteNonQueryAsync(connection, transaction, $"DROP TABLE IF EXISTS \"{table.Replace("\"", "\"\"")}\";", cancellationToken);
+            var version = Convert.ToInt32(await ExecuteScalarAsync(connection, transaction, "PRAGMA user_version;", cancellationToken));
+            if (version != CurrentVersion) throw new VaultRecoveryRequiredException();
+
+            await RequireExactObjectSqlAsync(connection, transaction, "table", "event_streams",
+                ExtractExpectedStatement("CREATE TABLE event_streams("), cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "table", "timeline_events",
+                ExtractExpectedStatement("CREATE TABLE timeline_events("), cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "table", "projection_checkpoints",
+                ExtractExpectedStatement("CREATE TABLE projection_checkpoints("), cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "index", "timeline_events_operation_position",
+                ExtractExpectedStatement("CREATE INDEX timeline_events_operation_position"), cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "trigger", "timeline_events_immutable_update",
+                "CREATE TRIGGER timeline_events_immutable_update BEFORE UPDATE ON timeline_events BEGIN SELECT RAISE(ABORT, 'timeline_events is immutable'); END", cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "trigger", "timeline_events_immutable_delete",
+                "CREATE TRIGGER timeline_events_immutable_delete BEFORE DELETE ON timeline_events BEGIN SELECT RAISE(ABORT, 'timeline_events is immutable'); END", cancellationToken);
+
+            await using var forbidden = connection.CreateCommand();
+            forbidden.Transaction = transaction;
+            forbidden.CommandText = """
+                SELECT COUNT(*) FROM sqlite_master
+                WHERE name NOT LIKE 'sqlite_%'
+                  AND (
+                    name = 'payload_json'
+                    OR name = 'event_operation_ids'
+                    OR name LIKE 'event_operation_ids_%'
+                    OR name LIKE 'event_streams_%'
+                    OR (name LIKE 'timeline_events_%' AND name NOT IN (
+                        'timeline_events_operation_position',
+                        'timeline_events_immutable_update',
+                        'timeline_events_immutable_delete'))
+                    OR (tbl_name IN ('event_streams', 'timeline_events', 'projection_checkpoints')
+                        AND name NOT IN (
+                            'event_streams',
+                            'timeline_events',
+                            'projection_checkpoints',
+                            'timeline_events_operation_position',
+                            'timeline_events_immutable_update',
+                            'timeline_events_immutable_delete'))
+                  );
+                """;
+            if (Convert.ToInt64(await forbidden.ExecuteScalarAsync(cancellationToken)) != 0)
+                throw new VaultRecoveryRequiredException();
+        }
+        catch (VaultRecoveryRequiredException) { throw; }
+        catch (Exception exception) when (exception is SqliteException or InvalidCastException or FormatException or OverflowException)
+        {
+            throw new VaultRecoveryRequiredException(exception);
         }
     }
 
-    private static async Task<List<string>> ReadApplicationTablesAsync(SqliteConnection connection, SqliteTransaction? transaction, CancellationToken cancellationToken)
+    private static async Task RequireExactObjectSqlAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string type,
+        string name,
+        string expectedSql,
+        CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name;";
-        var tables = new List<string>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken)) tables.Add(reader.GetString(0));
-        return tables;
+        command.CommandText = "SELECT sql FROM sqlite_master WHERE type = $type AND name = $name;";
+        command.Parameters.AddWithValue("$type", type);
+        command.Parameters.AddWithValue("$name", name);
+        var actual = Convert.ToString(await command.ExecuteScalarAsync(cancellationToken));
+        if (actual is null || !string.Equals(NormalizeSql(actual), NormalizeSql(expectedSql), StringComparison.Ordinal))
+            throw new VaultRecoveryRequiredException();
     }
 
-    private static async Task<bool> AreAllTablesEmptyAsync(SqliteConnection connection, IReadOnlyList<string> tables, CancellationToken cancellationToken)
+    private static string ExtractExpectedStatement(string prefix)
+        => ExtractExpectedStatement(VersionTwoSql, prefix);
+
+    private static string ExtractExpectedStatement(string schemaSql, string prefix)
     {
-        foreach (var table in tables)
+        var start = schemaSql.IndexOf(prefix, StringComparison.Ordinal);
+        if (start < 0) throw new InvalidOperationException("The canonical schema definition is incomplete.");
+        if (prefix.StartsWith("CREATE TRIGGER", StringComparison.Ordinal))
+        {
+            var triggerEnd = schemaSql.IndexOf("END;", start, StringComparison.Ordinal);
+            if (triggerEnd < 0) throw new InvalidOperationException("The canonical trigger is unterminated.");
+            return schemaSql[start..(triggerEnd + "END".Length)];
+        }
+        var end = schemaSql.IndexOf(';', start);
+        if (end < 0) throw new InvalidOperationException("The canonical schema statement is unterminated.");
+        return schemaSql[start..end];
+    }
+
+    private static string NormalizeSql(string sql)
+    {
+        var normalized = new System.Text.StringBuilder(sql.Length);
+        var inSingleQuote = false;
+        var inDoubleQuote = false;
+        for (var index = 0; index < sql.Length; index++)
+        {
+            var character = sql[index];
+            if (character == '\'' && !inDoubleQuote)
+            {
+                normalized.Append(character);
+                if (inSingleQuote && index + 1 < sql.Length && sql[index + 1] == '\'')
+                {
+                    normalized.Append(sql[++index]);
+                }
+                else
+                {
+                    inSingleQuote = !inSingleQuote;
+                }
+                continue;
+            }
+
+            if (character == '"' && !inSingleQuote)
+            {
+                normalized.Append(character);
+                if (inDoubleQuote && index + 1 < sql.Length && sql[index + 1] == '"')
+                {
+                    normalized.Append(sql[++index]);
+                }
+                else
+                {
+                    inDoubleQuote = !inDoubleQuote;
+                }
+                continue;
+            }
+
+            if (!inSingleQuote && !inDoubleQuote)
+            {
+                if (char.IsWhiteSpace(character) || character == ';') continue;
+                normalized.Append(char.ToLowerInvariant(character));
+            }
+            else
+            {
+                normalized.Append(character);
+            }
+        }
+
+        return normalized.ToString().Replace("ifnotexists", string.Empty, StringComparison.Ordinal);
+    }
+
+    private static async Task<VaultSchemaKind> ClassifyExactVersionOneAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken)
+    {
+        await RequireExactObjectSqlAsync(connection, transaction, "table", "event_streams",
+            ExtractExpectedStatement(VersionOneSql, "CREATE TABLE event_streams("), cancellationToken);
+        await RequireExactObjectSqlAsync(connection, transaction, "table", "timeline_events",
+            ExtractExpectedStatement(VersionOneSql, "CREATE TABLE timeline_events("), cancellationToken);
+        await RequireExactObjectSqlAsync(connection, transaction, "table", "projection_checkpoints",
+            ExtractExpectedStatement(VersionOneSql, "CREATE TABLE projection_checkpoints("), cancellationToken);
+        await RequireExactObjectSqlAsync(connection, transaction, "table", "event_operation_ids",
+            ExtractExpectedStatement(VersionOneSql, "CREATE TABLE event_operation_ids("), cancellationToken);
+        await RequireExactObjectSqlAsync(connection, transaction, "trigger", "timeline_events_immutable_update",
+            ExtractExpectedStatement(VersionOneSql, "CREATE TRIGGER timeline_events_immutable_update"), cancellationToken);
+        await RequireExactObjectSqlAsync(connection, transaction, "trigger", "timeline_events_immutable_delete",
+            ExtractExpectedStatement(VersionOneSql, "CREATE TRIGGER timeline_events_immutable_delete"), cancellationToken);
+        await RequireExactObjectSqlAsync(connection, transaction, "trigger", "event_operation_ids_immutable_update",
+            ExtractExpectedStatement(VersionOneSql, "CREATE TRIGGER event_operation_ids_immutable_update"), cancellationToken);
+        await RequireExactObjectSqlAsync(connection, transaction, "trigger", "event_operation_ids_immutable_delete",
+            ExtractExpectedStatement(VersionOneSql, "CREATE TRIGGER event_operation_ids_immutable_delete"), cancellationToken);
+
+        if (await CountApplicationObjectsAsync(connection, transaction, cancellationToken) != 8)
+            throw new VaultRecoveryRequiredException();
+
+        foreach (var table in new[] { "event_streams", "timeline_events", "projection_checkpoints", "event_operation_ids" })
         {
             await using var command = connection.CreateCommand();
-            command.CommandText = $"SELECT EXISTS(SELECT 1 FROM \"{table.Replace("\"", "\"\"")}\" LIMIT 1);";
-            if (Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken)) != 0) return false;
+            command.Transaction = transaction;
+            command.CommandText = $"SELECT EXISTS(SELECT 1 FROM \"{table}\" LIMIT 1);";
+            if (Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken)) != 0)
+                return VaultSchemaKind.LegacyNonEmpty;
         }
-        return true;
+
+        return VaultSchemaKind.EmptyV1;
     }
 
-    private static async Task<string> ReadMasterSqlAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
+    private static async Task<long> CountApplicationObjectsAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = "SELECT group_concat(sql, '\n') FROM sqlite_master WHERE name LIKE 'timeline_events%' OR name = 'event_streams';";
-        return Convert.ToString(await command.ExecuteScalarAsync(cancellationToken)) ?? string.Empty;
+        command.CommandText = """
+            SELECT COUNT(*)
+            FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+              AND type IN ('table', 'view', 'index', 'trigger');
+            """;
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
+    private static async Task DropVersionOneCoreAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await ExecuteNonQueryAsync(connection, transaction, """
+            DROP TRIGGER event_operation_ids_immutable_update;
+            DROP TRIGGER event_operation_ids_immutable_delete;
+            DROP TRIGGER timeline_events_immutable_update;
+            DROP TRIGGER timeline_events_immutable_delete;
+            DROP TABLE event_operation_ids;
+            DROP TABLE timeline_events;
+            DROP TABLE event_streams;
+            DROP TABLE projection_checkpoints;
+            """, cancellationToken);
     }
 
     private static void ValidateConnectionString(string connectionString)
     {
         var builder = new SqliteConnectionStringBuilder(connectionString);
-        if (builder.Cache == SqliteCacheMode.Shared) throw new VaultRecoveryRequiredException();
+        if (builder.Cache == SqliteCacheMode.Shared
+            || builder.Mode == SqliteOpenMode.Memory
+            || string.IsNullOrWhiteSpace(builder.DataSource)
+            || string.Equals(builder.DataSource, ":memory:", StringComparison.OrdinalIgnoreCase))
+            throw new VaultRecoveryRequiredException();
     }
 
     private static async Task RequirePragmaAsync(SqliteConnection connection, string set, string query, string expected, CancellationToken cancellationToken)

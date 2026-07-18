@@ -164,6 +164,49 @@ public sealed class VaultKeyRingStore
         return await UseKeyAsync(state, entry, callback, cancellationToken).ConfigureAwait(false);
     }
 
+    internal async Task<TResult> ResolveDataKeyAsync<TResult>(
+        SensitiveObjectRef owner,
+        DataKeyId expectedKeyId,
+        Func<TResult> destroyedCallback,
+        Func<DataKeyId, ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>> activeCallback,
+        CancellationToken cancellationToken)
+    {
+        await using var lease = await MaintenanceGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        return await ResolveDataKeyAsync(
+            owner, expectedKeyId, lease, destroyedCallback, activeCallback, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task<TResult> ResolveDataKeyAsync<TResult>(
+        SensitiveObjectRef owner,
+        DataKeyId expectedKeyId,
+        VaultMaintenanceLease lease,
+        Func<TResult> destroyedCallback,
+        Func<DataKeyId, ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>> activeCallback,
+        CancellationToken cancellationToken)
+    {
+        ValidateOwner(owner);
+        if (expectedKeyId.Value == Guid.Empty) throw new ArgumentException("A data-key ID is required.", nameof(expectedKeyId));
+        ArgumentNullException.ThrowIfNull(destroyedCallback);
+        ArgumentNullException.ThrowIfNull(activeCallback);
+        await using var operation = await MaintenanceGate
+            .EnterOperationAsync(lease, cancellationToken)
+            .ConfigureAwait(false);
+        CleanupOrphans(requireCanonical: true);
+        var image = await ReadCanonicalAsync(cancellationToken).ConfigureAwait(false);
+        using var state = Deserialize(image);
+        var destroyed = state.Destroyed.SingleOrDefault(candidate => candidate.Owner == owner);
+        if (destroyed is not null)
+        {
+            if (destroyed.KeyId != expectedKeyId) throw new VaultReceiptConflictException();
+            return destroyedCallback();
+        }
+
+        var active = state.Active.SingleOrDefault(candidate => candidate.Owner == owner)
+            ?? throw new VaultDataKeyNotFoundException();
+        if (active.KeyId != expectedKeyId) throw new VaultReceiptConflictException();
+        return await UseKeyAsync(state, active, activeCallback, cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task DestroyDataKeyAsync(
         VaultDestroyedKeyReceipt receipt,
         VaultMaintenanceLease lease,
