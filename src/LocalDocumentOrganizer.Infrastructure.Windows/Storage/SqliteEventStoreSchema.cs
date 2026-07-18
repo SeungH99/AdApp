@@ -39,6 +39,24 @@ internal static class SqliteEventStoreSchema
         PRAGMA user_version = 1;
         """;
 
+    private const string OperationIdMappingSql = """
+        CREATE TABLE IF NOT EXISTS event_operation_ids(
+            event_id TEXT PRIMARY KEY,
+            operation_id TEXT NOT NULL,
+            FOREIGN KEY(event_id) REFERENCES timeline_events(event_id)
+        );
+        CREATE TRIGGER IF NOT EXISTS event_operation_ids_immutable_update
+        BEFORE UPDATE ON event_operation_ids
+        BEGIN
+            SELECT RAISE(ABORT, 'event_operation_ids is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS event_operation_ids_immutable_delete
+        BEFORE DELETE ON event_operation_ids
+        BEGIN
+            SELECT RAISE(ABORT, 'event_operation_ids is immutable');
+        END;
+        """;
+
     public static async Task InitializeAsync(
         string connectionString,
         IReadOnlyList<ISqliteProjection> projections,
@@ -72,6 +90,12 @@ internal static class SqliteEventStoreSchema
             {
                 await ExecuteNonQueryAsync(connection, transaction, VersionOneSql, cancellationToken);
             }
+
+            await ExecuteNonQueryAsync(
+                connection,
+                transaction,
+                OperationIdMappingSql,
+                cancellationToken);
 
             foreach (var projection in projections)
             {

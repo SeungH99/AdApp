@@ -64,7 +64,7 @@ internal sealed class SqliteProjectionRebuilder
                 foreach (var rawEvent in batch)
                 {
                     ValidateAndAdvanceHead(streamHeads, rawEvent.StoredEvent);
-                    var currentEvent = Upcast(rawEvent.StoredEvent);
+                    var currentEvent = Upcast(rawEvent.StoredEvent, rawEvent.OperationId);
                     foreach (var projection in _projections)
                     {
                         await projection.ApplyAsync(
@@ -144,7 +144,7 @@ internal sealed class SqliteProjectionRebuilder
         }
     }
 
-    private StoredEvent Upcast(StoredEvent rawEvent)
+    private StoredEvent Upcast(StoredEvent rawEvent, OperationId operationId)
     {
         var currentEvent = _schemaRegistry.UpcastToCurrent(new DecryptedEvent(
             new EventMetadata(
@@ -154,7 +154,7 @@ internal sealed class SqliteProjectionRebuilder
                 rawEvent.EventType,
                 rawEvent.SchemaVersion,
                 rawEvent.RecordedAtUtc,
-                new OperationId(rawEvent.EventId.Value),
+                operationId,
                 null,
                 0),
             rawEvent.Payload));
@@ -194,11 +194,12 @@ internal sealed class SqliteProjectionRebuilder
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT global_position, stream_id, stream_version, event_id, event_type,
-                   schema_version, payload_json, recorded_at_utc
-            FROM timeline_events
-            WHERE global_position > $after_global_position
-            ORDER BY global_position ASC
+            SELECT e.global_position, e.stream_id, e.stream_version, e.event_id, e.event_type,
+                   e.schema_version, e.payload_json, e.recorded_at_utc, m.operation_id
+            FROM timeline_events e
+            LEFT JOIN event_operation_ids m ON m.event_id = e.event_id
+            WHERE e.global_position > $after_global_position
+            ORDER BY e.global_position ASC
             LIMIT $batch_size;
             """;
         command.Parameters.AddWithValue("$after_global_position", afterGlobalPosition);
@@ -208,19 +209,23 @@ internal sealed class SqliteProjectionRebuilder
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
+            var eventId = new EventId(Guid.Parse(reader.GetString(3)));
             batch.Add(new RawTimelineEvent(
                 reader.GetInt64(0),
                 new StoredEvent(
                     new StreamId(Guid.Parse(reader.GetString(1))),
                     new StreamVersion(reader.GetInt64(2)),
-                    new EventId(Guid.Parse(reader.GetString(3))),
+                    eventId,
                     reader.GetString(4),
                     reader.GetInt32(5),
                     reader.GetFieldValue<byte[]>(6),
                     DateTimeOffset.Parse(
                         reader.GetString(7),
                         CultureInfo.InvariantCulture,
-                        DateTimeStyles.RoundtripKind))));
+                        DateTimeStyles.RoundtripKind)),
+                reader.IsDBNull(8)
+                    ? new OperationId(eventId.Value)
+                    : new OperationId(Guid.Parse(reader.GetString(8)))));
         }
 
         return batch;
@@ -296,5 +301,8 @@ internal sealed class SqliteProjectionRebuilder
         }
     }
 
-    private sealed record RawTimelineEvent(long GlobalPosition, StoredEvent StoredEvent);
+    private sealed record RawTimelineEvent(
+        long GlobalPosition,
+        StoredEvent StoredEvent,
+        OperationId OperationId);
 }

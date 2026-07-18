@@ -68,10 +68,12 @@ public sealed class SqliteEventStore : IEventStore
             _connectionString, cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = """
-            SELECT stream_version, event_id, event_type, schema_version, payload_json, recorded_at_utc
-            FROM timeline_events
-            WHERE stream_id = $stream_id
-            ORDER BY stream_version;
+            SELECT e.stream_version, e.event_id, e.event_type, e.schema_version,
+                   e.payload_json, e.recorded_at_utc, m.operation_id
+            FROM timeline_events e
+            LEFT JOIN event_operation_ids m ON m.event_id = e.event_id
+            WHERE e.stream_id = $stream_id
+            ORDER BY e.stream_version;
             """;
         command.Parameters.AddWithValue("$stream_id", streamId.Value.ToString("D"));
 
@@ -90,7 +92,9 @@ public sealed class SqliteEventStore : IEventStore
                     reader.GetString(5),
                     CultureInfo.InvariantCulture,
                     DateTimeStyles.RoundtripKind).ToUniversalTime(),
-                new OperationId(eventId.Value),
+                reader.IsDBNull(6)
+                    ? new OperationId(eventId.Value)
+                    : new OperationId(Guid.Parse(reader.GetString(6))),
                 null,
                 0);
             events.Add(_schemaRegistry.UpcastToCurrent(
@@ -155,6 +159,12 @@ public sealed class SqliteEventStore : IEventStore
                     streamVersion,
                     eventToAppend,
                     recordedAtUtc,
+                    cancellationToken);
+                await InsertOperationIdAsync(
+                    connection,
+                    transaction,
+                    eventToAppend.EventId,
+                    command.OperationId,
                     cancellationToken);
                 var storedEvent = new StoredEvent(
                     command.StreamId,
@@ -221,6 +231,12 @@ public sealed class SqliteEventStore : IEventStore
         var eventIds = new HashSet<Guid>();
         foreach (var eventToAppend in events)
         {
+            if (eventToAppend.Protection is PayloadProtection.Shreddable)
+            {
+                throw new NotSupportedException(
+                    "Shreddable payload protection is not supported by the current event-store schema.");
+            }
+
             if (!eventIds.Add(eventToAppend.EventId.Value))
             {
                 throw new ArgumentException(
@@ -333,6 +349,24 @@ public sealed class SqliteEventStore : IEventStore
         return Convert.ToInt64(
             await command.ExecuteScalarAsync(cancellationToken),
             CultureInfo.InvariantCulture);
+    }
+
+    private static async Task InsertOperationIdAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        EventId eventId,
+        OperationId operationId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO event_operation_ids(event_id, operation_id)
+            VALUES ($event_id, $operation_id);
+            """;
+        command.Parameters.AddWithValue("$event_id", eventId.Value.ToString("D"));
+        command.Parameters.AddWithValue("$operation_id", operationId.Value.ToString("D"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private static bool IsBusyOrLocked(SqliteException exception) =>
