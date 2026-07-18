@@ -18,4 +18,14 @@ public interface ISqliteProjection
         SqliteConnection connection,
         SqliteTransaction transaction,
         CancellationToken cancellationToken);
+
+    Task ResetAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken);
+
+    Task<string> CalculateChecksumAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken);
 }

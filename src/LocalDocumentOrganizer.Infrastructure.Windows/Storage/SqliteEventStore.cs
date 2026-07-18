@@ -51,6 +51,13 @@ public sealed class SqliteEventStore : IEventStore
         SqliteEventStoreSchema.InitializeAsync(
             _connectionString, _projections, cancellationToken);
 
+    public Task<ProjectionRebuildResult> RebuildProjectionsAsync(
+        CancellationToken cancellationToken = default) =>
+        new SqliteProjectionRebuilder(
+            _connectionString,
+            _schemaRegistry,
+            _projections).RebuildAsync(cancellationToken);
+
     public async Task<IReadOnlyList<StoredEvent>> ReadStreamAsync(
         StreamId streamId,
         CancellationToken cancellationToken)
@@ -71,7 +78,7 @@ public sealed class SqliteEventStore : IEventStore
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
-            events.Add(new StoredEvent(
+            var rawEvent = new StoredEvent(
                 streamId,
                 new StreamVersion(reader.GetInt64(0)),
                 new EventId(Guid.Parse(reader.GetString(1))),
@@ -81,7 +88,15 @@ public sealed class SqliteEventStore : IEventStore
                 DateTimeOffset.Parse(
                     reader.GetString(5),
                     CultureInfo.InvariantCulture,
-                    DateTimeStyles.RoundtripKind)));
+                    DateTimeStyles.RoundtripKind));
+            events.Add(new StoredEvent(
+                rawEvent.StreamId,
+                rawEvent.StreamVersion,
+                rawEvent.EventId,
+                rawEvent.EventType,
+                _schemaRegistry.GetCurrentVersion(rawEvent.EventType),
+                _schemaRegistry.UpcastToCurrent(rawEvent),
+                rawEvent.RecordedAtUtc));
         }
 
         return events;
@@ -146,7 +161,7 @@ public sealed class SqliteEventStore : IEventStore
                         connection,
                         transaction,
                         cancellationToken);
-                    await UpdateCheckpointAsync(
+                    await SqliteProjectionCheckpointStore.AdvanceAsync(
                         connection,
                         transaction,
                         projection.Name,
@@ -307,26 +322,6 @@ public sealed class SqliteEventStore : IEventStore
         return Convert.ToInt64(
             await command.ExecuteScalarAsync(cancellationToken),
             CultureInfo.InvariantCulture);
-    }
-
-    private static async Task UpdateCheckpointAsync(
-        SqliteConnection connection,
-        SqliteTransaction transaction,
-        string projectionName,
-        long globalPosition,
-        CancellationToken cancellationToken)
-    {
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = """
-            INSERT INTO projection_checkpoints(projection_name, last_global_position)
-            VALUES ($projection_name, $global_position)
-            ON CONFLICT(projection_name) DO UPDATE SET
-                last_global_position = excluded.last_global_position;
-            """;
-        command.Parameters.AddWithValue("$projection_name", projectionName);
-        command.Parameters.AddWithValue("$global_position", globalPosition);
-        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private static bool IsBusyOrLocked(SqliteException exception) =>
