@@ -1,0 +1,416 @@
+<Window
+    x:Class="LocalDocumentOrganizer.App.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <Grid Background="{ThemeResource AppSurfaceBrush}">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="208" />
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="412" />
+        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="64" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <Border
+            x:Name="PrimaryNavigation"
+            Grid.RowSpan="2"
+            Background="{ThemeResource AppNavBrush}"
+            BorderBrush="{ThemeResource AppBorderBrush}"
+            BorderThickness="0,0,1,0">
+            <Grid Padding="16,18,14,18">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="48" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <StackPanel Orientation="Horizontal" Spacing="10">
+                    <Border
+                        Width="24"
+                        Height="24"
+                        Background="#FF111411"
+                        CornerRadius="3">
+                        <TextBlock
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            FontWeight="Bold"
+                            Foreground="{StaticResource AppAccentBrush}"
+                            Text="P" />
+                    </Border>
+                    <TextBlock
+                        VerticalAlignment="Center"
+                        FontSize="15"
+                        FontWeight="SemiBold"
+                        Foreground="{ThemeResource AppTextBrush}"
+                        Text="Proof to Closure" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="1" Margin="0,20,0,0">
+                    <Button
+                        Style="{StaticResource NavButtonStyle}"
+                        Background="{ThemeResource AppSelectionBrush}"
+                        BorderBrush="{StaticResource AppAccentBrush}"
+                        BorderThickness="3,0,0,0"
+                        Content="▣   Today" />
+                    <Button Style="{StaticResource NavButtonStyle}" Content="▤   Inbox                         7" />
+                    <Button Style="{StaticResource NavButtonStyle}" Content="☑   Review                        3" />
+                    <Button Style="{StaticResource NavButtonStyle}" Content="□   Cases" />
+                    <Button Style="{StaticResource NavButtonStyle}" Content="⌁   Activity" />
+                    <Button Style="{StaticResource NavButtonStyle}" Content="⚙   Settings" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="2" Spacing="10">
+                    <ComboBox
+                        HorizontalAlignment="Stretch"
+                        AutomationProperties.Name="Interface language"
+                        SelectedIndex="0">
+                        <ComboBoxItem Content="EN" />
+                        <ComboBoxItem Content="KO" />
+                        <ComboBoxItem Content="JA" />
+                        <ComboBoxItem Content="DE" />
+                        <ComboBoxItem Content="FR" />
+                        <ComboBoxItem Content="ES" />
+                    </ComboBox>
+                    <Button
+                        HorizontalAlignment="Stretch"
+                        HorizontalContentAlignment="Left"
+                        Content="⌘  Command palette        Ctrl+J" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Ellipse Width="9" Height="9" Fill="{StaticResource AppAccentBrush}" />
+                        <TextBlock Style="{StaticResource SubtleTextStyle}" Text="All local · Today, 09:14" />
+                    </StackPanel>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Border
+            Grid.Column="1"
+            Grid.ColumnSpan="2"
+            Background="{ThemeResource AppPanelBrush}"
+            BorderBrush="{ThemeResource AppBorderBrush}"
+            BorderThickness="0,0,0,1">
+            <Grid Margin="22,0,18,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="220" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock
+                    VerticalAlignment="Center"
+                    FontSize="20"
+                    FontWeight="SemiBold"
+                    Foreground="{ThemeResource AppTextBrush}"
+                    Text="Today" />
+                <TextBox
+                    x:Name="GlobalSearch"
+                    Grid.Column="1"
+                    MaxWidth="540"
+                    HorizontalAlignment="Stretch"
+                    VerticalAlignment="Center"
+                    AutomationProperties.Name="Search cases and documents"
+                    PlaceholderText="Search cases, documents, people…" />
+                <Button
+                    Grid.Column="2"
+                    Margin="12,0,0,0"
+                    VerticalAlignment="Center"
+                    AutomationProperties.Name="Local processing status"
+                    Content="●  Local processing  ⌄" />
+                <Button
+                    Grid.Column="3"
+                    Margin="10,0,0,0"
+                    VerticalAlignment="Center"
+                    AutomationProperties.Name="Add documents"
+                    Content="⊕  Add documents" />
+            </Grid>
+        </Border>
+
+        <ScrollViewer Grid.Row="1" Grid.Column="1">
+            <StackPanel Margin="22,24,18,24" Spacing="18">
+                <Grid ColumnSpacing="0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="1.35*" />
+                        <ColumnDefinition Width="1*" />
+                        <ColumnDefinition Width="1*" />
+                        <ColumnDefinition Width="1*" />
+                        <ColumnDefinition Width="1.25*" />
+                    </Grid.ColumnDefinitions>
+                    <Border Grid.Column="0" Background="#FF111411" CornerRadius="6" Padding="14,12" Margin="0,0,10,0">
+                        <StackPanel>
+                            <TextBlock FontSize="16" FontWeight="SemiBold" Foreground="White" Text="◷  3 need action" />
+                            <TextBlock FontSize="12" Foreground="#FFD9DDD6" Text="Within five seconds" />
+                        </StackPanel>
+                    </Border>
+                    <Border Grid.Column="1" Style="{StaticResource MetricCardStyle}">
+                        <StackPanel>
+                            <TextBlock FontSize="16" FontWeight="SemiBold" Text="$2,650.00" />
+                            <TextBlock Style="{StaticResource SubtleTextStyle}" Text="At risk" />
+                        </StackPanel>
+                    </Border>
+                    <Border Grid.Column="2" Style="{StaticResource MetricCardStyle}">
+                        <StackPanel>
+                            <TextBlock FontSize="16" FontWeight="SemiBold" Text="3" />
+                            <TextBlock Style="{StaticResource SubtleTextStyle}" Text="Due today" />
+                        </StackPanel>
+                    </Border>
+                    <Border Grid.Column="3" Style="{StaticResource MetricCardStyle}">
+                        <StackPanel>
+                            <TextBlock FontSize="16" FontWeight="SemiBold" Text="High" />
+                            <TextBlock Style="{StaticResource SubtleTextStyle}" Text="Risk detected" />
+                        </StackPanel>
+                    </Border>
+                    <Border Grid.Column="4" Style="{StaticResource MetricCardStyle}" Margin="0">
+                        <StackPanel>
+                            <TextBlock FontSize="15" FontWeight="SemiBold" Text="✓  Explicit approval" />
+                            <TextBlock Style="{StaticResource SubtleTextStyle}" Text="No automatic changes" />
+                        </StackPanel>
+                    </Border>
+                </Grid>
+
+                <TextBlock
+                    FontSize="15"
+                    FontWeight="SemiBold"
+                    Text="What needs action, why, and what evidence closes it." />
+
+                <Border
+                    x:Name="ActionDesk"
+                    Background="{ThemeResource AppPanelBrush}"
+                    BorderBrush="{ThemeResource AppBorderBrush}"
+                    BorderThickness="1"
+                    CornerRadius="7">
+                    <StackPanel>
+                        <Grid Padding="12,10" BorderBrush="{ThemeResource AppBorderBrush}">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <Button Background="{ThemeResource AppControlBrush}" Content="☷  Action Desk" />
+                                <Button Content="⌁  Timeline" />
+                                <Button Content="▦  Calendar" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                                <TextBlock VerticalAlignment="Center" Style="{StaticResource SubtleTextStyle}" Text="Sort by" />
+                                <Button Content="Due / Risk  ⇅" />
+                            </StackPanel>
+                        </Grid>
+
+                        <Grid Padding="12,8" Background="{ThemeResource AppControlBrush}" ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="32" />
+                                <ColumnDefinition Width="2.1*" />
+                                <ColumnDefinition Width="1.2*" />
+                                <ColumnDefinition Width="0.8*" />
+                                <ColumnDefinition Width="1.15*" />
+                                <ColumnDefinition Width="1.35*" />
+                                <ColumnDefinition Width="1.35*" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="1" Style="{StaticResource SubtleTextStyle}" Text="Action needed" />
+                            <TextBlock Grid.Column="2" Style="{StaticResource SubtleTextStyle}" Text="Case" />
+                            <TextBlock Grid.Column="3" Style="{StaticResource SubtleTextStyle}" Text="Amount" />
+                            <TextBlock Grid.Column="4" Style="{StaticResource SubtleTextStyle}" Text="Due / Status" />
+                            <TextBlock Grid.Column="5" Style="{StaticResource SubtleTextStyle}" Text="Why it matters" />
+                            <TextBlock Grid.Column="6" Style="{StaticResource SubtleTextStyle}" Text="Next action" />
+                        </Grid>
+
+                        <Border Background="{ThemeResource AppSelectionBrush}" BorderBrush="{StaticResource AppAccentBrush}" BorderThickness="1" Padding="12,12">
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="32" />
+                                    <ColumnDefinition Width="2.1*" />
+                                    <ColumnDefinition Width="1.2*" />
+                                    <ColumnDefinition Width="0.8*" />
+                                    <ColumnDefinition Width="1.15*" />
+                                    <ColumnDefinition Width="1.35*" />
+                                    <ColumnDefinition Width="1.35*" />
+                                </Grid.ColumnDefinitions>
+                                <CheckBox IsChecked="True" VerticalAlignment="Center" />
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock Foreground="{StaticResource AppRiskBrush}" FontSize="11" Text="High risk" />
+                                    <TextBlock FontWeight="SemiBold" Text="Unpaid client invoice" />
+                                    <TextBlock Style="{StaticResource SubtleTextStyle}" Text="INV-2024-1047 · Acme Studio" />
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Acme Studio" />
+                                    <TextBlock Style="{StaticResource SubtleTextStyle}" Text="Case #C-0241" />
+                                </StackPanel>
+                                <TextBlock Grid.Column="3" FontWeight="SemiBold" Text="$1,800" />
+                                <StackPanel Grid.Column="4">
+                                    <TextBlock Foreground="{StaticResource AppRiskBrush}" FontWeight="SemiBold" Text="Overdue" />
+                                    <TextBlock Style="{StaticResource SubtleTextStyle}" Text="Due 2 days ago" />
+                                </StackPanel>
+                                <TextBlock Grid.Column="5" TextWrapping="Wrap" Text="Cash flow impact. Client commitment in writing." />
+                                <TextBlock Grid.Column="6" TextWrapping="Wrap" Text="Send reminder and confirm payment" />
+                            </Grid>
+                        </Border>
+
+                        <Border BorderBrush="{ThemeResource AppBorderBrush}" BorderThickness="0,1,0,0" Padding="12,14">
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="32" />
+                                    <ColumnDefinition Width="2.1*" />
+                                    <ColumnDefinition Width="1.2*" />
+                                    <ColumnDefinition Width="0.8*" />
+                                    <ColumnDefinition Width="1.15*" />
+                                    <ColumnDefinition Width="1.35*" />
+                                    <ColumnDefinition Width="1.35*" />
+                                </Grid.ColumnDefinitions>
+                                <CheckBox VerticalAlignment="Center" />
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock Foreground="{StaticResource AppWarningBrush}" FontSize="11" Text="Medium risk" />
+                                    <TextBlock FontWeight="SemiBold" Text="Utility bill due today" />
+                                    <TextBlock Style="{StaticResource SubtleTextStyle}" Text="BILL-7788 · Hydro Quebec" />
+                                </StackPanel>
+                                <TextBlock Grid.Column="2" Text="Home Utilities" />
+                                <TextBlock Grid.Column="3" FontWeight="SemiBold" Text="$218.45" />
+                                <TextBlock Grid.Column="4" Foreground="{StaticResource AppWarningBrush}" Text="Due today" />
+                                <TextBlock Grid.Column="5" TextWrapping="Wrap" Text="Late fee after today" />
+                                <TextBlock Grid.Column="6" TextWrapping="Wrap" Text="Approve payment from checking" />
+                            </Grid>
+                        </Border>
+
+                        <Border BorderBrush="{ThemeResource AppBorderBrush}" BorderThickness="0,1,0,0" Padding="12,14">
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="32" />
+                                    <ColumnDefinition Width="2.1*" />
+                                    <ColumnDefinition Width="1.2*" />
+                                    <ColumnDefinition Width="0.8*" />
+                                    <ColumnDefinition Width="1.15*" />
+                                    <ColumnDefinition Width="1.35*" />
+                                    <ColumnDefinition Width="1.35*" />
+                                </Grid.ColumnDefinitions>
+                                <CheckBox VerticalAlignment="Center" />
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock Foreground="{StaticResource AppWarningBrush}" FontSize="11" Text="Medium risk" />
+                                    <TextBlock FontWeight="SemiBold" Text="Return awaiting refund proof" />
+                                    <TextBlock Style="{StaticResource SubtleTextStyle}" Text="RET-55901 · Northland Gear" />
+                                </StackPanel>
+                                <TextBlock Grid.Column="2" Text="Northland Gear" />
+                                <TextBlock Grid.Column="3" FontWeight="SemiBold" Text="$631.55" />
+                                <TextBlock Grid.Column="4" Foreground="{StaticResource AppInfoBrush}" Text="In progress" />
+                                <TextBlock Grid.Column="5" TextWrapping="Wrap" Text="Refund approved by vendor" />
+                                <TextBlock Grid.Column="6" TextWrapping="Wrap" Text="Confirm refund received" />
+                            </Grid>
+                        </Border>
+                    </StackPanel>
+                </Border>
+
+                <Border Background="{ThemeResource AppControlBrush}" CornerRadius="6" Padding="14,12">
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <TextBlock FontSize="18" Text="♧" />
+                        <StackPanel>
+                            <TextBlock FontWeight="SemiBold" Text="How this works" />
+                            <TextBlock Style="{StaticResource SubtleTextStyle}" Text="We show what needs action, why it matters, and what evidence closes it. You decide." />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+
+        <Border
+            x:Name="CaseInspector"
+            Grid.Row="1"
+            Grid.Column="2"
+            Background="{ThemeResource AppPanelBrush}"
+            BorderBrush="{ThemeResource AppBorderBrush}"
+            BorderThickness="1,0,0,0">
+            <Grid Padding="26,22,24,20">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <StackPanel Spacing="8">
+                    <TextBlock FontSize="18" FontWeight="SemiBold" Text="Unpaid client invoice" />
+                    <TextBlock Foreground="{StaticResource AppRiskBrush}" Text="High risk" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel>
+                            <TextBlock FontWeight="SemiBold" Text="Acme Studio" />
+                            <TextBlock Style="{StaticResource SubtleTextStyle}" Text="Case #C-0241" />
+                        </StackPanel>
+                        <TextBlock Grid.Column="1" FontSize="17" FontWeight="SemiBold" Text="$1,800.00 USD" />
+                    </Grid>
+                    <Grid Margin="0,4,0,0">
+                        <TextBlock Text="INV-2024-1047" />
+                        <StackPanel HorizontalAlignment="Right">
+                            <TextBlock HorizontalAlignment="Right" Foreground="{StaticResource AppRiskBrush}" FontWeight="SemiBold" Text="Overdue" />
+                            <TextBlock Style="{StaticResource SubtleTextStyle}" Text="Due 2 days ago · May 14, 2024" />
+                        </StackPanel>
+                    </Grid>
+                </StackPanel>
+
+                <StackPanel Grid.Row="1" Margin="0,22,0,0">
+                    <StackPanel Orientation="Horizontal" Spacing="24">
+                        <TextBlock FontWeight="SemiBold" Text="Evidence" />
+                        <TextBlock Foreground="{ThemeResource AppSubtleTextBrush}" Text="Timeline" />
+                    </StackPanel>
+                    <Border Height="2" Width="70" HorizontalAlignment="Left" Margin="0,9,0,0" Background="{StaticResource AppAccentBrush}" />
+                </StackPanel>
+
+                <ScrollViewer Grid.Row="2" Margin="0,18,0,16">
+                    <StackPanel Spacing="20">
+                        <StackPanel Spacing="5">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="What closes this" />
+                            <TextBlock TextWrapping="Wrap" Text="Payment received in full for $1,800.00 USD. Look for a matching bank transaction." />
+                        </StackPanel>
+
+                        <StackPanel Spacing="8">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Evidence (3)" />
+                            <Border BorderBrush="{ThemeResource AppBorderBrush}" BorderThickness="1" CornerRadius="5">
+                                <StackPanel>
+                                    <TextBlock Padding="12,10" Text="▧  Invoice_INV-2024-1047.pdf" />
+                                    <TextBlock Padding="12,10" Text="▧  Signed_SOW_Acme_Studio.pdf" />
+                                    <TextBlock Padding="12,10" Text="▤  Bank_statement_May_2024.pdf" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+
+                        <StackPanel Spacing="9">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Timeline (5)" />
+                            <TextBlock Text="May 14, 09:02   •  Invoice due date passed" />
+                            <TextBlock Text="May 10, 14:31   ✉  Reminder email recorded" />
+                            <TextBlock Text="May 01, 10:15   ⊞  Invoice created by you" />
+                            <TextBlock Text="Apr 28, 16:46   ⌁  SOW linked as evidence" />
+                            <TextBlock Text="Apr 28, 16:30   □  Case created" />
+                        </StackPanel>
+                    </StackPanel>
+                </ScrollViewer>
+
+                <StackPanel Grid.Row="3" Spacing="9">
+                    <Grid ColumnSpacing="10">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="132" />
+                        </Grid.ColumnDefinitions>
+                        <Button
+                            x:Name="ApproveActionButton"
+                            Background="{StaticResource AppAccentBrush}"
+                            Foreground="{StaticResource AppAccentTextBrush}"
+                            FontWeight="SemiBold"
+                            AutomationProperties.Name="Approve selected action"
+                            Click="ApproveActionButton_Click"
+                            Content="✓  Approve action" />
+                        <Button Grid.Column="1" Content="Not now" />
+                    </Grid>
+                    <TextBlock
+                        x:Name="ApprovalStatusText"
+                        Style="{StaticResource SubtleTextStyle}"
+                        Text="▣  Explicit approval only. No automatic file changes." />
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
