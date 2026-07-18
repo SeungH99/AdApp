@@ -1,6 +1,6 @@
 namespace LocalDocumentOrganizer.Core.Events;
 
-public readonly record struct StreamId
+public sealed record StreamId
 {
     public StreamId(Guid value)
     {
@@ -15,7 +15,7 @@ public readonly record struct StreamId
     public Guid Value { get; }
 }
 
-public readonly record struct EventId
+public sealed record EventId
 {
     public EventId(Guid value)
     {
@@ -60,13 +60,14 @@ public sealed record EventToAppend
         int schemaVersion,
         ReadOnlyMemory<byte> payload)
     {
+        ArgumentNullException.ThrowIfNull(eventId);
         EventContractValidation.ThrowIfInvalidEventType(eventType);
         EventContractValidation.ThrowIfInvalidSchemaVersion(schemaVersion);
 
         EventId = eventId;
         EventType = eventType;
         SchemaVersion = schemaVersion;
-        Payload = payload;
+        Payload = payload.ToArray();
     }
 
     public EventId EventId { get; }
@@ -89,6 +90,8 @@ public sealed record StoredEvent
         ReadOnlyMemory<byte> payload,
         DateTimeOffset recordedAtUtc)
     {
+        ArgumentNullException.ThrowIfNull(streamId);
+        ArgumentNullException.ThrowIfNull(eventId);
         EventContractValidation.ThrowIfInvalidEventType(eventType);
         EventContractValidation.ThrowIfInvalidSchemaVersion(schemaVersion);
 
@@ -97,7 +100,7 @@ public sealed record StoredEvent
         EventId = eventId;
         EventType = eventType;
         SchemaVersion = schemaVersion;
-        Payload = payload;
+        Payload = payload.ToArray();
         RecordedAtUtc = recordedAtUtc.ToUniversalTime();
     }
 
@@ -123,6 +126,7 @@ public sealed record AppendEventsCommand
         StreamVersion expectedVersion,
         IEnumerable<EventToAppend> events)
     {
+        ArgumentNullException.ThrowIfNull(streamId);
         ArgumentNullException.ThrowIfNull(events);
 
         var snapshot = Array.AsReadOnly(events.ToArray());
