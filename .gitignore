@@ -24,3 +24,11 @@ index.md
 !.gitlab/merge_request_templates/
 !.gitlab/merge_request_templates/*.md
 .context/
+tests/
+bin/
+obj/
+TestResults/
+.vs/
+artifacts/
+*.user
+*.suo
