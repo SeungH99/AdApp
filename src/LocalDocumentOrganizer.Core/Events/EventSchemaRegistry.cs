@@ -119,6 +119,17 @@ public sealed class EventSchemaRegistry
 
         return payload;
     }
+
+    public int GetCurrentVersion(string eventType)
+    {
+        EventContractValidation.ThrowIfInvalidEventType(eventType);
+        if (!_currentVersions.TryGetValue(eventType, out var currentVersion))
+        {
+            throw new UnknownEventTypeException(eventType);
+        }
+
+        return currentVersion;
+    }
 }
 
 public abstract class EventSchemaException : InvalidOperationException
