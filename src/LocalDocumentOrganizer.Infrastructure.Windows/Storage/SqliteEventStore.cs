@@ -18,8 +18,37 @@ public sealed class SqliteEventStore : IEventStore
         string connectionString,
         EventSchemaRegistry schemaRegistry,
         IEnumerable<ISqliteProjection> projections,
-        TimeProvider? timeProvider = null,
-        VaultKeyRingStore? keyRing = null)
+        TimeProvider? timeProvider = null)
+        : this(
+            connectionString,
+            schemaRegistry,
+            projections,
+            timeProvider,
+            keyRing: null)
+    {
+    }
+
+    internal SqliteEventStore(
+        string connectionString,
+        EventSchemaRegistry schemaRegistry,
+        IEnumerable<ISqliteProjection> projections,
+        VaultKeyRingStore keyRing,
+        TimeProvider? timeProvider = null)
+        : this(
+            connectionString,
+            schemaRegistry,
+            projections,
+            timeProvider,
+            RequireKeyRing(keyRing))
+    {
+    }
+
+    private SqliteEventStore(
+        string connectionString,
+        EventSchemaRegistry schemaRegistry,
+        IEnumerable<ISqliteProjection> projections,
+        TimeProvider? timeProvider,
+        VaultKeyRingStore? keyRing)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         ArgumentNullException.ThrowIfNull(schemaRegistry);
@@ -28,7 +57,8 @@ public sealed class SqliteEventStore : IEventStore
         _projections = ValidateProjections(projections);
         _connectionString = SqliteEventStoreSchema.CanonicalizeConnectionString(connectionString);
         _timeProvider = timeProvider ?? TimeProvider.System;
-        _payloads = new SqliteEventPayloadProtectionProvider(keyRing ?? CreateDefaultKeyRing(_connectionString));
+        _payloads = new SqliteEventPayloadProtectionProvider(
+            keyRing ?? CreateDefaultKeyRing(_connectionString));
     }
 
     public Task InitializeAsync(CancellationToken cancellationToken = default) =>
@@ -40,13 +70,19 @@ public sealed class SqliteEventStore : IEventStore
     public async Task<IReadOnlyList<EventForReplay>> ReadStreamAsync(StreamId streamId, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(streamId);
+        SqliteEventStoreSchema.ValidateVaultPath(
+            _connectionString, _payloads.KeyRing.MaintenanceGate);
         await using var lease = await _payloads.KeyRing.MaintenanceGate.AcquireAsync(cancellationToken);
         await using var payloadSession = _payloads.CreateReadSession(lease);
-        await using var connection = await SqliteEventStoreSchema.OpenConnectionAsync(_connectionString, cancellationToken);
+        await using var connection = await SqliteEventStoreSchema.OpenConnectionAsync(
+            _connectionString, _payloads.KeyRing.MaintenanceGate, cancellationToken);
         await using var schemaTransaction = connection.BeginTransaction(deferred: true);
         try
         {
             await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(connection, schemaTransaction, cancellationToken);
+            payloadSession.BindExpectedIdentity(
+                await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
+                    connection, schemaTransaction, cancellationToken));
             await using var command = connection.CreateCommand();
             command.Transaction = schemaTransaction;
             command.CommandText = """
@@ -54,9 +90,11 @@ public sealed class SqliteEventStore : IEventStore
                        recorded_at_utc, operation_id, operation_index, operation_count,
                        protection_kind, owner_kind, owner_id, key_id, envelope_version, payload_nonce,
                        payload_ciphertext, payload_tag
-                FROM timeline_events WHERE stream_id = $stream_id ORDER BY global_position;
+                FROM main.timeline_events
+                WHERE CAST(stream_id AS TEXT) COLLATE NOCASE = $stream_id_text
+                ORDER BY global_position;
                 """;
-            command.Parameters.AddWithValue("$stream_id", streamId.Value.ToString("D"));
+            AddStreamLookupParameters(command, streamId);
             var persistedRows = new List<PersistedTimelineRow>();
             var operationGroups = new OperationGroupSequenceValidator();
             await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
@@ -106,20 +144,36 @@ public sealed class SqliteEventStore : IEventStore
     {
         ArgumentNullException.ThrowIfNull(command);
         ValidateAppendBatchIdentifiers(command.Events);
+        SqliteEventStoreSchema.ValidateVaultPath(
+            _connectionString, _payloads.KeyRing.MaintenanceGate);
         await using var lease = await _payloads.KeyRing.MaintenanceGate.AcquireAsync(cancellationToken);
-        await using var keySession = await _payloads.OpenWriteSessionAsync(lease, cancellationToken);
+        VaultKeyRingStore.VaultKeyRingSession? keySession = null;
         SqliteConnection? connection = null;
         SqliteTransaction? transaction = null;
         try
         {
-            connection = await SqliteEventStoreSchema.OpenConnectionAsync(_connectionString, cancellationToken);
+            connection = await SqliteEventStoreSchema.OpenConnectionAsync(
+                _connectionString, _payloads.KeyRing.MaintenanceGate, cancellationToken);
             transaction = connection.BeginTransaction(deferred: false);
             await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
+            var expectedKeyRingIdentity =
+                await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
+                    connection, transaction, cancellationToken);
+            keySession = await _payloads.OpenWriteSessionAsync(
+                lease, expectedKeyRingIdentity, cancellationToken);
+            await SqliteEventStoreSchema.ValidateKeyRingIdentityAsync(
+                connection, transaction, keySession.Identity, cancellationToken);
             var existing = await ReadOperationAsync(connection, transaction, command.OperationId, cancellationToken);
             if (existing.Count != 0)
             {
                 ValidateOperationGroup(existing, command.OperationId);
                 var comparison = await CompareRetryAsync(existing, command, keySession, cancellationToken);
+                if (comparison is RetryComparison.Exact or RetryComparison.Unavailable)
+                {
+                    await ValidateTargetStreamMetadataAsync(
+                        connection, transaction, command.StreamId, expectedHead: null,
+                        cancellationToken: cancellationToken);
+                }
                 await transaction.RollbackAsync(cancellationToken);
                 return comparison switch
                 {
@@ -133,6 +187,9 @@ public sealed class SqliteEventStore : IEventStore
             if (rebuildRequirement.ProjectionNames.Count != 0)
                 throw new ProjectionRebuildRequiredException(rebuildRequirement.ProjectionNames, rebuildRequirement.RequiredGlobalPosition);
 
+            await ValidateTargetStreamMetadataAsync(
+                connection, transaction, command.StreamId, expectedHead: null,
+                cancellationToken: cancellationToken);
             var newVersion = new StreamVersion(checked(command.ExpectedVersion.Value + command.Events.Count));
             var actualVersion = await ReserveStreamAsync(connection, transaction, command.StreamId, command.ExpectedVersion, newVersion, cancellationToken);
             if (actualVersion is not null)
@@ -141,29 +198,55 @@ public sealed class SqliteEventStore : IEventStore
                 return new ConcurrencyConflict(command.ExpectedVersion, actualVersion.Value);
             }
             var streamVersion = command.ExpectedVersion;
+            var appendedSnapshots = new List<AppendedEventSnapshot>(command.Events.Count);
             for (var operationIndex = 0; operationIndex < command.Events.Count; operationIndex++)
             {
                 var eventToAppend = command.Events[operationIndex];
                 streamVersion = streamVersion.Next();
                 var recordedAtUtc = _timeProvider.GetUtcNow();
+                var recordedAtText = recordedAtUtc.ToUniversalTime()
+                    .ToString("O", CultureInfo.InvariantCulture);
                 var protectedPayload = await _payloads.ProtectAsync(
                     eventToAppend, command.StreamId, streamVersion, command.OperationId,
                     keySession, cancellationToken);
                 var globalPosition = await InsertEventAsync(connection, transaction, command.StreamId, streamVersion,
                     eventToAppend, command.OperationId, operationIndex, command.Events.Count,
-                    recordedAtUtc, protectedPayload, cancellationToken);
+                    recordedAtText, protectedPayload, cancellationToken);
+                appendedSnapshots.Add(AppendedEventSnapshot.Create(
+                    globalPosition,
+                    command.StreamId,
+                    streamVersion,
+                    eventToAppend,
+                    command.OperationId,
+                    operationIndex,
+                    command.Events.Count,
+                    recordedAtText,
+                    protectedPayload));
                 var metadata = new EventMetadata(command.StreamId, streamVersion, eventToAppend.EventId, eventToAppend.EventType, eventToAppend.SchemaVersion, recordedAtUtc, command.OperationId, protectedPayload.KeyId, protectedPayload.EnvelopeVersion);
                 var decrypted = new DecryptedEvent(metadata, eventToAppend.Payload);
                 foreach (var projection in _projections)
                 {
-                    await projection.ApplyAsync(decrypted, globalPosition, connection, transaction, cancellationToken);
+                    await SqliteProjectionAuthorizer.RunAsync(
+                        connection,
+                        () => projection.ApplyAsync(
+                            decrypted, globalPosition, connection, transaction, cancellationToken));
                     await SqliteProjectionCheckpointStore.AdvanceAsync(connection, transaction, projection.Name, globalPosition, cancellationToken);
                 }
             }
-            await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
+            await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(
+                connection, transaction, cancellationToken);
             var appended = await ReadOperationAsync(
                 connection, transaction, command.OperationId, cancellationToken);
             ValidateOperationGroup(appended, command.OperationId);
+            await RequireExactAppendedOperationAsync(
+                appended, appendedSnapshots, command, keySession, cancellationToken);
+            await ValidateTargetStreamMetadataAsync(
+                connection, transaction, command.StreamId, newVersion, cancellationToken);
+            await keySession.RequireCanonicalImageAsync(cancellationToken);
+            await SqliteEventStoreSchema.ValidateKeyRingIdentityAsync(
+                connection, transaction, keySession.Identity, cancellationToken);
+            SqliteEventStoreSchema.ValidateVaultPath(
+                _connectionString, _payloads.KeyRing.MaintenanceGate);
             await transaction.CommitAsync(cancellationToken);
             return new Appended(newVersion);
         }
@@ -179,6 +262,7 @@ public sealed class SqliteEventStore : IEventStore
         }
         finally
         {
+            if (keySession is not null) await keySession.DisposeAsync();
             if (transaction is not null) await transaction.DisposeAsync();
             if (connection is not null) await connection.DisposeAsync();
         }
@@ -232,6 +316,40 @@ public sealed class SqliteEventStore : IEventStore
         if (metadataConflict || payloadConflict) return RetryComparison.Conflict;
         if (unavailable) return RetryComparison.Unavailable;
         return RetryComparison.Exact;
+    }
+
+    private async Task RequireExactAppendedOperationAsync(
+        IReadOnlyList<PersistedOperationEvent> actual,
+        IReadOnlyList<AppendedEventSnapshot> expected,
+        AppendEventsCommand command,
+        VaultKeyRingStore.VaultKeyRingSession keySession,
+        CancellationToken cancellationToken)
+    {
+        if (actual.Count != expected.Count || actual.Count != command.Events.Count)
+            throw new VaultRecoveryRequiredException();
+
+        for (var index = 0; index < expected.Count; index++)
+        {
+            if (!expected[index].ExactEquals(actual[index]))
+                throw new VaultRecoveryRequiredException();
+
+            var replay = await _payloads.UnprotectAsync(
+                actual[index].Event, keySession, cancellationToken);
+            if (replay is not DecryptedEvent decrypted)
+                throw new VaultRecoveryRequiredException();
+            var actualPayload = decrypted.Payload;
+            var expectedPayload = command.Events[index].Payload;
+            try
+            {
+                if (!actualPayload.Span.SequenceEqual(expectedPayload.Span))
+                    throw new VaultRecoveryRequiredException();
+            }
+            finally
+            {
+                ZeroMemory(actualPayload);
+                ZeroMemory(expectedPayload);
+            }
+        }
     }
 
     private static void ValidateOperationGroup(IReadOnlyList<PersistedOperationEvent> rows, OperationId operationId)
@@ -310,31 +428,64 @@ public sealed class SqliteEventStore : IEventStore
     {
         var source = new SqliteConnectionStringBuilder(connectionString).DataSource;
         if (string.IsNullOrWhiteSpace(source) || source == ":memory:") throw new ArgumentException("Encrypted Vault storage requires a file-backed data source.", nameof(connectionString));
-        return new VaultKeyRingStore(Path.GetFullPath(source) + ".keyring");
+        return new VaultKeyRingStore(source + ".keyring");
     }
+
+    private static VaultKeyRingStore RequireKeyRing(VaultKeyRingStore? keyRing) =>
+        keyRing ?? throw new ArgumentNullException(nameof(keyRing));
 
     private static async Task<StreamVersion?> ReserveStreamAsync(SqliteConnection c, SqliteTransaction t, StreamId stream, StreamVersion expected, StreamVersion next, CancellationToken ct)
     {
+        var actual = await ReadHeadAsync(c, t, stream, ct);
         if (expected == StreamVersion.NoStream)
         {
-            var existing = await ReadHeadAsync(c, t, stream, ct); if (existing is not null) return existing;
-            await using var insert = c.CreateCommand(); insert.Transaction = t; insert.CommandText = "INSERT INTO event_streams(stream_id, head_version) VALUES($id, $version);";
-            insert.Parameters.AddWithValue("$id", stream.Value.ToString("D")); insert.Parameters.AddWithValue("$version", next.Value); await insert.ExecuteNonQueryAsync(ct); return null;
+            if (actual is not null) return actual;
+            await using var insert = c.CreateCommand();
+            insert.Transaction = t;
+            insert.CommandText = "INSERT INTO main.event_streams(stream_id, head_version) VALUES($id, $version);";
+            insert.Parameters.AddWithValue("$id", stream.Value.ToString("D"));
+            insert.Parameters.AddWithValue("$version", next.Value);
+            if (await insert.ExecuteNonQueryAsync(ct) != 1)
+                throw new VaultRecoveryRequiredException();
+            return null;
         }
-        await using var update = c.CreateCommand(); update.Transaction = t; update.CommandText = "UPDATE event_streams SET head_version=$next WHERE stream_id=$id AND head_version=$expected;";
-        update.Parameters.AddWithValue("$next", next.Value); update.Parameters.AddWithValue("$id", stream.Value.ToString("D")); update.Parameters.AddWithValue("$expected", expected.Value);
-        return await update.ExecuteNonQueryAsync(ct) == 1 ? null : await ReadHeadAsync(c, t, stream, ct) ?? StreamVersion.NoStream;
+
+        if (actual is null || actual != expected)
+            return actual ?? StreamVersion.NoStream;
+
+        await using var update = c.CreateCommand();
+        update.Transaction = t;
+        update.CommandText = "UPDATE main.event_streams SET head_version=$next WHERE stream_id=$id AND head_version=$expected;";
+        update.Parameters.AddWithValue("$next", next.Value);
+        update.Parameters.AddWithValue("$id", stream.Value.ToString("D"));
+        update.Parameters.AddWithValue("$expected", expected.Value);
+        if (await update.ExecuteNonQueryAsync(ct) != 1)
+            throw new VaultRecoveryRequiredException();
+        return null;
     }
 
     private static async Task<StreamVersion?> ReadHeadAsync(SqliteConnection c, SqliteTransaction t, StreamId stream, CancellationToken ct)
     {
         try
         {
-            await using var command = c.CreateCommand(); command.Transaction = t; command.CommandText = "SELECT head_version FROM event_streams WHERE stream_id=$id;"; command.Parameters.AddWithValue("$id", stream.Value.ToString("D"));
-            var value = await command.ExecuteScalarAsync(ct);
-            if (value is null) return null;
-            if (value is not long head) throw new VaultRecoveryRequiredException();
-            if (head < 0) throw new VaultRecoveryRequiredException();
+            await using var command = c.CreateCommand();
+            command.Transaction = t;
+            command.CommandText = """
+                SELECT stream_id, head_version
+                FROM main.event_streams
+                WHERE CAST(stream_id AS TEXT) COLLATE NOCASE = $stream_id_text;
+                """;
+            AddStreamLookupParameters(command, stream);
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct)) return null;
+            var persistedId = ParseCanonicalGuid(ReadRequiredText(reader, 0));
+            if (persistedId != stream.Value
+                || reader.GetValue(1) is not long head
+                || head < 0
+                || await reader.ReadAsync(ct))
+            {
+                throw new VaultRecoveryRequiredException();
+            }
             return new StreamVersion(head);
         }
         catch (VaultRecoveryRequiredException) { throw; }
@@ -343,6 +494,93 @@ public sealed class SqliteEventStore : IEventStore
         {
             throw new VaultRecoveryRequiredException(exception);
         }
+    }
+
+    private static async Task ValidateTargetStreamMetadataAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        StreamId stream,
+        StreamVersion? expectedHead,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var canonical = stream.Value.ToString("D");
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT COUNT(*),
+                       COALESCE(SUM(CASE WHEN typeof(stream_id) <> 'text'
+                                          OR stream_id COLLATE BINARY <> $stream_id_text
+                                         THEN 1 ELSE 0 END), 0),
+                       MIN(CASE WHEN typeof(stream_version) = 'integer' THEN stream_version END),
+                       MAX(CASE WHEN typeof(stream_version) = 'integer' THEN stream_version END),
+                       COUNT(DISTINCT CASE WHEN typeof(stream_version) = 'integer'
+                                           THEN stream_version END),
+                       COALESCE(SUM(CASE WHEN typeof(stream_version) <> 'integer'
+                                          OR stream_version < 0
+                                         THEN 1 ELSE 0 END), 0)
+                FROM main.timeline_events
+                WHERE CAST(stream_id AS TEXT) COLLATE NOCASE = $stream_id_text;
+                """;
+            command.Parameters.Add("$stream_id_text", SqliteType.Text).Value = canonical;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
+                throw new VaultRecoveryRequiredException();
+
+            var total = ReadRequiredInteger(reader, 0);
+            var invalidRepresentationCount = ReadRequiredInteger(reader, 1);
+            var minimum = reader.GetValue(2);
+            var maximum = reader.GetValue(3);
+            var distinctVersionCount = ReadRequiredInteger(reader, 4);
+            var invalidVersionCount = ReadRequiredInteger(reader, 5);
+            if (await reader.ReadAsync(cancellationToken))
+                throw new VaultRecoveryRequiredException();
+
+            var head = await ReadHeadAsync(connection, transaction, stream, cancellationToken);
+            if (expectedHead is not null && head != expectedHead)
+                throw new VaultRecoveryRequiredException();
+            if (total == 0)
+            {
+                if (invalidRepresentationCount != 0
+                    || minimum is not DBNull
+                    || maximum is not DBNull
+                    || distinctVersionCount != 0
+                    || invalidVersionCount != 0
+                    || head is not null)
+                {
+                    throw new VaultRecoveryRequiredException();
+                }
+
+                return;
+            }
+
+            if (total < 0
+                || invalidRepresentationCount != 0
+                || invalidVersionCount != 0
+                || minimum is not long minimumVersion
+                || maximum is not long maximumVersion
+                || head is null
+                || minimumVersion != 0
+                || maximumVersion != head.Value.Value
+                || distinctVersionCount != total
+                || checked(head.Value.Value + 1) != total)
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+        }
+        catch (VaultRecoveryRequiredException) { throw; }
+        catch (Exception exception) when (exception is SqliteException or InvalidCastException
+            or FormatException or OverflowException or InvalidOperationException)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
+    }
+
+    private static void AddStreamLookupParameters(SqliteCommand command, StreamId stream)
+    {
+        var canonical = stream.Value.ToString("D");
+        command.Parameters.Add("$stream_id_text", SqliteType.Text).Value = canonical;
     }
 
     private static async Task<long> InsertEventAsync(
@@ -354,13 +592,13 @@ public sealed class SqliteEventStore : IEventStore
         OperationId operation,
         int operationIndex,
         int operationCount,
-        DateTimeOffset recorded,
+        string recordedAtUtc,
         ProtectedEventPayload p,
         CancellationToken ct)
     {
         await using var command = c.CreateCommand(); command.Transaction = t;
-        command.CommandText = "INSERT INTO timeline_events(event_id,stream_id,stream_version,event_type,schema_version,recorded_at_utc,operation_id,operation_index,operation_count,protection_kind,owner_kind,owner_id,key_id,envelope_version,payload_nonce,payload_ciphertext,payload_tag) VALUES($event,$stream,$version,$type,$schema,$recorded,$operation,$operationIndex,$operationCount,$kind,$ownerKind,$ownerId,$key,$envelope,$nonce,$cipher,$tag) RETURNING global_position;";
-        command.Parameters.AddWithValue("$event", e.EventId.Value.ToString("D")); command.Parameters.AddWithValue("$stream", stream.Value.ToString("D")); command.Parameters.AddWithValue("$version", version.Value); command.Parameters.AddWithValue("$type", e.EventType); command.Parameters.AddWithValue("$schema", e.SchemaVersion); command.Parameters.AddWithValue("$recorded", recorded.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture)); command.Parameters.AddWithValue("$operation", operation.Value.ToString("D")); command.Parameters.AddWithValue("$operationIndex", operationIndex); command.Parameters.AddWithValue("$operationCount", operationCount); command.Parameters.AddWithValue("$kind", (int)p.Kind); command.Parameters.AddWithValue("$ownerKind", p.Owner is null ? DBNull.Value : (object)(int)p.Owner.Value.Kind); command.Parameters.AddWithValue("$ownerId", p.Owner is null ? DBNull.Value : p.Owner.Value.Id.Value.ToString("D")); command.Parameters.AddWithValue("$key", p.KeyId is null ? DBNull.Value : p.KeyId.Value.Value.ToString("D")); command.Parameters.AddWithValue("$envelope", p.EnvelopeVersion);
+        command.CommandText = "INSERT INTO main.timeline_events(event_id,stream_id,stream_version,event_type,schema_version,recorded_at_utc,operation_id,operation_index,operation_count,protection_kind,owner_kind,owner_id,key_id,envelope_version,payload_nonce,payload_ciphertext,payload_tag) VALUES($event,$stream,$version,$type,$schema,$recorded,$operation,$operationIndex,$operationCount,$kind,$ownerKind,$ownerId,$key,$envelope,$nonce,$cipher,$tag) RETURNING global_position;";
+        command.Parameters.AddWithValue("$event", e.EventId.Value.ToString("D")); command.Parameters.AddWithValue("$stream", stream.Value.ToString("D")); command.Parameters.AddWithValue("$version", version.Value); command.Parameters.AddWithValue("$type", e.EventType); command.Parameters.AddWithValue("$schema", e.SchemaVersion); command.Parameters.AddWithValue("$recorded", recordedAtUtc); command.Parameters.AddWithValue("$operation", operation.Value.ToString("D")); command.Parameters.AddWithValue("$operationIndex", operationIndex); command.Parameters.AddWithValue("$operationCount", operationCount); command.Parameters.AddWithValue("$kind", (int)p.Kind); command.Parameters.AddWithValue("$ownerKind", p.Owner is null ? DBNull.Value : (object)(int)p.Owner.Value.Kind); command.Parameters.AddWithValue("$ownerId", p.Owner is null ? DBNull.Value : p.Owner.Value.Id.Value.ToString("D")); command.Parameters.AddWithValue("$key", p.KeyId is null ? DBNull.Value : p.KeyId.Value.Value.ToString("D")); command.Parameters.AddWithValue("$envelope", p.EnvelopeVersion);
         command.Parameters.Add("$nonce", SqliteType.Blob).Value = p.Nonce ?? (object)DBNull.Value; command.Parameters.Add("$cipher", SqliteType.Blob).Value = p.Ciphertext; command.Parameters.Add("$tag", SqliteType.Blob).Value = p.Tag ?? (object)DBNull.Value;
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
@@ -374,22 +612,105 @@ public sealed class SqliteEventStore : IEventStore
         command.Transaction = transaction;
         command.CommandText = """
             SELECT global_position,stream_id,stream_version,operation_id,operation_index,operation_count
-            FROM timeline_events
+            FROM main.timeline_events
             ORDER BY global_position;
             """;
         var validator = new OperationGroupSequenceValidator();
+        var computedHeads = new Dictionary<StreamId, StreamVersion>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
-            validator.Accept(ReadOperationCoordinates(reader));
+            var coordinates = ReadOperationCoordinates(reader);
+            validator.Accept(coordinates);
+            StreamVersion expected;
+            try
+            {
+                expected = computedHeads.TryGetValue(coordinates.StreamId, out var head)
+                    ? head.Next()
+                    : new StreamVersion(0);
+            }
+            catch (Exception exception) when (exception is ArgumentOutOfRangeException or OverflowException)
+            {
+                throw new VaultRecoveryRequiredException(exception);
+            }
+            if (coordinates.StreamVersion != expected)
+                throw new VaultRecoveryRequiredException();
+            computedHeads[coordinates.StreamId] = coordinates.StreamVersion;
         }
         validator.Complete();
+        await ValidateStoredStreamHeadsAsync(
+            connection, transaction, computedHeads, cancellationToken);
+    }
+
+    internal static async Task ValidateStoredStreamHeadsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        IReadOnlyDictionary<StreamId, StreamVersion> computedHeads,
+        CancellationToken cancellationToken)
+    {
+        var unmatched = new Dictionary<StreamId, StreamVersion>(computedHeads);
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT stream_id, head_version
+            FROM main.event_streams
+            ORDER BY stream_id COLLATE BINARY;
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            StreamId stream;
+            StreamVersion head;
+            try
+            {
+                stream = new StreamId(ParseCanonicalGuid(ReadRequiredText(reader, 0)));
+                var value = ReadRequiredInteger(reader, 1);
+                if (value < 0) throw new VaultRecoveryRequiredException();
+                head = new StreamVersion(value);
+            }
+            catch (VaultRecoveryRequiredException) { throw; }
+            catch (Exception exception) when (exception is ArgumentException or InvalidCastException
+                or FormatException or OverflowException or InvalidOperationException)
+            {
+                throw new VaultRecoveryRequiredException(exception);
+            }
+
+            if (!unmatched.Remove(stream, out var expected) || head != expected)
+                throw new VaultRecoveryRequiredException();
+        }
+
+        if (unmatched.Count != 0)
+            throw new VaultRecoveryRequiredException();
     }
 
     private static async Task<IReadOnlyList<PersistedOperationEvent>> ReadOperationAsync(SqliteConnection c, SqliteTransaction t, OperationId operation, CancellationToken ct)
     {
-        await using var command = c.CreateCommand(); command.Transaction = t; command.CommandText = "SELECT global_position,stream_id,stream_version,event_id,event_type,schema_version,recorded_at_utc,operation_id,operation_index,operation_count,protection_kind,owner_kind,owner_id,key_id,envelope_version,payload_nonce,payload_ciphertext,payload_tag FROM timeline_events WHERE operation_id COLLATE NOCASE IN ($operation,CAST($operation AS BLOB),CAST(upper($operation) AS BLOB)) ORDER BY global_position;"; command.Parameters.AddWithValue("$operation", operation.Value.ToString("D"));
-        var values = new List<PersistedOperationEvent>(); await using var reader = await command.ExecuteReaderAsync(ct); while (await reader.ReadAsync(ct)) { var row = ReadPersistedTimelineRow(reader); values.Add(new PersistedOperationEvent(row.GlobalPosition, row.OperationIndex, row.OperationCount, row.Event)); } return values;
+        await ValidateOperationIdentifierRepresentationsAsync(c, t, operation, ct);
+        await using var command = c.CreateCommand(); command.Transaction = t; command.CommandText = "SELECT global_position,stream_id,stream_version,event_id,event_type,schema_version,recorded_at_utc,operation_id,operation_index,operation_count,protection_kind,owner_kind,owner_id,key_id,envelope_version,payload_nonce,payload_ciphertext,payload_tag FROM main.timeline_events WHERE operation_id COLLATE NOCASE IN ($operation,CAST($operation AS BLOB),CAST(upper($operation) AS BLOB)) ORDER BY global_position;"; command.Parameters.AddWithValue("$operation", operation.Value.ToString("D"));
+        var values = new List<PersistedOperationEvent>(); await using var reader = await command.ExecuteReaderAsync(ct); while (await reader.ReadAsync(ct)) { var row = ReadPersistedTimelineRow(reader); values.Add(new PersistedOperationEvent(row.GlobalPosition, row.OperationIndex, row.OperationCount, row.RecordedAtUtcText, row.Event)); } return values;
+    }
+
+    private static async Task ValidateOperationIdentifierRepresentationsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        OperationId operation,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT operation_id
+            FROM main.timeline_events
+            WHERE CAST(operation_id AS TEXT) COLLATE NOCASE = $operation
+            ORDER BY global_position;
+            """;
+        command.Parameters.AddWithValue("$operation", operation.Value.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            if (ParseCanonicalGuid(ReadRequiredText(reader, 0)) != operation.Value)
+                throw new VaultRecoveryRequiredException();
+        }
     }
 
     internal static PersistedTimelineRow ReadPersistedTimelineRow(SqliteDataReader reader)
@@ -456,7 +777,7 @@ public sealed class SqliteEventStore : IEventStore
             }
             var metadata = new EventMetadata(stream, streamVersion, eventId, eventType, schemaVersion,
                 recorded, operationId, keyId, envelopeVersion);
-            return new PersistedTimelineRow(globalPosition, operationIndex, operationCount,
+            return new PersistedTimelineRow(globalPosition, operationIndex, operationCount, recordedText,
                 new PersistedProtectedEvent(metadata, kind, owner, nonce, ciphertext, tag));
         }
         catch (VaultRecoveryRequiredException) { throw; }
@@ -523,13 +844,89 @@ public sealed class SqliteEventStore : IEventStore
         long GlobalPosition,
         int OperationIndex,
         int OperationCount,
+        string RecordedAtUtcText,
         PersistedProtectedEvent Event);
+
+    private sealed record AppendedEventSnapshot(
+        long GlobalPosition,
+        StreamId StreamId,
+        StreamVersion StreamVersion,
+        EventId EventId,
+        string EventType,
+        int SchemaVersion,
+        string RecordedAtUtcText,
+        OperationId OperationId,
+        int OperationIndex,
+        int OperationCount,
+        PersistedProtectionKind Kind,
+        SensitiveObjectRef? Owner,
+        DataKeyId? KeyId,
+        int EnvelopeVersion,
+        byte[]? Nonce,
+        byte[] Ciphertext,
+        byte[]? Tag)
+    {
+        internal static AppendedEventSnapshot Create(
+            long globalPosition,
+            StreamId streamId,
+            StreamVersion streamVersion,
+            EventToAppend eventToAppend,
+            OperationId operationId,
+            int operationIndex,
+            int operationCount,
+            string recordedAtUtcText,
+            ProtectedEventPayload payload) =>
+            new(
+                globalPosition,
+                streamId,
+                streamVersion,
+                eventToAppend.EventId,
+                eventToAppend.EventType,
+                eventToAppend.SchemaVersion,
+                recordedAtUtcText,
+                operationId,
+                operationIndex,
+                operationCount,
+                payload.Kind,
+                payload.Owner,
+                payload.KeyId,
+                payload.EnvelopeVersion,
+                payload.Nonce?.ToArray(),
+                payload.Ciphertext.ToArray(),
+                payload.Tag?.ToArray());
+
+        internal bool ExactEquals(PersistedOperationEvent actual)
+        {
+            var persisted = actual.Event;
+            return actual.GlobalPosition == GlobalPosition
+                && actual.OperationIndex == OperationIndex
+                && actual.OperationCount == OperationCount
+                && string.Equals(actual.RecordedAtUtcText, RecordedAtUtcText, StringComparison.Ordinal)
+                && persisted.Metadata.StreamId == StreamId
+                && persisted.Metadata.StreamVersion == StreamVersion
+                && persisted.Metadata.EventId == EventId
+                && string.Equals(persisted.Metadata.EventType, EventType, StringComparison.Ordinal)
+                && persisted.Metadata.SchemaVersion == SchemaVersion
+                && persisted.Metadata.OperationId == OperationId
+                && persisted.Kind == Kind
+                && persisted.Owner == Owner
+                && persisted.Metadata.DataKeyId == KeyId
+                && persisted.Metadata.EncryptionEnvelopeVersion == EnvelopeVersion
+                && NullableBytesEqual(persisted.Nonce, Nonce)
+                && persisted.Ciphertext.AsSpan().SequenceEqual(Ciphertext)
+                && NullableBytesEqual(persisted.Tag, Tag);
+        }
+
+        private static bool NullableBytesEqual(byte[]? left, byte[]? right) =>
+            left is null ? right is null : right is not null && left.AsSpan().SequenceEqual(right);
+    }
 }
 
 internal sealed record PersistedTimelineRow(
     long GlobalPosition,
     int OperationIndex,
     int OperationCount,
+    string RecordedAtUtcText,
     PersistedProtectedEvent Event)
 {
     public PersistedOperationCoordinates Coordinates => new(
@@ -551,7 +948,6 @@ internal sealed record PersistedOperationCoordinates(
 
 internal sealed class OperationGroupSequenceValidator
 {
-    private readonly HashSet<OperationId> _completed = [];
     private bool _hasCurrent;
     private OperationId _currentOperation;
     private StreamId? _currentStream;
@@ -566,8 +962,7 @@ internal sealed class OperationGroupSequenceValidator
         if (!_hasCurrent || row.OperationId != _currentOperation)
         {
             CompleteCurrent();
-            if (_completed.Contains(row.OperationId)
-                || row.OperationIndex != 0
+            if (row.OperationIndex != 0
                 || row.OperationCount <= 0)
                 throw new VaultRecoveryRequiredException();
             _hasCurrent = true;
@@ -599,7 +994,7 @@ internal sealed class OperationGroupSequenceValidator
     private void CompleteCurrent()
     {
         if (!_hasCurrent) return;
-        if (_nextIndex != _declaredCount || !_completed.Add(_currentOperation))
+        if (_nextIndex != _declaredCount)
             throw new VaultRecoveryRequiredException();
         _hasCurrent = false;
         _currentStream = null;

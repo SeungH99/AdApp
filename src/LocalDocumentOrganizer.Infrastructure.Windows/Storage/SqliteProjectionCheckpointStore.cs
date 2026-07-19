@@ -1,5 +1,5 @@
 using Microsoft.Data.Sqlite;
-using System.Globalization;
+using LocalDocumentOrganizer.Infrastructure.Windows.Crypto;
 
 namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
@@ -15,10 +15,12 @@ internal static class SqliteProjectionCheckpointStore
         await using var positionCommand = connection.CreateCommand();
         positionCommand.Transaction = transaction;
         positionCommand.CommandText =
-            "SELECT COALESCE(MAX(global_position), 0) FROM timeline_events;";
-        var requiredGlobalPosition = Convert.ToInt64(
-            await positionCommand.ExecuteScalarAsync(cancellationToken),
-            CultureInfo.InvariantCulture);
+            "SELECT COALESCE(MAX(global_position), 0) FROM main.timeline_events;";
+        if (await positionCommand.ExecuteScalarAsync(cancellationToken) is not long requiredGlobalPosition
+            || requiredGlobalPosition < 0)
+        {
+            throw new VaultRecoveryRequiredException();
+        }
 
         var projectionNames = new List<string>();
         foreach (var projection in projections)
@@ -27,7 +29,7 @@ internal static class SqliteProjectionCheckpointStore
             checkpointCommand.Transaction = transaction;
             checkpointCommand.CommandText = """
                 SELECT last_global_position
-                FROM projection_checkpoints
+                FROM main.projection_checkpoints
                 WHERE projection_name = $projection_name;
                 """;
             checkpointCommand.Parameters.AddWithValue("$projection_name", projection.Name);
@@ -42,7 +44,9 @@ internal static class SqliteProjectionCheckpointStore
                 continue;
             }
 
-            if (Convert.ToInt64(checkpoint, CultureInfo.InvariantCulture) != requiredGlobalPosition)
+            if (checkpoint is not long exactCheckpoint || exactCheckpoint < 0)
+                throw new VaultRecoveryRequiredException();
+            if (exactCheckpoint != requiredGlobalPosition)
             {
                 projectionNames.Add(projection.Name);
             }
@@ -62,7 +66,7 @@ internal static class SqliteProjectionCheckpointStore
             await using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = """
-                DELETE FROM projection_checkpoints
+                DELETE FROM main.projection_checkpoints
                 WHERE projection_name = $projection_name;
                 """;
             command.Parameters.AddWithValue("$projection_name", projection.Name);
@@ -80,7 +84,7 @@ internal static class SqliteProjectionCheckpointStore
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            INSERT INTO projection_checkpoints(projection_name, last_global_position)
+            INSERT INTO main.projection_checkpoints(projection_name, last_global_position)
             VALUES ($projection_name, $global_position)
             ON CONFLICT(projection_name) DO UPDATE SET
                 last_global_position = excluded.last_global_position;

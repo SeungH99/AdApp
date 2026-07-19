@@ -17,6 +17,8 @@ public sealed class VaultKeyRingStore
         "LocalDocumentOrganizer/VaultKeyRing/Authentication/v1"u8.ToArray();
     private static readonly byte[] WrappingDomain =
         "LocalDocumentOrganizer/VaultKeyRing/DekWrapping/v1"u8.ToArray();
+    private static readonly byte[] IdentityDomain =
+        "LocalDocumentOrganizer/VaultKeyRing/Identity/v1"u8.ToArray();
 
     private const int AuthenticationTagSize = 32;
     private const int NonceSize = 12;
@@ -68,12 +70,14 @@ public sealed class VaultKeyRingStore
 
     public async Task<VaultKeyRing> CreateAsync(CancellationToken cancellationToken)
     {
+        WindowsVaultPathGuard.RequireSafeEntryShape(_path);
         var directory = Path.GetDirectoryName(_path)
             ?? throw new ArgumentException("The keyring path has no parent directory.", nameof(_path));
         Directory.CreateDirectory(directory);
         await using var lease = await MaintenanceGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        WindowsVaultPathGuard.RequireSafeForOpen(_path);
         CleanupOrphans(requireCanonical: true);
-        if (File.Exists(_path))
+        if (WindowsVaultPathGuard.EntryExists(_path))
         {
             throw new VaultKeyRingPersistenceException("The Vault keyring already exists.");
         }
@@ -111,21 +115,44 @@ public sealed class VaultKeyRingStore
         return state.ToMetadata();
     }
 
+    internal async Task RequireCanonicalIdentityAsync(
+        VaultKeyRingIdentity expectedIdentity,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(expectedIdentity);
+        byte[]? image = null;
+        try
+        {
+            image = await ReadCanonicalAsync(cancellationToken).ConfigureAwait(false);
+            using var state = Deserialize(image);
+            if (!CreateIdentity(state.Root).FixedTimeEquals(expectedIdentity))
+                throw new VaultKeyRingRecoveryRequiredException();
+        }
+        finally
+        {
+            if (image is not null) CryptographicOperations.ZeroMemory(image);
+        }
+    }
+
     internal Task<VaultKeyRingSession> OpenReadSessionAsync(
         VaultMaintenanceLease lease,
+        VaultKeyRingIdentity expectedIdentity,
         CancellationToken cancellationToken) =>
-        OpenSessionAsync(lease, writable: false, cancellationToken);
+        OpenSessionAsync(lease, expectedIdentity, writable: false, cancellationToken);
 
     internal Task<VaultKeyRingSession> OpenWriteSessionAsync(
         VaultMaintenanceLease lease,
+        VaultKeyRingIdentity expectedIdentity,
         CancellationToken cancellationToken) =>
-        OpenSessionAsync(lease, writable: true, cancellationToken);
+        OpenSessionAsync(lease, expectedIdentity, writable: true, cancellationToken);
 
     private async Task<VaultKeyRingSession> OpenSessionAsync(
         VaultMaintenanceLease lease,
+        VaultKeyRingIdentity expectedIdentity,
         bool writable,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(expectedIdentity);
         var operation = await MaintenanceGate
             .EnterOperationAsync(lease, cancellationToken)
             .ConfigureAwait(false);
@@ -133,18 +160,20 @@ public sealed class VaultKeyRingStore
         KeyRingState? state = null;
         try
         {
-            CleanupOrphans(requireCanonical: true);
             image = await ReadCanonicalAsync(cancellationToken).ConfigureAwait(false);
             state = Deserialize(image);
+            var actualIdentity = CreateIdentity(state.Root);
+            if (!actualIdentity.FixedTimeEquals(expectedIdentity))
+                throw new VaultKeyRingRecoveryRequiredException();
+            if (writable) CleanupOrphans(requireCanonical: true);
             var session = new VaultKeyRingSession(
                 this,
                 operation,
                 state,
                 writable,
-                writable ? image : null,
+                image,
                 _sessionKeyObserver);
             state = null;
-            if (!writable) CryptographicOperations.ZeroMemory(image);
             image = null;
             return session;
         }
@@ -289,11 +318,29 @@ public sealed class VaultKeyRingStore
             _store = store;
             _operation = operation;
             _state = (KeyRingState)state;
+            Identity = CreateIdentity(_state.Root);
             _writable = writable;
             _image = image;
             _keyObserver = keyObserver;
             _active = _state.Active.ToDictionary(entry => entry.Owner);
             _destroyed = _state.Destroyed.ToDictionary(receipt => receipt.Owner);
+        }
+
+        internal VaultKeyRingIdentity Identity { get; }
+
+        internal async Task RequireCanonicalImageAsync(CancellationToken cancellationToken)
+        {
+            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                ThrowIfDisposed();
+                await _store.RequireCanonicalImageAsync(_image!, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                _gate.Release();
+            }
         }
 
         internal async ValueTask<TResult> ResolveDataKeyAsync<TResult>(
@@ -357,6 +404,8 @@ public sealed class VaultKeyRingStore
                 byte[]? nextImage = null;
                 try
                 {
+                    await _store.RequireCanonicalImageAsync(_image!, cancellationToken)
+                        .ConfigureAwait(false);
                     var keyId = new DataKeyId(Guid.NewGuid());
                     var nextEntry = Wrap(owner, keyId, dataKey, _state.Root);
                     _state.Active.Add(nextEntry);
@@ -798,7 +847,10 @@ public sealed class VaultKeyRingStore
     {
         try
         {
-            return await ReadBoundedFileAsync(_path, cancellationToken).ConfigureAwait(false);
+            WindowsVaultPathGuard.RequireSafeForOpen(_path);
+            var image = await ReadBoundedFileAsync(_path, cancellationToken).ConfigureAwait(false);
+            WindowsVaultPathGuard.RequireSafeForOpen(_path);
+            return image;
         }
         catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
         {
@@ -839,6 +891,7 @@ public sealed class VaultKeyRingStore
             FileShare.Read | FileShare.Delete,
             bufferSize: 4096,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
+        WindowsVaultPathGuard.RequireOpenedCanonicalSingleLinkFile(path, stream.SafeFileHandle);
         var length = ValidateOpenedLength(stream.Length);
         var image = new byte[length];
         var offset = 0;
@@ -861,6 +914,8 @@ public sealed class VaultKeyRingStore
             throw new VaultKeyRingFormatException("The Vault keyring changed or grew while reading.");
         }
 
+        WindowsVaultPathGuard.RequireOpenedCanonicalSingleLinkFile(path, stream.SafeFileHandle);
+
         return image;
     }
 
@@ -873,6 +928,7 @@ public sealed class VaultKeyRingStore
             FileShare.Read | FileShare.Delete,
             bufferSize: 4096,
             FileOptions.SequentialScan);
+        WindowsVaultPathGuard.RequireOpenedCanonicalSingleLinkFile(path, stream.SafeFileHandle);
         var length = ValidateOpenedLength(stream.Length);
         var image = new byte[length];
         var offset = 0;
@@ -891,6 +947,8 @@ public sealed class VaultKeyRingStore
         {
             throw new VaultKeyRingFormatException("The Vault keyring changed or grew while reading.");
         }
+
+        WindowsVaultPathGuard.RequireOpenedCanonicalSingleLinkFile(path, stream.SafeFileHandle);
 
         return image;
     }
@@ -960,11 +1018,15 @@ public sealed class VaultKeyRingStore
         var temp = Path.Combine(directory, $"{Path.GetFileName(_path)}.tmp-{Guid.NewGuid():N}");
         try
         {
+            WindowsVaultPathGuard.RequireSafeForOpen(_path);
+            WindowsVaultPathGuard.RequireSafeEntryShape(temp);
             _faults.ThrowIfRequested(VaultKeyRingFaultPoint.BeforeTempCreate);
             await using (var stream = new FileStream(
                 temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096,
                 FileOptions.Asynchronous | FileOptions.WriteThrough))
             {
+                WindowsVaultPathGuard.RequireOpenedCanonicalSingleLinkFile(
+                    temp, stream.SafeFileHandle);
                 await stream.WriteAsync(image, cancellationToken).ConfigureAwait(false);
                 _faults.ThrowIfRequested(VaultKeyRingFaultPoint.AfterTempWrite);
                 await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
@@ -975,6 +1037,9 @@ public sealed class VaultKeyRingStore
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
+                WindowsVaultPathGuard.RequireSafeForOpen(_path);
+                if (oldImage is not null)
+                    await RequireCanonicalImageAsync(oldImage, cancellationToken).ConfigureAwait(false);
                 if (oldImage is null)
                 {
                     File.Move(temp, _path, overwrite: false);
@@ -984,7 +1049,13 @@ public sealed class VaultKeyRingStore
                     File.Replace(temp, _path, destinationBackupFileName: null);
                 }
 
+                WindowsVaultPathGuard.RequireSafeForOpen(_path);
                 _faults.ThrowIfRequested(VaultKeyRingFaultPoint.AfterPublish);
+            }
+            catch (VaultRecoveryRequiredException exception) when (oldImage is null)
+            {
+                throw new VaultKeyRingPersistenceException(
+                    "The Vault keyring could not be published.", exception);
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {
@@ -994,12 +1065,7 @@ public sealed class VaultKeyRingStore
                     return;
                 }
 
-                if (publicationState == PublicationState.Old)
-                {
-                    throw new VaultKeyRingPersistenceException("The Vault keyring could not be published.", exception);
-                }
-
-                if (oldImage is null && publicationState == PublicationState.Missing)
+                if (oldImage is null || publicationState == PublicationState.Old)
                 {
                     throw new VaultKeyRingPersistenceException("The Vault keyring could not be published.", exception);
                 }
@@ -1017,11 +1083,14 @@ public sealed class VaultKeyRingStore
         }
         finally
         {
-            if (File.Exists(temp))
+            if (WindowsVaultPathGuard.EntryExists(temp))
             {
                 try
                 {
+                    WindowsVaultPathGuard.RequireSafeForOpen(temp);
                     File.Delete(temp);
+                    if (WindowsVaultPathGuard.EntryExists(temp))
+                        throw new IOException("Temporary keyring cleanup was not durable.");
                 }
                 catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
                 {
@@ -1031,11 +1100,32 @@ public sealed class VaultKeyRingStore
         }
     }
 
+    private async Task RequireCanonicalImageAsync(
+        byte[] expectedImage,
+        CancellationToken cancellationToken)
+    {
+        byte[]? canonical = null;
+        try
+        {
+            canonical = await ReadCanonicalAsync(cancellationToken).ConfigureAwait(false);
+            if (canonical.Length != expectedImage.Length
+                || !CryptographicOperations.FixedTimeEquals(canonical, expectedImage))
+            {
+                throw new VaultKeyRingRecoveryRequiredException();
+            }
+        }
+        finally
+        {
+            if (canonical is not null) CryptographicOperations.ZeroMemory(canonical);
+        }
+    }
+
     private PublicationState ClassifyCanonical(byte[] next, byte[]? previous)
     {
         try
         {
-            if (!File.Exists(_path)) return PublicationState.Missing;
+            WindowsVaultPathGuard.RequireSafeForOpen(_path);
+            if (!WindowsVaultPathGuard.EntryExists(_path)) return PublicationState.Missing;
             var canonical = ReadBoundedFile(_path);
             using var canonicalState = Deserialize(canonical);
             using var nextState = Deserialize(next);
@@ -1067,7 +1157,8 @@ public sealed class VaultKeyRingStore
     {
         var orphans = FindOrphans();
         if (orphans.Count == 0) return;
-        if (requireCanonical && !File.Exists(_path))
+        WindowsVaultPathGuard.RequireSafeForOpen(_path);
+        if (requireCanonical && !WindowsVaultPathGuard.EntryExists(_path))
         {
             throw new VaultKeyRingRecoveryRequiredException();
         }
@@ -1090,8 +1181,10 @@ public sealed class VaultKeyRingStore
         {
             try
             {
+                WindowsVaultPathGuard.RequireSafeForOpen(orphan);
                 File.Delete(orphan);
-                if (File.Exists(orphan)) throw new IOException("Temporary keyring cleanup was not durable.");
+                if (WindowsVaultPathGuard.EntryExists(orphan))
+                    throw new IOException("Temporary keyring cleanup was not durable.");
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {
@@ -1212,6 +1305,13 @@ public sealed class VaultKeyRingStore
 
     private static byte[] DeriveKey(ReadOnlySpan<byte> root, ReadOnlySpan<byte> domain) =>
         HMACSHA256.HashData(root, domain);
+
+    private static VaultKeyRingIdentity CreateIdentity(ReadOnlySpan<byte> root)
+    {
+        var value = DeriveKey(root, IdentityDomain);
+        try { return new VaultKeyRingIdentity(value); }
+        finally { CryptographicOperations.ZeroMemory(value); }
+    }
 
     private static byte[] CreateWrappingAad(SensitiveObjectRef owner, DataKeyId keyId)
     {
@@ -1362,6 +1462,7 @@ public sealed class VaultKeyRingStore
         public List<VaultDestroyedKeyReceipt> Destroyed { get; }
 
         public VaultKeyRing ToMetadata() => new(
+            CreateIdentity(Root),
             Active.Select(entry => new VaultActiveKeyMetadata(entry.Owner, entry.KeyId)),
             Destroyed);
 

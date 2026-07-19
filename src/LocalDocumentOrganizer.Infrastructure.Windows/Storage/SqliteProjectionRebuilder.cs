@@ -30,6 +30,8 @@ internal sealed class SqliteProjectionRebuilder
     public async Task<ProjectionRebuildResult> RebuildAsync(
         CancellationToken cancellationToken)
     {
+        SqliteEventStoreSchema.ValidateVaultPath(
+            _connectionString, _payloads.KeyRing.MaintenanceGate);
         await using var lease = await _payloads.KeyRing.MaintenanceGate.AcquireAsync(cancellationToken);
         await using var payloadSession = _payloads.CreateReadSession(lease);
 
@@ -39,13 +41,21 @@ internal sealed class SqliteProjectionRebuilder
         {
             connection = await SqliteEventStoreSchema.OpenConnectionAsync(
                 _connectionString,
+                _payloads.KeyRing.MaintenanceGate,
                 cancellationToken);
             transaction = connection.BeginTransaction(deferred: false);
             await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
+            var expectedKeyRingIdentity =
+                await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
+                    connection, transaction, cancellationToken);
+            payloadSession.BindExpectedIdentity(expectedKeyRingIdentity);
 
             foreach (var projection in _projections)
             {
-                await projection.ResetAsync(connection, transaction, cancellationToken);
+                await SqliteProjectionAuthorizer.RunAsync(
+                    connection,
+                    () => projection.ResetAsync(
+                        connection, transaction, cancellationToken));
             }
 
             await SqliteProjectionCheckpointStore.ClearAsync(
@@ -57,7 +67,7 @@ internal sealed class SqliteProjectionRebuilder
             var streamHeads = new Dictionary<StreamId, StreamVersion>();
             var operationGroups = new OperationGroupSequenceValidator();
             long totalEventCount = 0;
-            long lastGlobalPosition = 0;
+            long? lastGlobalPosition = null;
             while (true)
             {
                 var batch = await ReadBatchAsync(
@@ -81,12 +91,14 @@ internal sealed class SqliteProjectionRebuilder
                     var currentEvent = _schemaRegistry.UpcastToCurrent((DecryptedEvent)replayEvent);
                     foreach (var projection in _projections)
                     {
-                        await projection.ApplyAsync(
-                            currentEvent,
-                            rawEvent.GlobalPosition,
+                        await SqliteProjectionAuthorizer.RunAsync(
                             connection,
-                            transaction,
-                            cancellationToken);
+                            () => projection.ApplyAsync(
+                                currentEvent,
+                                rawEvent.GlobalPosition,
+                                connection,
+                                transaction,
+                                cancellationToken));
                         await SqliteProjectionCheckpointStore.AdvanceAsync(
                             connection,
                             transaction,
@@ -110,10 +122,12 @@ internal sealed class SqliteProjectionRebuilder
             var checksums = new SortedDictionary<string, string>(StringComparer.Ordinal);
             foreach (var projection in _projections)
             {
-                var checksum = await projection.CalculateChecksumAsync(
+                var checksum = await SqliteProjectionAuthorizer.RunAsync(
                     connection,
-                    transaction,
-                    cancellationToken);
+                    () => projection.CalculateChecksumAsync(
+                        connection,
+                        transaction,
+                        cancellationToken));
                 if (!IsValidChecksum(checksum))
                 {
                     throw new InvalidProjectionChecksumException(projection.Name, checksum);
@@ -122,7 +136,18 @@ internal sealed class SqliteProjectionRebuilder
                 checksums.Add(projection.Name, checksum);
             }
 
+            await ValidateStreamHeadsAsync(
+                connection,
+                transaction,
+                streamHeads,
+                cancellationToken);
             await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
+            await payloadSession.RequireCanonicalImageIfOpenedAsync(cancellationToken);
+            payloadSession.BindExpectedIdentity(
+                await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
+                    connection, transaction, cancellationToken));
+            SqliteEventStoreSchema.ValidateVaultPath(
+                _connectionString, _payloads.KeyRing.MaintenanceGate);
             await transaction.CommitAsync(cancellationToken);
             return new ProjectionRebuildResult(totalEventCount, streamHeads, checksums);
         }
@@ -180,23 +205,24 @@ internal sealed class SqliteProjectionRebuilder
     private static async Task<IReadOnlyList<RawTimelineEvent>> ReadBatchAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
-        long afterGlobalPosition,
+        long? afterGlobalPosition,
         CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = """
+        const string select = """
             SELECT e.global_position, e.stream_id, e.stream_version, e.event_id, e.event_type,
                    e.schema_version, e.recorded_at_utc, e.operation_id, e.operation_index,
                    e.operation_count, e.protection_kind, e.owner_kind, e.owner_id, e.key_id,
                    e.envelope_version, e.payload_nonce,
                    e.payload_ciphertext, e.payload_tag
-            FROM timeline_events e
-            WHERE e.global_position > $after_global_position
-            ORDER BY e.global_position ASC
-            LIMIT $batch_size;
+            FROM main.timeline_events e
             """;
-        command.Parameters.AddWithValue("$after_global_position", afterGlobalPosition);
+        command.CommandText = afterGlobalPosition is null
+            ? select + " ORDER BY e.global_position ASC LIMIT $batch_size;"
+            : select + " WHERE e.global_position > $after_global_position ORDER BY e.global_position ASC LIMIT $batch_size;";
+        if (afterGlobalPosition is not null)
+            command.Parameters.AddWithValue("$after_global_position", afterGlobalPosition.Value);
         command.Parameters.AddWithValue("$batch_size", BatchSize);
 
         var batch = new List<RawTimelineEvent>(BatchSize);
@@ -220,7 +246,7 @@ internal sealed class SqliteProjectionRebuilder
         command.Transaction = transaction;
         command.CommandText = """
             SELECT stream_id, head_version
-            FROM event_streams
+            FROM main.event_streams
             ORDER BY stream_id COLLATE BINARY;
             """;
 

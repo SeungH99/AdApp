@@ -27,6 +27,8 @@ public sealed class VaultMaintenanceGate
 
     public async ValueTask<VaultMaintenanceLease> AcquireAsync(CancellationToken cancellationToken)
     {
+        WindowsVaultPathGuard.RequireSafeEntryShape(KeyRingPath);
+        WindowsVaultPathGuard.RequireSafeEntryShape(LockPath);
         await _processGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -42,7 +44,18 @@ public sealed class VaultMaintenanceGate
                         FileShare.None,
                         bufferSize: 1,
                         FileOptions.Asynchronous | FileOptions.WriteThrough);
-                    return new VaultMaintenanceLease(_identity, _processGate, stream);
+                    try
+                    {
+                        WindowsVaultPathGuard.RequireOpenedCanonicalSingleLinkFile(
+                            LockPath, stream.SafeFileHandle);
+                        WindowsVaultPathGuard.RequireSafeForOpen(KeyRingPath);
+                        return new VaultMaintenanceLease(_identity, _processGate, stream);
+                    }
+                    catch
+                    {
+                        stream.Dispose();
+                        throw;
+                    }
                 }
                 catch (IOException exception) when (IsSharingViolation(exception))
                 {

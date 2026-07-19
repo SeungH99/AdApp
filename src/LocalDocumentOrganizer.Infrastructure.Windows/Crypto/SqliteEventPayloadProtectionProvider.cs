@@ -32,11 +32,13 @@ internal sealed class SqliteEventPayloadProtectionProvider
 
     public async Task<VaultKeyRingStore.VaultKeyRingSession> OpenWriteSessionAsync(
         VaultMaintenanceLease lease,
+        VaultKeyRingIdentity expectedIdentity,
         CancellationToken cancellationToken)
     {
         try
         {
-            return await _keyRing.OpenWriteSessionAsync(lease, cancellationToken).ConfigureAwait(false);
+            return await _keyRing.OpenWriteSessionAsync(
+                lease, expectedIdentity, cancellationToken).ConfigureAwait(false);
         }
         catch (VaultKeyRingException exception)
         {
@@ -49,11 +51,13 @@ internal sealed class SqliteEventPayloadProtectionProvider
 
     internal async Task<VaultKeyRingStore.VaultKeyRingSession> OpenReadKeySessionAsync(
         VaultMaintenanceLease lease,
+        VaultKeyRingIdentity expectedIdentity,
         CancellationToken cancellationToken)
     {
         try
         {
-            return await _keyRing.OpenReadSessionAsync(lease, cancellationToken).ConfigureAwait(false);
+            return await _keyRing.OpenReadSessionAsync(
+                lease, expectedIdentity, cancellationToken).ConfigureAwait(false);
         }
         catch (VaultKeyRingException exception)
         {
@@ -247,6 +251,7 @@ internal sealed class SqliteEventPayloadReadSession : IAsyncDisposable
     private readonly SqliteEventPayloadProtectionProvider _provider;
     private readonly VaultMaintenanceLease _lease;
     private VaultKeyRingStore.VaultKeyRingSession? _keys;
+    private VaultKeyRingIdentity? _expectedIdentity;
     private int _disposeStarted;
 
     internal SqliteEventPayloadReadSession(
@@ -257,6 +262,19 @@ internal sealed class SqliteEventPayloadReadSession : IAsyncDisposable
         _lease = lease;
     }
 
+    internal void BindExpectedIdentity(VaultKeyRingIdentity expectedIdentity)
+    {
+        ArgumentNullException.ThrowIfNull(expectedIdentity);
+        if (Volatile.Read(ref _disposeStarted) != 0)
+            throw new ObjectDisposedException(nameof(SqliteEventPayloadReadSession));
+        if (_expectedIdentity is not null
+            && !_expectedIdentity.FixedTimeEquals(expectedIdentity))
+            throw new VaultRecoveryRequiredException();
+        _expectedIdentity = expectedIdentity;
+        if (_keys is not null && !_keys.Identity.FixedTimeEquals(expectedIdentity))
+            throw new VaultRecoveryRequiredException();
+    }
+
     public async Task<EventForReplay> UnprotectAsync(
         PersistedProtectedEvent persisted,
         CancellationToken cancellationToken)
@@ -265,8 +283,21 @@ internal sealed class SqliteEventPayloadReadSession : IAsyncDisposable
             throw new ObjectDisposedException(nameof(SqliteEventPayloadReadSession));
         if (persisted.Kind == PersistedProtectionKind.Structural)
             return await _provider.UnprotectAsync(persisted, cancellationToken).ConfigureAwait(false);
-        _keys ??= await _provider.OpenReadKeySessionAsync(_lease, cancellationToken).ConfigureAwait(false);
+        if (_expectedIdentity is null) throw new VaultRecoveryRequiredException();
+        _keys ??= await _provider.OpenReadKeySessionAsync(
+            _lease, _expectedIdentity, cancellationToken).ConfigureAwait(false);
+        if (!_keys.Identity.FixedTimeEquals(_expectedIdentity))
+            throw new VaultRecoveryRequiredException();
         return await _provider.UnprotectAsync(persisted, _keys, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task RequireCanonicalImageIfOpenedAsync(
+        CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _disposeStarted) != 0)
+            throw new ObjectDisposedException(nameof(SqliteEventPayloadReadSession));
+        if (_keys is not null)
+            await _keys.RequireCanonicalImageAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()

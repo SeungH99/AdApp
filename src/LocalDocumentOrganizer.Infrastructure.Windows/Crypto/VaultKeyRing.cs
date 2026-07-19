@@ -15,16 +15,43 @@ public sealed class VaultKeyRing
     private readonly ReadOnlyCollection<VaultDestroyedKeyReceipt> _destroyedReceipts;
 
     internal VaultKeyRing(
+        VaultKeyRingIdentity identity,
         IEnumerable<VaultActiveKeyMetadata> activeKeys,
         IEnumerable<VaultDestroyedKeyReceipt> destroyedReceipts)
     {
+        Identity = identity ?? throw new ArgumentNullException(nameof(identity));
         _activeKeys = Array.AsReadOnly(activeKeys.ToArray());
         _destroyedReceipts = Array.AsReadOnly(destroyedReceipts.ToArray());
     }
 
+    internal VaultKeyRingIdentity Identity { get; }
+
     public IReadOnlyList<VaultActiveKeyMetadata> ActiveKeys => _activeKeys;
 
     public IReadOnlyList<VaultDestroyedKeyReceipt> DestroyedReceipts => _destroyedReceipts;
+}
+
+internal sealed class VaultKeyRingIdentity
+{
+    public const int Size = 32;
+    private readonly byte[] _value;
+
+    internal VaultKeyRingIdentity(ReadOnlySpan<byte> value)
+    {
+        if (value.Length != Size)
+            throw new ArgumentException("The Vault keyring identity length is invalid.", nameof(value));
+        _value = value.ToArray();
+    }
+
+    internal byte[] Export() => _value.ToArray();
+
+    internal bool FixedTimeEquals(ReadOnlySpan<byte> candidate) =>
+        candidate.Length == Size
+        && CryptographicOperations.FixedTimeEquals(_value, candidate);
+
+    internal bool FixedTimeEquals(VaultKeyRingIdentity? candidate) =>
+        candidate is not null
+        && CryptographicOperations.FixedTimeEquals(_value, candidate._value);
 }
 
 public sealed record VaultActiveKeyMetadata(SensitiveObjectRef Owner, DataKeyId KeyId);

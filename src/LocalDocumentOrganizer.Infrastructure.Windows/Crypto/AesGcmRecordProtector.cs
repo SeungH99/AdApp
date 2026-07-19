@@ -8,6 +8,19 @@ public sealed class AesGcmRecordProtector : IAuthenticatedRecordProtector
     internal const int NonceSize = 12;
     internal const int TagSize = 16;
 
+    private readonly Action<ReadOnlyMemory<byte>>? _authenticationFailureZeroedObserver;
+
+    public AesGcmRecordProtector()
+        : this(null)
+    {
+    }
+
+    internal AesGcmRecordProtector(
+        Action<ReadOnlyMemory<byte>>? authenticationFailureZeroedObserver)
+    {
+        _authenticationFailureZeroedObserver = authenticationFailureZeroedObserver;
+    }
+
     public EncryptedRecordEnvelope Protect(
         ReadOnlySpan<byte> dataKey,
         ReadOnlySpan<byte> plaintext,
@@ -63,6 +76,7 @@ public sealed class AesGcmRecordProtector : IAuthenticatedRecordProtector
         catch (AuthenticationTagMismatchException)
         {
             CryptographicOperations.ZeroMemory(plaintext);
+            _authenticationFailureZeroedObserver?.Invoke(plaintext);
             throw new PayloadAuthenticationException(context.KeyId, context.EventId);
         }
     }
