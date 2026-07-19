@@ -86,30 +86,32 @@ public sealed class EventSchemaRegistry
         _steps = stepSnapshot;
     }
 
-    public ReadOnlyMemory<byte> UpcastToCurrent(StoredEvent storedEvent)
+    public DecryptedEvent UpcastToCurrent(DecryptedEvent decryptedEvent)
     {
-        ArgumentNullException.ThrowIfNull(storedEvent);
+        ArgumentNullException.ThrowIfNull(decryptedEvent);
 
-        if (!_currentVersions.TryGetValue(storedEvent.EventType, out var currentVersion))
+        var metadata = decryptedEvent.Metadata;
+
+        if (!_currentVersions.TryGetValue(metadata.EventType, out var currentVersion))
         {
-            throw new UnknownEventTypeException(storedEvent.EventType);
+            throw new UnknownEventTypeException(metadata.EventType);
         }
 
-        if (storedEvent.SchemaVersion > currentVersion)
+        if (metadata.SchemaVersion > currentVersion)
         {
             throw new FutureEventSchemaVersionException(
-                storedEvent.EventType,
-                storedEvent.SchemaVersion,
+                metadata.EventType,
+                metadata.SchemaVersion,
                 currentVersion);
         }
 
-        var payload = storedEvent.Payload;
-        for (var version = storedEvent.SchemaVersion; version < currentVersion; version++)
+        var payload = decryptedEvent.Payload;
+        for (var version = metadata.SchemaVersion; version < currentVersion; version++)
         {
-            if (!_steps.TryGetValue((storedEvent.EventType, version), out var upcaster))
+            if (!_steps.TryGetValue((metadata.EventType, version), out var upcaster))
             {
                 throw new MissingUpcasterChainException(
-                    storedEvent.EventType,
+                    metadata.EventType,
                     version,
                     currentVersion);
             }
@@ -117,7 +119,20 @@ public sealed class EventSchemaRegistry
             payload = upcaster.Upcast(payload);
         }
 
-        return payload;
+        var currentMetadata = metadata.SchemaVersion == currentVersion
+            ? metadata
+            : new EventMetadata(
+                metadata.StreamId,
+                metadata.StreamVersion,
+                metadata.EventId,
+                metadata.EventType,
+                currentVersion,
+                metadata.RecordedAtUtc,
+                metadata.OperationId,
+                metadata.DataKeyId,
+                metadata.EncryptionEnvelopeVersion);
+
+        return new DecryptedEvent(currentMetadata, payload);
     }
 
     public int GetCurrentVersion(string eventType)
