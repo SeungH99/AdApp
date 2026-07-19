@@ -49,7 +49,7 @@ internal static class SqliteEventStoreSchema
             )
         ) STRICT;
         CREATE INDEX timeline_events_operation_position
-            ON timeline_events(operation_id, global_position);
+            ON timeline_events(operation_id COLLATE NOCASE, global_position);
         CREATE TABLE projection_checkpoints(
             projection_name TEXT PRIMARY KEY,
             last_global_position INTEGER NOT NULL CHECK(last_global_position >= 0)
@@ -184,7 +184,7 @@ internal static class SqliteEventStoreSchema
             }
 
             await ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
-            await SqliteEventStore.ValidateAllOperationGroupsAsync(connection, transaction, cancellationToken);
+            await SqliteEventStore.ValidateAllOperationMetadataAsync(connection, transaction, cancellationToken);
             await transaction.CommitAsync(cancellationToken);
         }
         catch
@@ -196,6 +196,36 @@ internal static class SqliteEventStoreSchema
 
     private static bool IsEmpty(VaultKeyRing ring) =>
         ring.ActiveKeys.Count == 0 && ring.DestroyedReceipts.Count == 0;
+
+    internal static string CanonicalizeConnectionString(string connectionString)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        try
+        {
+            var builder = new SqliteConnectionStringBuilder(connectionString);
+            var source = builder.DataSource;
+            if (string.IsNullOrWhiteSpace(source)
+                || string.Equals(source, ":memory:", StringComparison.OrdinalIgnoreCase)
+                || source.StartsWith("file:", StringComparison.OrdinalIgnoreCase)
+                || source.Contains('|', StringComparison.Ordinal)
+                || builder.Mode == SqliteOpenMode.Memory
+                || builder.Cache == SqliteCacheMode.Shared)
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+
+            var resolved = Path.GetFullPath(source);
+            if (!Path.IsPathFullyQualified(resolved)) throw new VaultRecoveryRequiredException();
+            builder.DataSource = resolved;
+            return builder.ToString();
+        }
+        catch (VaultRecoveryRequiredException) { throw; }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException
+            or PathTooLongException or System.Security.SecurityException)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
+    }
 
     public static async Task<SqliteConnection> OpenConnectionAsync(
         string connectionString,
@@ -227,23 +257,15 @@ internal static class SqliteEventStoreSchema
     {
         var builder = new SqliteConnectionStringBuilder(connectionString);
         var path = Path.GetFullPath(builder.DataSource);
+        if (HasDatabaseSidecar(path)) return new VaultSchemaInspection(VaultSchemaKind.Malformed);
         if (!File.Exists(path)) return new VaultSchemaInspection(VaultSchemaKind.New);
         if (new FileInfo(path).Length == 0) return new VaultSchemaInspection(VaultSchemaKind.New);
 
-        var snapshotDirectory = Path.Combine(
-            Path.GetTempPath(), $"local-document-organizer-vault-probe-{Guid.NewGuid():N}");
-        var snapshotPath = Path.Combine(snapshotDirectory, "vault.db");
-        Directory.CreateDirectory(snapshotDirectory);
+        VaultSchemaInspection inspection;
         try
         {
-            CopyProbeFile(path, snapshotPath);
-            foreach (var suffix in new[] { "-journal", "-wal", "-shm" })
-            {
-                if (File.Exists(path + suffix)) CopyProbeFile(path + suffix, snapshotPath + suffix);
-            }
-
-            builder.DataSource = snapshotPath;
-            builder.Mode = SqliteOpenMode.ReadWrite;
+            builder.DataSource = new Uri(path).AbsoluteUri + "?immutable=1";
+            builder.Mode = SqliteOpenMode.ReadOnly;
             builder.Cache = SqliteCacheMode.Private;
             builder.Pooling = false;
             await using (var connection = new SqliteConnection(builder.ToString()))
@@ -252,70 +274,44 @@ internal static class SqliteEventStoreSchema
                 var version = Convert.ToInt32(await ExecuteScalarAsync(connection, null, "PRAGMA user_version;", cancellationToken));
                 if (version == 0)
                 {
-                    return await CountApplicationObjectsAsync(connection, null, cancellationToken) == 0
+                    inspection = await CountApplicationObjectsAsync(connection, null, cancellationToken) == 0
                         ? new VaultSchemaInspection(VaultSchemaKind.New)
                         : new VaultSchemaInspection(VaultSchemaKind.Malformed);
                 }
-
-                if (version == 1)
+                else if (version == 1)
                 {
-                    return new VaultSchemaInspection(await ClassifyExactVersionOneAsync(connection, null, cancellationToken));
+                    inspection = new VaultSchemaInspection(
+                        await ClassifyExactVersionOneAsync(connection, null, cancellationToken));
                 }
-
-                if (version == CurrentVersion)
+                else if (version == CurrentVersion)
                 {
                     await ValidateExistingVersionTwoAsync(connection, null, cancellationToken);
-                    return new VaultSchemaInspection(VaultSchemaKind.V2);
+                    inspection = new VaultSchemaInspection(VaultSchemaKind.V2);
                 }
-
-                return new VaultSchemaInspection(VaultSchemaKind.Unknown);
+                else
+                {
+                    inspection = new VaultSchemaInspection(VaultSchemaKind.Unknown);
+                }
             }
         }
         catch (VaultRecoveryRequiredException)
         {
-            return new VaultSchemaInspection(VaultSchemaKind.Malformed);
+            inspection = new VaultSchemaInspection(VaultSchemaKind.Malformed);
         }
-        catch (Exception exception) when (exception is SqliteException or InvalidCastException or FormatException or OverflowException)
+        catch (Exception exception) when (exception is SqliteException or InvalidCastException
+            or FormatException or OverflowException or InvalidOperationException)
         {
             _ = exception;
-            return new VaultSchemaInspection(VaultSchemaKind.Malformed);
+            inspection = new VaultSchemaInspection(VaultSchemaKind.Malformed);
         }
-        finally
-        {
-            await DeleteProbeDirectoryAsync(snapshotDirectory, cancellationToken);
-        }
+
+        return HasDatabaseSidecar(path)
+            ? new VaultSchemaInspection(VaultSchemaKind.Malformed)
+            : inspection;
     }
 
-    private static void CopyProbeFile(string source, string destination)
-    {
-        using var input = new FileStream(
-            source, FileMode.Open, FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete, bufferSize: 64 * 1024,
-            FileOptions.SequentialScan);
-        using var output = new FileStream(
-            destination, FileMode.CreateNew, FileAccess.Write,
-            FileShare.None, bufferSize: 64 * 1024,
-            FileOptions.WriteThrough);
-        input.CopyTo(output);
-        output.Flush(flushToDisk: true);
-    }
-
-    private static async Task DeleteProbeDirectoryAsync(string path, CancellationToken cancellationToken)
-    {
-        for (var attempt = 0; ; attempt++)
-        {
-            try
-            {
-                Directory.Delete(path, recursive: true);
-                return;
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-            {
-                if (attempt == 2) throw new VaultRecoveryRequiredException(exception);
-                await Task.Delay(TimeSpan.FromMilliseconds(10), cancellationToken);
-            }
-        }
-    }
+    private static bool HasDatabaseSidecar(string path) =>
+        File.Exists(path + "-journal") || File.Exists(path + "-wal") || File.Exists(path + "-shm");
 
     private static async Task<VaultSchemaInspection> InspectInsideTransactionAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken cancellationToken)
     {
@@ -551,7 +547,10 @@ internal static class SqliteEventStoreSchema
         if (builder.Cache == SqliteCacheMode.Shared
             || builder.Mode == SqliteOpenMode.Memory
             || string.IsNullOrWhiteSpace(builder.DataSource)
-            || string.Equals(builder.DataSource, ":memory:", StringComparison.OrdinalIgnoreCase))
+            || string.Equals(builder.DataSource, ":memory:", StringComparison.OrdinalIgnoreCase)
+            || builder.DataSource.StartsWith("file:", StringComparison.OrdinalIgnoreCase)
+            || builder.DataSource.Contains('|', StringComparison.Ordinal)
+            || !Path.IsPathFullyQualified(builder.DataSource))
             throw new VaultRecoveryRequiredException();
     }
 

@@ -30,6 +30,37 @@ internal sealed class SqliteEventPayloadProtectionProvider
     public Task<VaultKeyRing> ValidateKeyRingAsync(CancellationToken cancellationToken) =>
         _keyRing.OpenAsync(cancellationToken);
 
+    public async Task<VaultKeyRingStore.VaultKeyRingSession> OpenWriteSessionAsync(
+        VaultMaintenanceLease lease,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _keyRing.OpenWriteSessionAsync(lease, cancellationToken).ConfigureAwait(false);
+        }
+        catch (VaultKeyRingException exception)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
+    }
+
+    internal SqliteEventPayloadReadSession CreateReadSession(VaultMaintenanceLease lease) =>
+        new(this, lease);
+
+    internal async Task<VaultKeyRingStore.VaultKeyRingSession> OpenReadKeySessionAsync(
+        VaultMaintenanceLease lease,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _keyRing.OpenReadSessionAsync(lease, cancellationToken).ConfigureAwait(false);
+        }
+        catch (VaultKeyRingException exception)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
+    }
+
     public async Task<ProtectedEventPayload> ProtectAsync(
         EventToAppend eventToAppend,
         StreamId streamId,
@@ -70,20 +101,72 @@ internal sealed class SqliteEventPayloadProtectionProvider
             cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<ProtectedEventPayload> ProtectAsync(
+        EventToAppend eventToAppend,
+        StreamId streamId,
+        StreamVersion streamVersion,
+        OperationId operationId,
+        VaultKeyRingStore.VaultKeyRingSession session,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(eventToAppend);
+        ArgumentNullException.ThrowIfNull(streamId);
+        ArgumentNullException.ThrowIfNull(session);
+
+        if (eventToAppend.Protection is PayloadProtection.DurableStructural)
+            return ProtectedEventPayload.Structural(eventToAppend.Payload);
+
+        var owner = ((PayloadProtection.Shreddable)eventToAppend.Protection).Owner;
+        try
+        {
+            return await session.GetOrCreateDataKeyAsync(
+                owner,
+                async (keyId, key, token) =>
+                {
+                    var plaintext = eventToAppend.Payload;
+                    try
+                    {
+                        var context = new EventEncryptionContext(
+                            1, keyId, owner, streamId, streamVersion, eventToAppend.EventId,
+                            eventToAppend.EventType, eventToAppend.SchemaVersion, operationId);
+                        var envelope = _protector.Protect(key.Span, plaintext.Span, context);
+                        return await ValueTask.FromResult(ProtectedEventPayload.Shreddable(owner, envelope));
+                    }
+                    finally
+                    {
+                        ZeroTemporary(plaintext);
+                    }
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (VaultRecoveryRequiredException) { throw; }
+        catch (Exception exception) when (exception is VaultKeyRingException or CryptographicException)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
+    }
+
     public async Task<EventForReplay> UnprotectAsync(
         PersistedProtectedEvent persisted,
         CancellationToken cancellationToken)
-        => await UnprotectCoreAsync(persisted, lease: null, cancellationToken).ConfigureAwait(false);
+        => await UnprotectCoreAsync(persisted, lease: null, session: null, cancellationToken).ConfigureAwait(false);
 
     public async Task<EventForReplay> UnprotectAsync(
         PersistedProtectedEvent persisted,
         VaultMaintenanceLease lease,
         CancellationToken cancellationToken)
-        => await UnprotectCoreAsync(persisted, lease, cancellationToken).ConfigureAwait(false);
+        => await UnprotectCoreAsync(persisted, lease, session: null, cancellationToken).ConfigureAwait(false);
+
+    public async Task<EventForReplay> UnprotectAsync(
+        PersistedProtectedEvent persisted,
+        VaultKeyRingStore.VaultKeyRingSession session,
+        CancellationToken cancellationToken)
+        => await UnprotectCoreAsync(persisted, lease: null, session, cancellationToken).ConfigureAwait(false);
 
     private async Task<EventForReplay> UnprotectCoreAsync(
         PersistedProtectedEvent persisted,
         VaultMaintenanceLease? lease,
+        VaultKeyRingStore.VaultKeyRingSession? session,
         CancellationToken cancellationToken)
     {
         if (persisted.Kind == PersistedProtectionKind.Structural)
@@ -131,6 +214,9 @@ internal sealed class SqliteEventPayloadProtectionProvider
             }
 
             EventForReplay Destroyed() => new ShreddedEvent(persisted.Metadata, owner);
+            if (session is not null)
+                return await session.ResolveDataKeyAsync(
+                    owner, keyId, Destroyed, DecryptAsync, cancellationToken).ConfigureAwait(false);
             return lease is null
                 ? await _keyRing.ResolveDataKeyAsync(
                     owner, keyId, Destroyed, DecryptAsync, cancellationToken).ConfigureAwait(false)
@@ -153,6 +239,40 @@ internal sealed class SqliteEventPayloadProtectionProvider
             throw new VaultRecoveryRequiredException();
         CryptographicOperations.ZeroMemory(segment.Array.AsSpan(segment.Offset, segment.Count));
         _zeroedPlaintextObserver?.Invoke(value);
+    }
+}
+
+internal sealed class SqliteEventPayloadReadSession : IAsyncDisposable
+{
+    private readonly SqliteEventPayloadProtectionProvider _provider;
+    private readonly VaultMaintenanceLease _lease;
+    private VaultKeyRingStore.VaultKeyRingSession? _keys;
+    private int _disposeStarted;
+
+    internal SqliteEventPayloadReadSession(
+        SqliteEventPayloadProtectionProvider provider,
+        VaultMaintenanceLease lease)
+    {
+        _provider = provider;
+        _lease = lease;
+    }
+
+    public async Task<EventForReplay> UnprotectAsync(
+        PersistedProtectedEvent persisted,
+        CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _disposeStarted) != 0)
+            throw new ObjectDisposedException(nameof(SqliteEventPayloadReadSession));
+        if (persisted.Kind == PersistedProtectionKind.Structural)
+            return await _provider.UnprotectAsync(persisted, cancellationToken).ConfigureAwait(false);
+        _keys ??= await _provider.OpenReadKeySessionAsync(_lease, cancellationToken).ConfigureAwait(false);
+        return await _provider.UnprotectAsync(persisted, _keys, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0) return;
+        if (_keys is not null) await _keys.DisposeAsync().ConfigureAwait(false);
     }
 }
 

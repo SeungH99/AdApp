@@ -31,14 +31,7 @@ internal sealed class SqliteProjectionRebuilder
         CancellationToken cancellationToken)
     {
         await using var lease = await _payloads.KeyRing.MaintenanceGate.AcquireAsync(cancellationToken);
-        try
-        {
-            await _payloads.ValidateKeyRingAsync(cancellationToken);
-        }
-        catch (VaultKeyRingException exception)
-        {
-            throw new VaultRecoveryRequiredException(exception);
-        }
+        await using var payloadSession = _payloads.CreateReadSession(lease);
 
         SqliteConnection? connection = null;
         SqliteTransaction? transaction = null;
@@ -49,7 +42,6 @@ internal sealed class SqliteProjectionRebuilder
                 cancellationToken);
             transaction = connection.BeginTransaction(deferred: false);
             await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
-            await SqliteEventStore.ValidateAllOperationGroupsAsync(connection, transaction, cancellationToken);
 
             foreach (var projection in _projections)
             {
@@ -63,6 +55,7 @@ internal sealed class SqliteProjectionRebuilder
                 cancellationToken);
 
             var streamHeads = new Dictionary<StreamId, StreamVersion>();
+            var operationGroups = new OperationGroupSequenceValidator();
             long totalEventCount = 0;
             long lastGlobalPosition = 0;
             while (true)
@@ -79,8 +72,10 @@ internal sealed class SqliteProjectionRebuilder
 
                 foreach (var rawEvent in batch)
                 {
+                    operationGroups.Accept(rawEvent.Coordinates);
                     ValidateAndAdvanceHead(streamHeads, rawEvent.Persisted.Metadata);
-                    var replayEvent = await _payloads.UnprotectAsync(rawEvent.Persisted, lease, cancellationToken);
+                    var replayEvent = await payloadSession.UnprotectAsync(
+                        rawEvent.Persisted, cancellationToken);
                     if (replayEvent is ShreddedEvent) throw new ShreddedProjectionReplayNotSupportedException();
 
                     var currentEvent = _schemaRegistry.UpcastToCurrent((DecryptedEvent)replayEvent);
@@ -105,6 +100,7 @@ internal sealed class SqliteProjectionRebuilder
                 }
             }
 
+            operationGroups.Complete();
             await ValidateStreamHeadsAsync(
                 connection,
                 transaction,
@@ -127,7 +123,6 @@ internal sealed class SqliteProjectionRebuilder
             }
 
             await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
-            await SqliteEventStore.ValidateAllOperationGroupsAsync(connection, transaction, cancellationToken);
             await transaction.CommitAsync(cancellationToken);
             return new ProjectionRebuildResult(totalEventCount, streamHeads, checksums);
         }
@@ -209,7 +204,7 @@ internal sealed class SqliteProjectionRebuilder
         while (await reader.ReadAsync(cancellationToken))
         {
             var row = SqliteEventStore.ReadPersistedTimelineRow(reader);
-            batch.Add(new RawTimelineEvent(row.GlobalPosition, row.Event));
+            batch.Add(new RawTimelineEvent(row.Coordinates, row.Event));
         }
 
         return batch;
@@ -236,15 +231,17 @@ internal sealed class SqliteProjectionRebuilder
             {
                 try
                 {
-                    var headValue = reader.GetInt64(1);
+                    var headValue = SqliteEventStore.ReadRequiredInteger(reader, 1);
                     if (headValue < 0) throw new VaultRecoveryRequiredException();
                     storedHeads.Add(
-                        new StreamId(SqliteEventStore.ParseCanonicalGuid(reader.GetString(0))),
+                        new StreamId(SqliteEventStore.ParseCanonicalGuid(
+                            SqliteEventStore.ReadRequiredText(reader, 0))),
                         new StreamVersion(headValue));
                 }
                 catch (VaultRecoveryRequiredException) { throw; }
                 catch (Exception exception) when (exception is ArgumentException or InvalidCastException
-                    or FormatException or OverflowException or SqliteException)
+                    or FormatException or OverflowException or SqliteException
+                    or InvalidOperationException or NotSupportedException)
                 {
                     throw new VaultRecoveryRequiredException(exception);
                 }
@@ -296,7 +293,12 @@ internal sealed class SqliteProjectionRebuilder
         }
     }
 
-    private sealed record RawTimelineEvent(long GlobalPosition, PersistedProtectedEvent Persisted);
+    private sealed record RawTimelineEvent(
+        PersistedOperationCoordinates Coordinates,
+        PersistedProtectedEvent Persisted)
+    {
+        public long GlobalPosition => Coordinates.GlobalPosition;
+    }
 }
 
 public sealed class ShreddedProjectionReplayNotSupportedException : InvalidOperationException
