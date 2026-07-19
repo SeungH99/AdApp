@@ -5,7 +5,7 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
 internal static class SqliteEventStoreSchema
 {
-    private const int CurrentVersion = 2;
+    private const int CurrentVersion = 3;
     private const string VersionTwoSql = """
         CREATE TABLE event_streams(
             stream_id TEXT PRIMARY KEY CHECK(stream_id <> '00000000-0000-0000-0000-000000000000' AND length(stream_id) = 36 AND stream_id = lower(stream_id) AND substr(stream_id,9,1)='-' AND substr(stream_id,14,1)='-' AND substr(stream_id,19,1)='-' AND substr(stream_id,24,1)='-' AND length(replace(stream_id,'-','')) = 32 AND replace(stream_id,'-','') NOT GLOB '*[^0-9a-f]*'),
@@ -80,6 +80,17 @@ internal static class SqliteEventStoreSchema
         PRAGMA main.user_version = 2;
         """;
 
+    private const string VersionThreeProjectionSql = """
+        DROP TABLE projection_checkpoints;
+        CREATE TABLE projection_checkpoints(
+            projection_name TEXT PRIMARY KEY CHECK(length(projection_name) > 0),
+            projection_schema_version INTEGER NOT NULL CHECK(projection_schema_version > 0),
+            encryption_version INTEGER NOT NULL CHECK(encryption_version = 1),
+            last_global_position INTEGER NOT NULL CHECK(last_global_position >= 0)
+        ) STRICT;
+        PRAGMA main.user_version = 3;
+        """;
+
     private const string VersionOneSql = """
         CREATE TABLE event_streams(
             stream_id TEXT PRIMARY KEY,
@@ -123,7 +134,7 @@ internal static class SqliteEventStoreSchema
 
     public static async Task InitializeAsync(
         string connectionString,
-        IReadOnlyList<ISqliteProjection> projections,
+        SqliteProjectionRegistry projections,
         VaultKeyRingStore keyRing,
         CancellationToken cancellationToken)
     {
@@ -133,6 +144,11 @@ internal static class SqliteEventStoreSchema
         await using (var firstLease = await keyRing.MaintenanceGate.AcquireAsync(cancellationToken))
         {
             inspection = await InspectBeforeMutationAsync(connectionString, cancellationToken);
+        }
+
+        if (inspection.Kind == VaultSchemaKind.LegacyProjection)
+        {
+            throw new LegacyProjectionRecoveryRequiredException();
         }
 
         if (inspection.Kind == VaultSchemaKind.LegacyNonEmpty)
@@ -165,7 +181,7 @@ internal static class SqliteEventStoreSchema
             catch (VaultKeyRingException exception) { throw new VaultRecoveryRequiredException(exception); }
         }
 
-        if (inspection.Kind == VaultSchemaKind.V2)
+        if (inspection.Kind is VaultSchemaKind.V3 or VaultSchemaKind.EligibleV2)
             RequireKeyRingIdentity(inspection.KeyRingIdentity, bootstrapRing.Identity);
 
         await using var lease = await keyRing.MaintenanceGate.AcquireAsync(cancellationToken);
@@ -190,6 +206,8 @@ internal static class SqliteEventStoreSchema
         try
         {
             var finalInspection = await InspectInsideTransactionAsync(connection, transaction, cancellationToken);
+            if (finalInspection.Kind == VaultSchemaKind.LegacyProjection)
+                throw new LegacyProjectionRecoveryRequiredException();
             if (finalInspection.Kind is VaultSchemaKind.Unknown or VaultSchemaKind.Malformed or VaultSchemaKind.LegacyNonEmpty)
                 throw new VaultRecoveryRequiredException();
             RequireCompatibleFinalInspection(preOpenInspection, finalInspection);
@@ -219,23 +237,50 @@ internal static class SqliteEventStoreSchema
             if (finalInspection.Kind is VaultSchemaKind.New or VaultSchemaKind.EmptyV1)
             {
                 await ExecuteNonQueryAsync(connection, transaction, VersionTwoSql, cancellationToken);
+                await ExecuteNonQueryAsync(
+                    connection, transaction, VersionThreeProjectionSql, cancellationToken);
                 await InsertKeyRingIdentityAsync(
                     connection, transaction, authoritativeRing.Identity, cancellationToken);
             }
+            else if (finalInspection.Kind == VaultSchemaKind.EligibleV2)
+            {
+                await ExecuteNonQueryAsync(
+                    connection, transaction, VersionThreeProjectionSql, cancellationToken);
+            }
             else
             {
-                await ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
+                await ValidateExistingVersionThreeAsync(connection, transaction, cancellationToken);
             }
 
-            foreach (var projection in projections)
+            foreach (var registration in projections.Registrations)
             {
-                await SqliteProjectionAuthorizer.RunAsync(
+                var projection = registration.Projection;
+                var compatibility = await SqliteProjectionAuthorizer.RunAsync(
                     connection,
                     () => projection.InitializeAsync(
-                        connection, transaction, cancellationToken));
+                        SqliteProjectionContexts.CreateAdministrative(
+                            connection,
+                            transaction,
+                            keyRing,
+                            lease,
+                            registration),
+                        cancellationToken));
+                if (!Enum.IsDefined(compatibility.Compatibility))
+                    throw new VaultRecoveryRequiredException();
+                if (compatibility.RequiresCheckpointInvalidation)
+                {
+                    await SqliteProjectionCheckpointStore.ClearAsync(
+                        connection,
+                        transaction,
+                        [registration],
+                        cancellationToken);
+                }
             }
 
-            await ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
+            await ValidateProjectionMembershipAsync(
+                connection, transaction, projections, cancellationToken);
+
+            await ValidateExistingVersionThreeAsync(connection, transaction, cancellationToken);
             await SqliteEventStore.ValidateAllOperationMetadataAsync(connection, transaction, cancellationToken);
             await ValidateCurrentKeyRingIdentityAsync(
                 keyRing, authoritativeRing.Identity, cancellationToken);
@@ -259,9 +304,9 @@ internal static class SqliteEventStoreSchema
         VaultSchemaInspection current,
         VaultKeyRingIdentity authoritativeIdentity)
     {
-        if (original.Kind == VaultSchemaKind.V2)
+        if (original.Kind is VaultSchemaKind.V3 or VaultSchemaKind.EligibleV2)
         {
-            if (current.Kind != VaultSchemaKind.V2)
+            if (current.Kind != original.Kind)
                 throw new VaultRecoveryRequiredException();
             RequireKeyRingIdentity(original.KeyRingIdentity, authoritativeIdentity);
             RequireKeyRingIdentity(current.KeyRingIdentity, authoritativeIdentity);
@@ -271,7 +316,7 @@ internal static class SqliteEventStoreSchema
         if (original.Kind is not (VaultSchemaKind.New or VaultSchemaKind.EmptyV1))
             throw new VaultRecoveryRequiredException();
         if (current.Kind == original.Kind) return;
-        if (current.Kind == VaultSchemaKind.V2)
+        if (current.Kind == VaultSchemaKind.V3)
         {
             RequireKeyRingIdentity(current.KeyRingIdentity, authoritativeIdentity);
             return;
@@ -286,7 +331,7 @@ internal static class SqliteEventStoreSchema
     {
         if (preOpen.Kind != final.Kind)
             throw new VaultRecoveryRequiredException();
-        if (preOpen.Kind == VaultSchemaKind.V2)
+        if (preOpen.Kind is VaultSchemaKind.V3 or VaultSchemaKind.EligibleV2)
             RequireKeyRingIdentity(preOpen.KeyRingIdentity, final.KeyRingIdentity!);
     }
 
@@ -386,11 +431,25 @@ internal static class SqliteEventStoreSchema
                     inspection = new VaultSchemaInspection(
                         await ClassifyExactVersionOneAsync(connection, null, cancellationToken));
                 }
+                else if (version == 2)
+                {
+                    try
+                    {
+                        await ValidateEligibleVersionTwoAsync(connection, null, cancellationToken);
+                        inspection = new VaultSchemaInspection(
+                            VaultSchemaKind.EligibleV2,
+                            await ReadPersistedKeyRingIdentityAsync(connection, null, cancellationToken));
+                    }
+                    catch (LegacyProjectionRecoveryRequiredException)
+                    {
+                        inspection = new VaultSchemaInspection(VaultSchemaKind.LegacyProjection);
+                    }
+                }
                 else if (version == CurrentVersion)
                 {
-                    await ValidateExistingVersionTwoAsync(connection, null, cancellationToken);
+                    await ValidateExistingVersionThreeAsync(connection, null, cancellationToken);
                     inspection = new VaultSchemaInspection(
-                        VaultSchemaKind.V2,
+                        VaultSchemaKind.V3,
                         await ReadPersistedKeyRingIdentityAsync(connection, null, cancellationToken));
                 }
                 else
@@ -463,18 +522,25 @@ internal static class SqliteEventStoreSchema
         {
             return new VaultSchemaInspection(await ClassifyExactVersionOneAsync(connection, transaction, cancellationToken));
         }
+        if (version == 2)
+        {
+            await ValidateEligibleVersionTwoAsync(connection, transaction, cancellationToken);
+            return new VaultSchemaInspection(
+                VaultSchemaKind.EligibleV2,
+                await ReadPersistedKeyRingIdentityAsync(connection, transaction, cancellationToken));
+        }
         if (version == CurrentVersion)
         {
-            await ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
+            await ValidateExistingVersionThreeAsync(connection, transaction, cancellationToken);
             return new VaultSchemaInspection(
-                VaultSchemaKind.V2,
+                VaultSchemaKind.V3,
                 await ReadPersistedKeyRingIdentityAsync(connection, transaction, cancellationToken));
         }
 
         return new VaultSchemaInspection(VaultSchemaKind.Unknown);
     }
 
-    internal static async Task ValidateExistingVersionTwoAsync(SqliteConnection connection, SqliteTransaction? transaction, CancellationToken cancellationToken)
+    internal static async Task ValidateExistingVersionThreeAsync(SqliteConnection connection, SqliteTransaction? transaction, CancellationToken cancellationToken)
     {
         try
         {
@@ -486,7 +552,10 @@ internal static class SqliteEventStoreSchema
             await RequireExactObjectSqlAsync(connection, transaction, "table", "timeline_events",
                 ExtractExpectedStatement("CREATE TABLE timeline_events("), cancellationToken);
             await RequireExactObjectSqlAsync(connection, transaction, "table", "projection_checkpoints",
-                ExtractExpectedStatement("CREATE TABLE projection_checkpoints("), cancellationToken);
+                ExtractExpectedStatement(
+                    VersionThreeProjectionSql,
+                    "CREATE TABLE projection_checkpoints("),
+                cancellationToken);
             await RequireExactObjectSqlAsync(connection, transaction, "table", "vault_metadata",
                 ExtractExpectedStatement("CREATE TABLE vault_metadata("), cancellationToken);
             await RequireExactObjectSqlAsync(connection, transaction, "index", "event_streams_stream_id_nocase",
@@ -572,6 +641,129 @@ internal static class SqliteEventStoreSchema
         {
             throw new VaultRecoveryRequiredException(exception);
         }
+    }
+
+    private static async Task ValidateEligibleVersionTwoAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var version = Convert.ToInt32(await ExecuteScalarAsync(
+                connection, transaction, "PRAGMA main.user_version;", cancellationToken));
+            if (version != 2) throw new LegacyProjectionRecoveryRequiredException();
+
+            await RequireExactObjectSqlAsync(connection, transaction, "table", "event_streams",
+                ExtractExpectedStatement(VersionTwoSql, "CREATE TABLE event_streams("), cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "table", "timeline_events",
+                ExtractExpectedStatement(VersionTwoSql, "CREATE TABLE timeline_events("), cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "table", "projection_checkpoints",
+                ExtractExpectedStatement(VersionTwoSql, "CREATE TABLE projection_checkpoints("), cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "table", "vault_metadata",
+                ExtractExpectedStatement(VersionTwoSql, "CREATE TABLE vault_metadata("), cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "index", "event_streams_stream_id_nocase",
+                ExtractExpectedStatement(VersionTwoSql, "CREATE UNIQUE INDEX event_streams_stream_id_nocase"), cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "index", "timeline_events_stream_position_nocase",
+                ExtractExpectedStatement(VersionTwoSql, "CREATE INDEX timeline_events_stream_position_nocase"), cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "index", "timeline_events_operation_position",
+                ExtractExpectedStatement(VersionTwoSql, "CREATE INDEX timeline_events_operation_position"), cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "index", "timeline_events_operation_representation",
+                ExtractExpectedStatement(VersionTwoSql, "CREATE INDEX timeline_events_operation_representation"), cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "trigger", "timeline_events_immutable_update",
+                "CREATE TRIGGER timeline_events_immutable_update BEFORE UPDATE ON timeline_events BEGIN SELECT RAISE(ABORT, 'timeline_events is immutable'); END", cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "trigger", "timeline_events_immutable_delete",
+                "CREATE TRIGGER timeline_events_immutable_delete BEFORE DELETE ON timeline_events BEGIN SELECT RAISE(ABORT, 'timeline_events is immutable'); END", cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "trigger", "vault_metadata_immutable_update",
+                "CREATE TRIGGER vault_metadata_immutable_update BEFORE UPDATE ON vault_metadata BEGIN SELECT RAISE(ABORT, 'vault_metadata is immutable'); END", cancellationToken);
+            await RequireExactObjectSqlAsync(connection, transaction, "trigger", "vault_metadata_immutable_delete",
+                "CREATE TRIGGER vault_metadata_immutable_delete BEFORE DELETE ON vault_metadata BEGIN SELECT RAISE(ABORT, 'vault_metadata is immutable'); END", cancellationToken);
+            _ = await ReadPersistedKeyRingIdentityAsync(connection, transaction, cancellationToken);
+
+            if (Convert.ToInt64(await ExecuteScalarAsync(
+                    connection,
+                    transaction,
+                    "SELECT COUNT(*) FROM main.projection_checkpoints;",
+                    cancellationToken)) != 0
+                || Convert.ToInt64(await ExecuteScalarAsync(
+                    connection,
+                    transaction,
+                    "SELECT COUNT(*) FROM main.sqlite_master WHERE substr(lower(name),1,7) <> 'sqlite_';",
+                    cancellationToken)) != 12)
+            {
+                throw new LegacyProjectionRecoveryRequiredException();
+            }
+        }
+        catch (LegacyProjectionRecoveryRequiredException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (exception is VaultRecoveryRequiredException
+            or SqliteException or InvalidCastException or FormatException or OverflowException)
+        {
+            throw new LegacyProjectionRecoveryRequiredException(exception);
+        }
+    }
+
+    private static async Task ValidateProjectionObjectMembershipAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        SqliteProjectionRegistry projections,
+        CancellationToken cancellationToken)
+    {
+        if (projections.AllowsLegacyTestObjects) return;
+
+        var coreObjects = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "event_streams",
+            "timeline_events",
+            "projection_checkpoints",
+            "vault_metadata",
+            "event_streams_stream_id_nocase",
+            "timeline_events_stream_position_nocase",
+            "timeline_events_operation_position",
+            "timeline_events_operation_representation",
+            "timeline_events_immutable_update",
+            "timeline_events_immutable_delete",
+            "vault_metadata_immutable_update",
+            "vault_metadata_immutable_delete",
+        };
+        var registeredTables = projections.Registrations
+            .SelectMany(registration => registration.EncryptedLocations)
+            .Select(location => location.TableName)
+            .ToHashSet(StringComparer.Ordinal);
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT type, name, tbl_name
+            FROM main.sqlite_master
+            WHERE substr(lower(name),1,7) <> 'sqlite_'
+            ORDER BY type COLLATE BINARY, name COLLATE BINARY;
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            if (reader.GetValue(0) is not string type
+                || reader.GetValue(1) is not string name
+                || reader.GetValue(2) is not string tableName)
+                throw new VaultRecoveryRequiredException();
+            if (coreObjects.Contains(name)) continue;
+            if (type == "table" && name == tableName && registeredTables.Contains(name)) continue;
+            if (type is "index" or "trigger" && registeredTables.Contains(tableName)) continue;
+            throw new VaultRecoveryRequiredException();
+        }
+    }
+
+    internal static async Task ValidateProjectionMembershipAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        SqliteProjectionRegistry projections,
+        CancellationToken cancellationToken)
+    {
+        await SqliteProjectionCheckpointStore.ValidateMembershipAsync(
+            connection, transaction, projections.Registrations, cancellationToken);
+        await ValidateProjectionObjectMembershipAsync(
+            connection, transaction, projections, cancellationToken);
     }
 
     internal static async Task<VaultKeyRingIdentity> ReadPersistedKeyRingIdentityAsync(
@@ -847,8 +1039,31 @@ internal static class SqliteEventStoreSchema
         return await command.ExecuteScalarAsync(cancellationToken);
     }
     private static async Task RollbackWithoutMaskingAsync(SqliteTransaction transaction) { try { await transaction.RollbackAsync(); } catch { } }
-    private enum VaultSchemaKind { New, EmptyV1, LegacyNonEmpty, V2, Unknown, Malformed }
+    private enum VaultSchemaKind
+    {
+        New,
+        EmptyV1,
+        LegacyNonEmpty,
+        EligibleV2,
+        V3,
+        LegacyProjection,
+        Unknown,
+        Malformed,
+    }
     private sealed record VaultSchemaInspection(
         VaultSchemaKind Kind,
         VaultKeyRingIdentity? KeyRingIdentity = null);
+}
+
+public sealed class LegacyProjectionRecoveryRequiredException : InvalidOperationException
+{
+    public LegacyProjectionRecoveryRequiredException()
+        : base("Legacy projection state requires explicit recovery before this Vault can be upgraded.")
+    {
+    }
+
+    public LegacyProjectionRecoveryRequiredException(Exception innerException)
+        : base("Legacy projection state requires explicit recovery before this Vault can be upgraded.", innerException)
+    {
+    }
 }

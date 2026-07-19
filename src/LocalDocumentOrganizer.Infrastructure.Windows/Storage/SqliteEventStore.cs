@@ -11,13 +11,23 @@ public sealed class SqliteEventStore : IEventStore
     private readonly string _connectionString;
     private readonly EventSchemaRegistry _schemaRegistry;
     private readonly IReadOnlyList<ISqliteProjection> _projections;
+    private readonly IReadOnlyList<SqliteProjectionRegistration> _projectionRegistrations;
+    private readonly SqliteProjectionRegistry _projectionRegistry;
     private readonly TimeProvider _timeProvider;
     private readonly SqliteEventPayloadProtectionProvider _payloads;
 
     public SqliteEventStore(
         string connectionString,
         EventSchemaRegistry schemaRegistry,
-        IEnumerable<ISqliteProjection> projections,
+        TimeProvider? timeProvider = null)
+        : this(connectionString, schemaRegistry, SqliteProjectionRegistry.Empty, timeProvider)
+    {
+    }
+
+    internal SqliteEventStore(
+        string connectionString,
+        EventSchemaRegistry schemaRegistry,
+        SqliteProjectionRegistry projections,
         TimeProvider? timeProvider = null)
         : this(
             connectionString,
@@ -31,7 +41,7 @@ public sealed class SqliteEventStore : IEventStore
     internal SqliteEventStore(
         string connectionString,
         EventSchemaRegistry schemaRegistry,
-        IEnumerable<ISqliteProjection> projections,
+        SqliteProjectionRegistry projections,
         VaultKeyRingStore keyRing,
         TimeProvider? timeProvider = null)
         : this(
@@ -46,7 +56,7 @@ public sealed class SqliteEventStore : IEventStore
     private SqliteEventStore(
         string connectionString,
         EventSchemaRegistry schemaRegistry,
-        IEnumerable<ISqliteProjection> projections,
+        SqliteProjectionRegistry projections,
         TimeProvider? timeProvider,
         VaultKeyRingStore? keyRing)
     {
@@ -54,7 +64,9 @@ public sealed class SqliteEventStore : IEventStore
         ArgumentNullException.ThrowIfNull(schemaRegistry);
         ArgumentNullException.ThrowIfNull(projections);
         _schemaRegistry = schemaRegistry;
-        _projections = ValidateProjections(projections);
+        _projectionRegistry = projections;
+        _projections = projections.Projections;
+        _projectionRegistrations = projections.Registrations;
         _connectionString = SqliteEventStoreSchema.CanonicalizeConnectionString(connectionString);
         _timeProvider = timeProvider ?? TimeProvider.System;
         _payloads = new SqliteEventPayloadProtectionProvider(
@@ -62,10 +74,13 @@ public sealed class SqliteEventStore : IEventStore
     }
 
     public Task InitializeAsync(CancellationToken cancellationToken = default) =>
-        SqliteEventStoreSchema.InitializeAsync(_connectionString, _projections, _payloads.KeyRing, cancellationToken);
+        SqliteEventStoreSchema.InitializeAsync(
+            _connectionString, _projectionRegistry, _payloads.KeyRing, cancellationToken);
 
     public Task<ProjectionRebuildResult> RebuildProjectionsAsync(CancellationToken cancellationToken = default) =>
-        new SqliteProjectionRebuilder(_connectionString, _schemaRegistry, _projections, _payloads).RebuildAsync(cancellationToken);
+        new SqliteProjectionRebuilder(
+            _connectionString, _schemaRegistry, _projectionRegistry, _payloads)
+            .RebuildAsync(cancellationToken);
 
     public async Task<IReadOnlyList<EventForReplay>> ReadStreamAsync(StreamId streamId, CancellationToken cancellationToken)
     {
@@ -79,7 +94,9 @@ public sealed class SqliteEventStore : IEventStore
         await using var schemaTransaction = connection.BeginTransaction(deferred: true);
         try
         {
-            await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(connection, schemaTransaction, cancellationToken);
+            await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(connection, schemaTransaction, cancellationToken);
+            await SqliteEventStoreSchema.ValidateProjectionMembershipAsync(
+                connection, schemaTransaction, _projectionRegistry, cancellationToken);
             payloadSession.BindExpectedIdentity(
                 await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
                     connection, schemaTransaction, cancellationToken));
@@ -155,7 +172,9 @@ public sealed class SqliteEventStore : IEventStore
             connection = await SqliteEventStoreSchema.OpenConnectionAsync(
                 _connectionString, _payloads.KeyRing.MaintenanceGate, cancellationToken);
             transaction = connection.BeginTransaction(deferred: false);
-            await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
+            await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(connection, transaction, cancellationToken);
+            await SqliteEventStoreSchema.ValidateProjectionMembershipAsync(
+                connection, transaction, _projectionRegistry, cancellationToken);
             var expectedKeyRingIdentity =
                 await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
                     connection, transaction, cancellationToken);
@@ -183,7 +202,8 @@ public sealed class SqliteEventStore : IEventStore
                 };
             }
             ValidateCurrentEventSchemas(command.Events);
-            var rebuildRequirement = await SqliteProjectionCheckpointStore.FindRebuildRequirementAsync(connection, transaction, _projections, cancellationToken);
+            var rebuildRequirement = await SqliteProjectionCheckpointStore.FindRebuildRequirementAsync(
+                connection, transaction, _projectionRegistrations, cancellationToken);
             if (rebuildRequirement.ProjectionNames.Count != 0)
                 throw new ProjectionRebuildRequiredException(rebuildRequirement.ProjectionNames, rebuildRequirement.RequiredGlobalPosition);
 
@@ -224,17 +244,36 @@ public sealed class SqliteEventStore : IEventStore
                     protectedPayload));
                 var metadata = new EventMetadata(command.StreamId, streamVersion, eventToAppend.EventId, eventToAppend.EventType, eventToAppend.SchemaVersion, recordedAtUtc, command.OperationId, protectedPayload.KeyId, protectedPayload.EnvelopeVersion);
                 var decrypted = new DecryptedEvent(metadata, eventToAppend.Payload);
-                foreach (var projection in _projections)
+                foreach (var registration in _projectionRegistrations)
                 {
+                    var projection = registration.Projection;
                     await SqliteProjectionAuthorizer.RunAsync(
                         connection,
                         () => projection.ApplyAsync(
-                            decrypted, globalPosition, connection, transaction, cancellationToken));
-                    await SqliteProjectionCheckpointStore.AdvanceAsync(connection, transaction, projection.Name, globalPosition, cancellationToken);
+                            decrypted,
+                            globalPosition,
+                            protectedPayload.Owner is { } owner
+                                && protectedPayload.KeyId is { } dataKeyId
+                                ? SqliteProjectionContexts.CreateApply(
+                                    connection,
+                                    transaction,
+                                    _payloads.KeyRing,
+                                    keySession,
+                                    registration,
+                                    owner,
+                                    dataKeyId)
+                                : SqliteProjectionContexts.CreateDisabledApply(
+                                    connection,
+                                    transaction),
+                            cancellationToken));
+                    await SqliteProjectionCheckpointStore.AdvanceAsync(
+                        connection, transaction, registration, globalPosition, cancellationToken);
                 }
             }
-            await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(
+            await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(
                 connection, transaction, cancellationToken);
+            await SqliteEventStoreSchema.ValidateProjectionMembershipAsync(
+                connection, transaction, _projectionRegistry, cancellationToken);
             var appended = await ReadOperationAsync(
                 connection, transaction, command.OperationId, cancellationToken);
             ValidateOperationGroup(appended, command.OperationId);
@@ -410,18 +449,6 @@ public sealed class SqliteEventStore : IEventStore
             if (eventToAppend.SchemaVersion != _schemaRegistry.GetCurrentVersion(eventToAppend.EventType))
                 throw new ArgumentException("Events must use their registered current schema version.", nameof(events));
         }
-    }
-
-    private static IReadOnlyList<ISqliteProjection> ValidateProjections(IEnumerable<ISqliteProjection> projections)
-    {
-        var values = projections.ToArray(); var names = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var projection in values)
-        {
-            ArgumentNullException.ThrowIfNull(projection);
-            if (string.IsNullOrWhiteSpace(projection.Name) || !names.Add(projection.Name))
-                throw new ArgumentException("Projection names must be stable and unique.", nameof(projections));
-        }
-        return values.OrderBy(projection => projection.Name, StringComparer.Ordinal).ToArray();
     }
 
     private static VaultKeyRingStore CreateDefaultKeyRing(string connectionString)

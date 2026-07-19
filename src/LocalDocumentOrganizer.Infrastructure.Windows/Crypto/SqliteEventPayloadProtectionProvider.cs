@@ -300,6 +300,22 @@ internal sealed class SqliteEventPayloadReadSession : IAsyncDisposable
             await _keys.RequireCanonicalImageAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    internal ValueTask<TResult> UseProjectionSubkeyAsync<TResult>(
+        SensitiveObjectRef owner,
+        DataKeyId expectedKeyId,
+        Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>> callback,
+        CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _disposeStarted) != 0)
+            throw new ObjectDisposedException(nameof(SqliteEventPayloadReadSession));
+        if (_expectedIdentity is null || _keys is null)
+            throw new VaultRecoveryRequiredException();
+        if (!_keys.Identity.FixedTimeEquals(_expectedIdentity))
+            throw new VaultRecoveryRequiredException();
+        return _keys.UseProjectionSubkeyAsync(
+            owner, expectedKeyId, callback, cancellationToken);
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposeStarted, 1) != 0) return;

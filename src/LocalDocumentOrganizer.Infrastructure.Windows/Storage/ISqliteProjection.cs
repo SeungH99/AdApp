@@ -1,5 +1,5 @@
 using LocalDocumentOrganizer.Core.Events;
-using Microsoft.Data.Sqlite;
+using LocalDocumentOrganizer.Core.Security;
 
 namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
@@ -8,29 +8,34 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 /// SQLite authorizer and any denied operation fails the enclosing Vault transaction, but this
 /// boundary is not a sandbox for code that replaces native callbacks or modifies Vault files.
 /// </summary>
-public interface ISqliteProjection
+internal interface ISqliteProjection
 {
     string Name { get; }
 
-    Task InitializeAsync(
-        SqliteConnection connection,
-        SqliteTransaction transaction,
+    int SchemaVersion { get; }
+
+    int EncryptionVersion { get; }
+
+    Task<ProjectionCompatibilityResult> InitializeAsync(
+        SqliteProjectionAdministrativeContext context,
         CancellationToken cancellationToken);
 
     Task ApplyAsync(
-        DecryptedEvent decryptedEvent,
+        EventForReplay replayEvent,
         long globalPosition,
-        SqliteConnection connection,
-        SqliteTransaction transaction,
+        SqliteProjectionApplyContext context,
+        CancellationToken cancellationToken);
+
+    Task PurgeOwnerAsync(
+        SensitiveObjectRef owner,
+        SqliteProjectionAdministrativeContext context,
         CancellationToken cancellationToken);
 
     Task ResetAsync(
-        SqliteConnection connection,
-        SqliteTransaction transaction,
+        SqliteProjectionAdministrativeContext context,
         CancellationToken cancellationToken);
 
     Task<string> CalculateChecksumAsync(
-        SqliteConnection connection,
-        SqliteTransaction transaction,
+        SqliteProjectionAdministrativeContext context,
         CancellationToken cancellationToken);
 }

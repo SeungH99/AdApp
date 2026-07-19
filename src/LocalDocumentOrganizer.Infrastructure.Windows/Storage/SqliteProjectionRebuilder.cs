@@ -13,17 +13,21 @@ internal sealed class SqliteProjectionRebuilder
     private readonly string _connectionString;
     private readonly EventSchemaRegistry _schemaRegistry;
     private readonly IReadOnlyList<ISqliteProjection> _projections;
+    private readonly IReadOnlyList<SqliteProjectionRegistration> _projectionRegistrations;
+    private readonly SqliteProjectionRegistry _projectionRegistry;
     private readonly SqliteEventPayloadProtectionProvider _payloads;
 
     public SqliteProjectionRebuilder(
         string connectionString,
         EventSchemaRegistry schemaRegistry,
-        IReadOnlyList<ISqliteProjection> projections,
+        SqliteProjectionRegistry projections,
         SqliteEventPayloadProtectionProvider payloads)
     {
         _connectionString = connectionString;
         _schemaRegistry = schemaRegistry;
-        _projections = projections;
+        _projectionRegistry = projections;
+        _projections = projections.Projections;
+        _projectionRegistrations = projections.Registrations;
         _payloads = payloads;
     }
 
@@ -44,24 +48,33 @@ internal sealed class SqliteProjectionRebuilder
                 _payloads.KeyRing.MaintenanceGate,
                 cancellationToken);
             transaction = connection.BeginTransaction(deferred: false);
-            await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
+            await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(connection, transaction, cancellationToken);
+            await SqliteEventStoreSchema.ValidateProjectionMembershipAsync(
+                connection, transaction, _projectionRegistry, cancellationToken);
             var expectedKeyRingIdentity =
                 await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
                     connection, transaction, cancellationToken);
             payloadSession.BindExpectedIdentity(expectedKeyRingIdentity);
 
-            foreach (var projection in _projections)
+            foreach (var registration in _projectionRegistrations)
             {
+                var projection = registration.Projection;
                 await SqliteProjectionAuthorizer.RunAsync(
                     connection,
                     () => projection.ResetAsync(
-                        connection, transaction, cancellationToken));
+                        SqliteProjectionContexts.CreateAdministrative(
+                            connection,
+                            transaction,
+                            _payloads.KeyRing,
+                            lease,
+                            registration),
+                        cancellationToken));
             }
 
             await SqliteProjectionCheckpointStore.ClearAsync(
                 connection,
                 transaction,
-                _projections,
+                _projectionRegistrations,
                 cancellationToken);
 
             var streamHeads = new Dictionary<StreamId, StreamVersion>();
@@ -86,23 +99,36 @@ internal sealed class SqliteProjectionRebuilder
                     ValidateAndAdvanceHead(streamHeads, rawEvent.Persisted.Metadata);
                     var replayEvent = await payloadSession.UnprotectAsync(
                         rawEvent.Persisted, cancellationToken);
-                    if (replayEvent is ShreddedEvent) throw new ShreddedProjectionReplayNotSupportedException();
-
-                    var currentEvent = _schemaRegistry.UpcastToCurrent((DecryptedEvent)replayEvent);
-                    foreach (var projection in _projections)
+                    var currentEvent = replayEvent is DecryptedEvent decrypted
+                        ? _schemaRegistry.UpcastToCurrent(decrypted)
+                        : replayEvent;
+                    foreach (var registration in _projectionRegistrations)
                     {
+                        var projection = registration.Projection;
                         await SqliteProjectionAuthorizer.RunAsync(
                             connection,
                             () => projection.ApplyAsync(
                                 currentEvent,
                                 rawEvent.GlobalPosition,
-                                connection,
-                                transaction,
+                                currentEvent is DecryptedEvent
+                                    && rawEvent.Persisted.Owner is { } owner
+                                    && rawEvent.Persisted.Metadata.DataKeyId is { } dataKeyId
+                                    ? SqliteProjectionContexts.CreateApply(
+                                        connection,
+                                        transaction,
+                                        _payloads.KeyRing,
+                                        payloadSession,
+                                        registration,
+                                        owner,
+                                        dataKeyId)
+                                    : SqliteProjectionContexts.CreateDisabledApply(
+                                        connection,
+                                        transaction),
                                 cancellationToken));
                         await SqliteProjectionCheckpointStore.AdvanceAsync(
                             connection,
                             transaction,
-                            projection.Name,
+                            registration,
                             rawEvent.GlobalPosition,
                             cancellationToken);
                     }
@@ -125,8 +151,13 @@ internal sealed class SqliteProjectionRebuilder
                 var checksum = await SqliteProjectionAuthorizer.RunAsync(
                     connection,
                     () => projection.CalculateChecksumAsync(
-                        connection,
-                        transaction,
+                        SqliteProjectionContexts.CreateAdministrative(
+                            connection,
+                            transaction,
+                            _payloads.KeyRing,
+                            payloadSession,
+                            _projectionRegistrations.Single(
+                                registration => ReferenceEquals(registration.Projection, projection))),
                         cancellationToken));
                 if (!IsValidChecksum(checksum))
                 {
@@ -141,7 +172,9 @@ internal sealed class SqliteProjectionRebuilder
                 transaction,
                 streamHeads,
                 cancellationToken);
-            await SqliteEventStoreSchema.ValidateExistingVersionTwoAsync(connection, transaction, cancellationToken);
+            await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(connection, transaction, cancellationToken);
+            await SqliteEventStoreSchema.ValidateProjectionMembershipAsync(
+                connection, transaction, _projectionRegistry, cancellationToken);
             await payloadSession.RequireCanonicalImageIfOpenedAsync(cancellationToken);
             payloadSession.BindExpectedIdentity(
                 await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(

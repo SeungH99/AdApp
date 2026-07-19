@@ -19,6 +19,8 @@ public sealed class VaultKeyRingStore
         "LocalDocumentOrganizer/VaultKeyRing/DekWrapping/v1"u8.ToArray();
     private static readonly byte[] IdentityDomain =
         "LocalDocumentOrganizer/VaultKeyRing/Identity/v1"u8.ToArray();
+    private static readonly byte[] ProjectionValueEncryptionKeyDomain =
+        "LocalDocumentOrganizer/ProjectionValue/EncryptionKey/v1"u8.ToArray();
 
     private const int AuthenticationTagSize = 32;
     private const int NonceSize = 12;
@@ -168,6 +170,7 @@ public sealed class VaultKeyRingStore
             if (writable) CleanupOrphans(requireCanonical: true);
             var session = new VaultKeyRingSession(
                 this,
+                lease,
                 operation,
                 state,
                 writable,
@@ -293,10 +296,56 @@ public sealed class VaultKeyRingStore
         return await UseKeyAsync(state, active, activeCallback, cancellationToken).ConfigureAwait(false);
     }
 
+    internal async ValueTask<TResult> UseProjectionSubkeyAsync<TResult>(
+        SensitiveObjectRef owner,
+        DataKeyId expectedKeyId,
+        VaultMaintenanceLease lease,
+        Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>> callback,
+        CancellationToken cancellationToken)
+    {
+        ValidateOwner(owner);
+        if (expectedKeyId.Value == Guid.Empty)
+            throw new ArgumentException("A data-key ID is required.", nameof(expectedKeyId));
+        ArgumentNullException.ThrowIfNull(callback);
+
+        byte[]? subkey = null;
+        try
+        {
+            await using (var operation = await MaintenanceGate
+                .EnterOperationAsync(lease, cancellationToken)
+                .ConfigureAwait(false))
+            {
+                CleanupOrphans(requireCanonical: true);
+                var image = await ReadCanonicalAsync(cancellationToken).ConfigureAwait(false);
+                using var state = Deserialize(image);
+                if (state.Destroyed.Any(candidate => candidate.Owner == owner))
+                    throw new VaultDataKeyDestroyedException();
+                var active = state.Active.SingleOrDefault(candidate => candidate.Owner == owner)
+                    ?? throw new VaultDataKeyNotFoundException();
+                if (active.KeyId != expectedKeyId) throw new VaultReceiptConflictException();
+                subkey = await UseKeyAsync(
+                    state,
+                    active,
+                    static (_, dataKey, _) => ValueTask.FromResult(
+                        HMACSHA256.HashData(
+                            dataKey.Span,
+                            ProjectionValueEncryptionKeyDomain)),
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            return await callback(subkey, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (subkey is not null) CryptographicOperations.ZeroMemory(subkey);
+        }
+    }
+
     internal sealed class VaultKeyRingSession : IAsyncDisposable
     {
         private readonly VaultKeyRingStore _store;
-        private readonly VaultMaintenanceOperation _operation;
+        private readonly VaultMaintenanceLease _lease;
+        private VaultMaintenanceOperation? _operation;
         private readonly KeyRingState _state;
         private readonly bool _writable;
         private readonly Dictionary<SensitiveObjectRef, ActiveEntry> _active;
@@ -309,6 +358,7 @@ public sealed class VaultKeyRingStore
 
         internal VaultKeyRingSession(
             VaultKeyRingStore store,
+            VaultMaintenanceLease lease,
             VaultMaintenanceOperation operation,
             object state,
             bool writable,
@@ -316,6 +366,7 @@ public sealed class VaultKeyRingStore
             Action<SensitiveObjectRef, ReadOnlyMemory<byte>>? keyObserver)
         {
             _store = store;
+            _lease = lease;
             _operation = operation;
             _state = (KeyRingState)state;
             Identity = CreateIdentity(_state.Root);
@@ -334,6 +385,7 @@ public sealed class VaultKeyRingStore
             try
             {
                 ThrowIfDisposed();
+                ThrowIfAdmissionReleased();
                 await _store.RequireCanonicalImageAsync(_image!, cancellationToken)
                     .ConfigureAwait(false);
             }
@@ -359,6 +411,7 @@ public sealed class VaultKeyRingStore
             try
             {
                 ThrowIfDisposed();
+                ThrowIfAdmissionReleased();
                 if (_destroyed.TryGetValue(owner, out var destroyed))
                 {
                     if (destroyed.KeyId != expectedKeyId) throw new VaultReceiptConflictException();
@@ -378,6 +431,68 @@ public sealed class VaultKeyRingStore
             }
         }
 
+        internal async ValueTask<TResult> UseProjectionSubkeyAsync<TResult>(
+            SensitiveObjectRef owner,
+            DataKeyId expectedKeyId,
+            Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>> callback,
+            CancellationToken cancellationToken)
+        {
+            ValidateOwner(owner);
+            if (expectedKeyId.Value == Guid.Empty)
+                throw new ArgumentException("A data-key ID is required.", nameof(expectedKeyId));
+            ArgumentNullException.ThrowIfNull(callback);
+
+            byte[]? subkey = null;
+            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                ThrowIfDisposed();
+                ThrowIfAdmissionReleased();
+                if (_destroyed.ContainsKey(owner)) throw new VaultDataKeyDestroyedException();
+                if (!_active.TryGetValue(owner, out var active))
+                    throw new VaultDataKeyNotFoundException();
+                if (active.KeyId != expectedKeyId) throw new VaultReceiptConflictException();
+                var cached = GetOrUnwrap(active);
+                subkey = HMACSHA256.HashData(
+                    cached.Key.Span,
+                    ProjectionValueEncryptionKeyDomain);
+
+                var operation = _operation!;
+                _operation = null;
+                await operation.DisposeAsync().ConfigureAwait(false);
+                try
+                {
+                    return await callback(subkey, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    try
+                    {
+                        _operation = await _store.MaintenanceGate
+                            .EnterOperationAsync(_lease, CancellationToken.None)
+                            .ConfigureAwait(false);
+                        await _store.RequireCanonicalImageAsync(_image!, CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        if (_operation is not null)
+                        {
+                            await _operation.DisposeAsync().ConfigureAwait(false);
+                            _operation = null;
+                        }
+
+                        throw;
+                    }
+                }
+            }
+            finally
+            {
+                if (subkey is not null) CryptographicOperations.ZeroMemory(subkey);
+                _gate.Release();
+            }
+        }
+
         internal async ValueTask<TResult> GetOrCreateDataKeyAsync<TResult>(
             SensitiveObjectRef owner,
             Func<DataKeyId, ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>> callback,
@@ -389,6 +504,7 @@ public sealed class VaultKeyRingStore
             try
             {
                 ThrowIfDisposed();
+                ThrowIfAdmissionReleased();
                 if (!_writable) throw new InvalidOperationException("The Vault keyring session is read-only.");
                 if (_destroyed.ContainsKey(owner)) throw new VaultDataKeyDestroyedException();
                 if (_active.TryGetValue(owner, out var active))
@@ -450,6 +566,11 @@ public sealed class VaultKeyRingStore
                 throw new ObjectDisposedException(nameof(VaultKeyRingSession));
         }
 
+        private void ThrowIfAdmissionReleased()
+        {
+            if (_operation is null) throw new VaultKeyRingRecoveryRequiredException();
+        }
+
         public async ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref _disposeStarted, 1) != 0) return;
@@ -469,7 +590,11 @@ public sealed class VaultKeyRingStore
             finally
             {
                 _gate.Release();
-                await _operation.DisposeAsync().ConfigureAwait(false);
+                if (_operation is not null)
+                {
+                    await _operation.DisposeAsync().ConfigureAwait(false);
+                    _operation = null;
+                }
             }
         }
 
