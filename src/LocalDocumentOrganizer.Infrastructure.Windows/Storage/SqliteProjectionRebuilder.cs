@@ -54,6 +54,10 @@ internal sealed class SqliteProjectionRebuilder
             var expectedKeyRingIdentity =
                 await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
                     connection, transaction, cancellationToken);
+            await SqliteSensitiveDataDeletionStore.RequireNoPendingReceiptsAsync(
+                _payloads.KeyRing,
+                expectedKeyRingIdentity,
+                cancellationToken);
             payloadSession.BindExpectedIdentity(expectedKeyRingIdentity);
 
             foreach (var registration in _projectionRegistrations)

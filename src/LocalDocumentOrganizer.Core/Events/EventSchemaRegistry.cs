@@ -1,3 +1,5 @@
+using LocalDocumentOrganizer.Core.Deletion;
+
 namespace LocalDocumentOrganizer.Core.Events;
 
 public interface IEventUpcaster
@@ -23,11 +25,23 @@ public sealed class EventSchemaRegistry
         ArgumentNullException.ThrowIfNull(currentVersions);
         ArgumentNullException.ThrowIfNull(upcasters);
 
-        var versionSnapshot = new Dictionary<string, int>(StringComparer.Ordinal);
+        var versionSnapshot = new Dictionary<string, int>(StringComparer.Ordinal)
+        {
+            [SensitiveObjectDeletedEventContract.EventType] =
+                SensitiveObjectDeletedEventContract.SchemaVersion,
+        };
         foreach (var registration in currentVersions)
         {
             EventContractValidation.ThrowIfInvalidEventType(registration.Key);
             EventContractValidation.ThrowIfInvalidSchemaVersion(registration.Value);
+            if (string.Equals(
+                registration.Key,
+                SensitiveObjectDeletedEventContract.EventType,
+                StringComparison.Ordinal))
+            {
+                throw new ReservedSystemEventTypeException(registration.Key);
+            }
+
             versionSnapshot.Add(registration.Key, registration.Value);
         }
 
@@ -36,6 +50,13 @@ public sealed class EventSchemaRegistry
         {
             ArgumentNullException.ThrowIfNull(upcaster);
             EventContractValidation.ThrowIfInvalidEventType(upcaster.EventType);
+            if (string.Equals(
+                upcaster.EventType,
+                SensitiveObjectDeletedEventContract.EventType,
+                StringComparison.Ordinal))
+            {
+                throw new ReservedSystemEventTypeException(upcaster.EventType);
+            }
 
             if (upcaster.FromSchemaVersion < 1 ||
                 upcaster.ToSchemaVersion != upcaster.FromSchemaVersion + 1)
@@ -153,6 +174,17 @@ public abstract class EventSchemaException : InvalidOperationException
         : base(message)
     {
     }
+}
+
+public sealed class ReservedSystemEventTypeException : EventSchemaException
+{
+    public ReservedSystemEventTypeException(string eventType)
+        : base($"Event type '{eventType}' is reserved by the system.")
+    {
+        EventType = eventType;
+    }
+
+    public string EventType { get; }
 }
 
 public sealed class UnknownEventTypeException : EventSchemaException

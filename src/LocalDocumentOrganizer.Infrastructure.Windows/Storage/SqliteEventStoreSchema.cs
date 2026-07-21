@@ -5,7 +5,7 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
 internal static class SqliteEventStoreSchema
 {
-    private const int CurrentVersion = 3;
+    private const int CurrentVersion = 4;
     private const string VersionTwoSql = """
         CREATE TABLE event_streams(
             stream_id TEXT PRIMARY KEY CHECK(stream_id <> '00000000-0000-0000-0000-000000000000' AND length(stream_id) = 36 AND stream_id = lower(stream_id) AND substr(stream_id,9,1)='-' AND substr(stream_id,14,1)='-' AND substr(stream_id,19,1)='-' AND substr(stream_id,24,1)='-' AND length(replace(stream_id,'-','')) = 32 AND replace(stream_id,'-','') NOT GLOB '*[^0-9a-f]*'),
@@ -89,6 +89,23 @@ internal static class SqliteEventStoreSchema
             last_global_position INTEGER NOT NULL CHECK(last_global_position >= 0)
         ) STRICT;
         PRAGMA main.user_version = 3;
+        """;
+
+    private const string VersionFourDeletionSql = """
+        CREATE TABLE secure_compaction_queue(
+            owner_kind INTEGER NOT NULL CHECK(owner_kind IN (0, 1, 2, 3)),
+            owner_id TEXT NOT NULL CHECK(owner_id <> '00000000-0000-0000-0000-000000000000' AND length(owner_id) = 36 AND owner_id = lower(owner_id) AND substr(owner_id,9,1)='-' AND substr(owner_id,14,1)='-' AND substr(owner_id,19,1)='-' AND substr(owner_id,24,1)='-' AND length(replace(owner_id,'-','')) = 32 AND replace(owner_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+            destroyed_key_id TEXT NOT NULL CHECK(destroyed_key_id <> '00000000-0000-0000-0000-000000000000' AND length(destroyed_key_id) = 36 AND destroyed_key_id = lower(destroyed_key_id) AND substr(destroyed_key_id,9,1)='-' AND substr(destroyed_key_id,14,1)='-' AND substr(destroyed_key_id,19,1)='-' AND substr(destroyed_key_id,24,1)='-' AND length(replace(destroyed_key_id,'-','')) = 32 AND replace(destroyed_key_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+            stream_id TEXT NOT NULL CHECK(stream_id <> '00000000-0000-0000-0000-000000000000' AND length(stream_id) = 36 AND stream_id = lower(stream_id) AND substr(stream_id,9,1)='-' AND substr(stream_id,14,1)='-' AND substr(stream_id,19,1)='-' AND substr(stream_id,24,1)='-' AND length(replace(stream_id,'-','')) = 32 AND replace(stream_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+            tombstone_stream_version INTEGER NOT NULL CHECK(tombstone_stream_version >= 0),
+            operation_id TEXT NOT NULL UNIQUE CHECK(operation_id <> '00000000-0000-0000-0000-000000000000' AND length(operation_id) = 36 AND operation_id = lower(operation_id) AND substr(operation_id,9,1)='-' AND substr(operation_id,14,1)='-' AND substr(operation_id,19,1)='-' AND substr(operation_id,24,1)='-' AND length(replace(operation_id,'-','')) = 32 AND replace(operation_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+            tombstone_event_id TEXT NOT NULL UNIQUE CHECK(tombstone_event_id <> '00000000-0000-0000-0000-000000000000' AND length(tombstone_event_id) = 36 AND tombstone_event_id = lower(tombstone_event_id) AND substr(tombstone_event_id,9,1)='-' AND substr(tombstone_event_id,14,1)='-' AND substr(tombstone_event_id,19,1)='-' AND substr(tombstone_event_id,24,1)='-' AND length(replace(tombstone_event_id,'-','')) = 32 AND replace(tombstone_event_id,'-','') NOT GLOB '*[^0-9a-f]*'),
+            PRIMARY KEY(owner_kind, owner_id)
+        ) STRICT;
+        CREATE TRIGGER secure_compaction_queue_immutable_update
+        BEFORE UPDATE ON secure_compaction_queue
+        BEGIN SELECT RAISE(ABORT, 'secure_compaction_queue is immutable'); END;
+        PRAGMA main.user_version = 4;
         """;
 
     private const string VersionOneSql = """
@@ -181,10 +198,12 @@ internal static class SqliteEventStoreSchema
             catch (VaultKeyRingException exception) { throw new VaultRecoveryRequiredException(exception); }
         }
 
-        if (inspection.Kind is VaultSchemaKind.V3 or VaultSchemaKind.EligibleV2)
+        if (inspection.Kind is VaultSchemaKind.V4 or VaultSchemaKind.V3 or VaultSchemaKind.EligibleV2)
             RequireKeyRingIdentity(inspection.KeyRingIdentity, bootstrapRing.Identity);
 
         await using var lease = await keyRing.MaintenanceGate.AcquireAsync(cancellationToken);
+        try { await keyRing.EnsureCurrentFormatAsync(lease, cancellationToken); }
+        catch (VaultKeyRingException exception) { throw new VaultRecoveryRequiredException(exception); }
         VaultKeyRing ringBeforeDatabaseOpen;
         try { ringBeforeDatabaseOpen = await keyRing.OpenAsync(cancellationToken); }
         catch (VaultKeyRingException exception) { throw new VaultRecoveryRequiredException(exception); }
@@ -239,6 +258,8 @@ internal static class SqliteEventStoreSchema
                 await ExecuteNonQueryAsync(connection, transaction, VersionTwoSql, cancellationToken);
                 await ExecuteNonQueryAsync(
                     connection, transaction, VersionThreeProjectionSql, cancellationToken);
+                await ExecuteNonQueryAsync(
+                    connection, transaction, VersionFourDeletionSql, cancellationToken);
                 await InsertKeyRingIdentityAsync(
                     connection, transaction, authoritativeRing.Identity, cancellationToken);
             }
@@ -246,6 +267,14 @@ internal static class SqliteEventStoreSchema
             {
                 await ExecuteNonQueryAsync(
                     connection, transaction, VersionThreeProjectionSql, cancellationToken);
+                await ExecuteNonQueryAsync(
+                    connection, transaction, VersionFourDeletionSql, cancellationToken);
+            }
+            else if (finalInspection.Kind == VaultSchemaKind.V3)
+            {
+                await ValidateLegacyVersionThreeAsync(connection, transaction, cancellationToken);
+                await ExecuteNonQueryAsync(
+                    connection, transaction, VersionFourDeletionSql, cancellationToken);
             }
             else
             {
@@ -304,7 +333,7 @@ internal static class SqliteEventStoreSchema
         VaultSchemaInspection current,
         VaultKeyRingIdentity authoritativeIdentity)
     {
-        if (original.Kind is VaultSchemaKind.V3 or VaultSchemaKind.EligibleV2)
+        if (original.Kind is VaultSchemaKind.V4 or VaultSchemaKind.V3 or VaultSchemaKind.EligibleV2)
         {
             if (current.Kind != original.Kind)
                 throw new VaultRecoveryRequiredException();
@@ -316,7 +345,7 @@ internal static class SqliteEventStoreSchema
         if (original.Kind is not (VaultSchemaKind.New or VaultSchemaKind.EmptyV1))
             throw new VaultRecoveryRequiredException();
         if (current.Kind == original.Kind) return;
-        if (current.Kind == VaultSchemaKind.V3)
+        if (current.Kind == VaultSchemaKind.V4)
         {
             RequireKeyRingIdentity(current.KeyRingIdentity, authoritativeIdentity);
             return;
@@ -331,7 +360,7 @@ internal static class SqliteEventStoreSchema
     {
         if (preOpen.Kind != final.Kind)
             throw new VaultRecoveryRequiredException();
-        if (preOpen.Kind is VaultSchemaKind.V3 or VaultSchemaKind.EligibleV2)
+        if (preOpen.Kind is VaultSchemaKind.V4 or VaultSchemaKind.V3 or VaultSchemaKind.EligibleV2)
             RequireKeyRingIdentity(preOpen.KeyRingIdentity, final.KeyRingIdentity!);
     }
 
@@ -445,11 +474,18 @@ internal static class SqliteEventStoreSchema
                         inspection = new VaultSchemaInspection(VaultSchemaKind.LegacyProjection);
                     }
                 }
+                else if (version == 3)
+                {
+                    await ValidateLegacyVersionThreeAsync(connection, null, cancellationToken);
+                    inspection = new VaultSchemaInspection(
+                        VaultSchemaKind.V3,
+                        await ReadPersistedKeyRingIdentityAsync(connection, null, cancellationToken));
+                }
                 else if (version == CurrentVersion)
                 {
                     await ValidateExistingVersionThreeAsync(connection, null, cancellationToken);
                     inspection = new VaultSchemaInspection(
-                        VaultSchemaKind.V3,
+                        VaultSchemaKind.V4,
                         await ReadPersistedKeyRingIdentityAsync(connection, null, cancellationToken));
                 }
                 else
@@ -529,23 +565,57 @@ internal static class SqliteEventStoreSchema
                 VaultSchemaKind.EligibleV2,
                 await ReadPersistedKeyRingIdentityAsync(connection, transaction, cancellationToken));
         }
+        if (version == 3)
+        {
+            await ValidateLegacyVersionThreeAsync(connection, transaction, cancellationToken);
+            return new VaultSchemaInspection(
+                VaultSchemaKind.V3,
+                await ReadPersistedKeyRingIdentityAsync(connection, transaction, cancellationToken));
+        }
         if (version == CurrentVersion)
         {
             await ValidateExistingVersionThreeAsync(connection, transaction, cancellationToken);
             return new VaultSchemaInspection(
-                VaultSchemaKind.V3,
+                VaultSchemaKind.V4,
                 await ReadPersistedKeyRingIdentityAsync(connection, transaction, cancellationToken));
         }
 
         return new VaultSchemaInspection(VaultSchemaKind.Unknown);
     }
 
-    internal static async Task ValidateExistingVersionThreeAsync(SqliteConnection connection, SqliteTransaction? transaction, CancellationToken cancellationToken)
+    internal static Task ValidateExistingVersionThreeAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken) =>
+        ValidateExistingSchemaAsync(
+            connection,
+            transaction,
+            CurrentVersion,
+            requireDeletionQueue: true,
+            cancellationToken);
+
+    private static Task ValidateLegacyVersionThreeAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken) =>
+        ValidateExistingSchemaAsync(
+            connection,
+            transaction,
+            expectedVersion: 3,
+            requireDeletionQueue: false,
+            cancellationToken);
+
+    private static async Task ValidateExistingSchemaAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        int expectedVersion,
+        bool requireDeletionQueue,
+        CancellationToken cancellationToken)
     {
         try
         {
             var version = Convert.ToInt32(await ExecuteScalarAsync(connection, transaction, "PRAGMA main.user_version;", cancellationToken));
-            if (version != CurrentVersion) throw new VaultRecoveryRequiredException();
+            if (version != expectedVersion) throw new VaultRecoveryRequiredException();
 
             await RequireExactObjectSqlAsync(connection, transaction, "table", "event_streams",
                 ExtractExpectedStatement("CREATE TABLE event_streams("), cancellationToken);
@@ -574,6 +644,40 @@ internal static class SqliteEventStoreSchema
                 "CREATE TRIGGER vault_metadata_immutable_update BEFORE UPDATE ON vault_metadata BEGIN SELECT RAISE(ABORT, 'vault_metadata is immutable'); END", cancellationToken);
             await RequireExactObjectSqlAsync(connection, transaction, "trigger", "vault_metadata_immutable_delete",
                 "CREATE TRIGGER vault_metadata_immutable_delete BEFORE DELETE ON vault_metadata BEGIN SELECT RAISE(ABORT, 'vault_metadata is immutable'); END", cancellationToken);
+            if (requireDeletionQueue)
+            {
+                await RequireExactObjectSqlAsync(
+                    connection,
+                    transaction,
+                    "table",
+                    "secure_compaction_queue",
+                    ExtractExpectedStatement(
+                        VersionFourDeletionSql,
+                        "CREATE TABLE secure_compaction_queue("),
+                    cancellationToken);
+                await RequireExactObjectSqlAsync(
+                    connection,
+                    transaction,
+                    "trigger",
+                    "secure_compaction_queue_immutable_update",
+                    ExtractExpectedStatement(
+                        VersionFourDeletionSql,
+                        "CREATE TRIGGER secure_compaction_queue_immutable_update"),
+                    cancellationToken);
+            }
+
+            var deletionObjectCount = Convert.ToInt64(await ExecuteScalarAsync(
+                connection,
+                transaction,
+                """
+                SELECT COUNT(*) FROM main.sqlite_master
+                WHERE lower(name) IN (
+                    'secure_compaction_queue',
+                    'secure_compaction_queue_immutable_update');
+                """,
+                cancellationToken));
+            if (deletionObjectCount != (requireDeletionQueue ? 2 : 0))
+                throw new VaultRecoveryRequiredException();
             _ = await ReadPersistedKeyRingIdentityAsync(connection, transaction, cancellationToken);
 
             await using var forbidden = connection.CreateCommand();
@@ -596,12 +700,21 @@ internal static class SqliteEventStoreSchema
                     OR (lower(name) GLOB 'vault_metadata_*' AND lower(name) NOT IN (
                         'vault_metadata_immutable_update',
                         'vault_metadata_immutable_delete'))
-                    OR (lower(tbl_name) IN ('event_streams', 'timeline_events', 'projection_checkpoints', 'vault_metadata')
+                    OR (lower(name) GLOB 'secure_compaction_queue*' AND lower(name) NOT IN (
+                        'secure_compaction_queue',
+                        'secure_compaction_queue_immutable_update'))
+                    OR (lower(tbl_name) IN (
+                            'event_streams',
+                            'timeline_events',
+                            'projection_checkpoints',
+                            'vault_metadata',
+                            'secure_compaction_queue')
                         AND lower(name) NOT IN (
                             'event_streams',
                             'timeline_events',
                             'projection_checkpoints',
                             'vault_metadata',
+                            'secure_compaction_queue',
                             'event_streams_stream_id_nocase',
                             'timeline_events_stream_position_nocase',
                             'timeline_events_operation_position',
@@ -609,7 +722,8 @@ internal static class SqliteEventStoreSchema
                             'timeline_events_immutable_update',
                             'timeline_events_immutable_delete',
                             'vault_metadata_immutable_update',
-                            'vault_metadata_immutable_delete'))
+                            'vault_metadata_immutable_delete',
+                            'secure_compaction_queue_immutable_update'))
                   );
                 """;
             if (Convert.ToInt64(await forbidden.ExecuteScalarAsync(cancellationToken)) != 0)
@@ -622,16 +736,18 @@ internal static class SqliteEventStoreSchema
                 WHERE name COLLATE NOCASE IN (
                     'event_streams', 'timeline_events', 'projection_checkpoints',
                     'vault_metadata', 'event_streams_stream_id_nocase',
+                    'secure_compaction_queue',
                     'timeline_events_stream_position_nocase',
                     'timeline_events_operation_position',
                     'timeline_events_operation_representation',
                     'timeline_events_immutable_update',
                     'timeline_events_immutable_delete',
                     'vault_metadata_immutable_update',
-                    'vault_metadata_immutable_delete')
+                    'vault_metadata_immutable_delete',
+                    'secure_compaction_queue_immutable_update')
                    OR tbl_name COLLATE NOCASE IN (
                     'event_streams', 'timeline_events', 'projection_checkpoints',
-                    'vault_metadata');
+                    'vault_metadata', 'secure_compaction_queue');
                 """;
             if (Convert.ToInt64(await forbiddenTemp.ExecuteScalarAsync(cancellationToken)) != 0)
                 throw new VaultRecoveryRequiredException();
@@ -719,6 +835,7 @@ internal static class SqliteEventStoreSchema
             "timeline_events",
             "projection_checkpoints",
             "vault_metadata",
+            "secure_compaction_queue",
             "event_streams_stream_id_nocase",
             "timeline_events_stream_position_nocase",
             "timeline_events_operation_position",
@@ -727,6 +844,7 @@ internal static class SqliteEventStoreSchema
             "timeline_events_immutable_delete",
             "vault_metadata_immutable_update",
             "vault_metadata_immutable_delete",
+            "secure_compaction_queue_immutable_update",
         };
         var registeredTables = projections.Registrations
             .SelectMany(registration => registration.EncryptedLocations)
@@ -1046,6 +1164,7 @@ internal static class SqliteEventStoreSchema
         LegacyNonEmpty,
         EligibleV2,
         V3,
+        V4,
         LegacyProjection,
         Unknown,
         Malformed,

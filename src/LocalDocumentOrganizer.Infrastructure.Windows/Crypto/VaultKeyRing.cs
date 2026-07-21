@@ -9,7 +9,7 @@ public sealed class VaultKeyRing
 {
     public const int RootSize = 32;
     public const int DataKeySize = 32;
-    public const int FormatVersion = 1;
+    public const int FormatVersion = 2;
 
     private readonly ReadOnlyCollection<VaultActiveKeyMetadata> _activeKeys;
     private readonly ReadOnlyCollection<VaultDestroyedKeyReceipt> _destroyedReceipts;
@@ -67,6 +67,7 @@ public sealed record VaultDestroyedKeyReceipt
     public VaultDestroyedKeyReceipt(
         SensitiveObjectRef owner,
         DataKeyId keyId,
+        StreamId streamId,
         OperationId operationId,
         EventId tombstoneEventId,
         StreamVersion expectedStreamVersion,
@@ -75,6 +76,7 @@ public sealed record VaultDestroyedKeyReceipt
     {
         Owner = owner;
         KeyId = keyId;
+        StreamId = streamId ?? throw new ArgumentNullException(nameof(streamId));
         OperationId = operationId;
         TombstoneEventId = tombstoneEventId;
         ExpectedStreamVersion = expectedStreamVersion;
@@ -85,6 +87,7 @@ public sealed record VaultDestroyedKeyReceipt
 
     public SensitiveObjectRef Owner { get; }
     public DataKeyId KeyId { get; }
+    public StreamId StreamId { get; }
     public OperationId OperationId { get; }
     public EventId TombstoneEventId { get; }
     public StreamVersion ExpectedStreamVersion { get; }

@@ -1,4 +1,5 @@
 using System.Globalization;
+using LocalDocumentOrganizer.Core.Deletion;
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
 using LocalDocumentOrganizer.Infrastructure.Windows.Crypto;
@@ -6,7 +7,7 @@ using Microsoft.Data.Sqlite;
 
 namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
-public sealed class SqliteEventStore : IEventStore
+public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
 {
     private readonly string _connectionString;
     private readonly EventSchemaRegistry _schemaRegistry;
@@ -15,6 +16,7 @@ public sealed class SqliteEventStore : IEventStore
     private readonly SqliteProjectionRegistry _projectionRegistry;
     private readonly TimeProvider _timeProvider;
     private readonly SqliteEventPayloadProtectionProvider _payloads;
+    private readonly SqliteSensitiveDataDeletionStore _deletions;
 
     public SqliteEventStore(
         string connectionString,
@@ -53,12 +55,30 @@ public sealed class SqliteEventStore : IEventStore
     {
     }
 
+    internal SqliteEventStore(
+        string connectionString,
+        EventSchemaRegistry schemaRegistry,
+        SqliteProjectionRegistry projections,
+        VaultKeyRingStore keyRing,
+        TimeProvider? timeProvider,
+        ISqliteSensitiveDataDeletionFaultInjector faultInjector)
+        : this(
+            connectionString,
+            schemaRegistry,
+            projections,
+            timeProvider,
+            RequireKeyRing(keyRing),
+            faultInjector)
+    {
+    }
+
     private SqliteEventStore(
         string connectionString,
         EventSchemaRegistry schemaRegistry,
         SqliteProjectionRegistry projections,
         TimeProvider? timeProvider,
-        VaultKeyRingStore? keyRing)
+        VaultKeyRingStore? keyRing,
+        ISqliteSensitiveDataDeletionFaultInjector? faultInjector = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         ArgumentNullException.ThrowIfNull(schemaRegistry);
@@ -71,16 +91,31 @@ public sealed class SqliteEventStore : IEventStore
         _timeProvider = timeProvider ?? TimeProvider.System;
         _payloads = new SqliteEventPayloadProtectionProvider(
             keyRing ?? CreateDefaultKeyRing(_connectionString));
+        _deletions = new SqliteSensitiveDataDeletionStore(
+            _connectionString,
+            _schemaRegistry,
+            _projectionRegistry,
+            _payloads.KeyRing,
+            _timeProvider,
+            faultInjector);
     }
 
-    public Task InitializeAsync(CancellationToken cancellationToken = default) =>
-        SqliteEventStoreSchema.InitializeAsync(
+    public async Task InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        await SqliteEventStoreSchema.InitializeAsync(
             _connectionString, _projectionRegistry, _payloads.KeyRing, cancellationToken);
+        await _deletions.RecoverAsync(cancellationToken);
+    }
 
     public Task<ProjectionRebuildResult> RebuildProjectionsAsync(CancellationToken cancellationToken = default) =>
         new SqliteProjectionRebuilder(
             _connectionString, _schemaRegistry, _projectionRegistry, _payloads)
             .RebuildAsync(cancellationToken);
+
+    public Task<DeleteSensitiveObjectResult> DeleteAsync(
+        DeleteSensitiveObjectCommand command,
+        CancellationToken cancellationToken) =>
+        _deletions.DeleteAsync(command, cancellationToken);
 
     public async Task<IReadOnlyList<EventForReplay>> ReadStreamAsync(StreamId streamId, CancellationToken cancellationToken)
     {
@@ -178,6 +213,10 @@ public sealed class SqliteEventStore : IEventStore
             var expectedKeyRingIdentity =
                 await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
                     connection, transaction, cancellationToken);
+            await SqliteSensitiveDataDeletionStore.RequireNoPendingReceiptsAsync(
+                _payloads.KeyRing,
+                expectedKeyRingIdentity,
+                cancellationToken);
             keySession = await _payloads.OpenWriteSessionAsync(
                 lease, expectedKeyRingIdentity, cancellationToken);
             await SqliteEventStoreSchema.ValidateKeyRingIdentityAsync(
