@@ -75,11 +75,22 @@ public sealed class VaultKeyRingStore
 
     public async Task<VaultKeyRing> CreateAsync(CancellationToken cancellationToken)
     {
+        await using var lease = await MaintenanceGate.AcquireMutationAsync(cancellationToken).ConfigureAwait(false);
+        return await CreateAsync(lease, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task<VaultKeyRing> CreateAsync(
+        VaultMaintenanceLease lease,
+        CancellationToken cancellationToken)
+    {
+        MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
+        await using var operation = await MaintenanceGate
+            .EnterOperationAsync(lease, cancellationToken)
+            .ConfigureAwait(false);
         WindowsVaultPathGuard.RequireSafeEntryShape(_path);
         var directory = Path.GetDirectoryName(_path)
             ?? throw new ArgumentException("The keyring path has no parent directory.", nameof(_path));
         Directory.CreateDirectory(directory);
-        await using var lease = await MaintenanceGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
         WindowsVaultPathGuard.RequireSafeForOpen(_path);
         CleanupOrphans(requireCanonical: true);
         if (WindowsVaultPathGuard.EntryExists(_path))
@@ -130,6 +141,7 @@ public sealed class VaultKeyRingStore
         VaultMaintenanceLease lease,
         CancellationToken cancellationToken)
     {
+        MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
         await using var operation = await MaintenanceGate
             .EnterOperationAsync(lease, cancellationToken)
             .ConfigureAwait(false);
@@ -188,6 +200,18 @@ public sealed class VaultKeyRingStore
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(expectedIdentity);
+        if (writable)
+        {
+            MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
+        }
+        else
+        {
+            MaintenanceGate.Validate(
+                lease,
+                VaultLeaseMode.Read,
+                VaultLeaseMode.Mutation,
+                VaultLeaseMode.Rebuild);
+        }
         var operation = await MaintenanceGate
             .EnterOperationAsync(lease, cancellationToken)
             .ConfigureAwait(false);
@@ -227,7 +251,7 @@ public sealed class VaultKeyRingStore
         Func<DataKeyId, ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>> callback,
         CancellationToken cancellationToken)
     {
-        await using var lease = await MaintenanceGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        await using var lease = await MaintenanceGate.AcquireMutationAsync(cancellationToken).ConfigureAwait(false);
         return await GetOrCreateDataKeyAsync(owner, lease, callback, cancellationToken).ConfigureAwait(false);
     }
 
@@ -239,6 +263,7 @@ public sealed class VaultKeyRingStore
     {
         ValidateOwner(owner);
         ArgumentNullException.ThrowIfNull(callback);
+        MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
         await using var operation = await MaintenanceGate
             .EnterOperationAsync(lease, cancellationToken)
             .ConfigureAwait(false);
@@ -293,7 +318,7 @@ public sealed class VaultKeyRingStore
         Func<DataKeyId, ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>> activeCallback,
         CancellationToken cancellationToken)
     {
-        await using var lease = await MaintenanceGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        await using var lease = await MaintenanceGate.AcquireReadAsync(cancellationToken).ConfigureAwait(false);
         return await ResolveDataKeyAsync(
             owner, expectedKeyId, lease, destroyedCallback, activeCallback, cancellationToken).ConfigureAwait(false);
     }
@@ -310,6 +335,11 @@ public sealed class VaultKeyRingStore
         if (expectedKeyId.Value == Guid.Empty) throw new ArgumentException("A data-key ID is required.", nameof(expectedKeyId));
         ArgumentNullException.ThrowIfNull(destroyedCallback);
         ArgumentNullException.ThrowIfNull(activeCallback);
+        MaintenanceGate.Validate(
+            lease,
+            VaultLeaseMode.Read,
+            VaultLeaseMode.Mutation,
+            VaultLeaseMode.Rebuild);
         await using var operation = await MaintenanceGate
             .EnterOperationAsync(lease, cancellationToken)
             .ConfigureAwait(false);
@@ -340,6 +370,11 @@ public sealed class VaultKeyRingStore
         if (expectedKeyId.Value == Guid.Empty)
             throw new ArgumentException("A data-key ID is required.", nameof(expectedKeyId));
         ArgumentNullException.ThrowIfNull(callback);
+        MaintenanceGate.Validate(
+            lease,
+            VaultLeaseMode.Read,
+            VaultLeaseMode.Mutation,
+            VaultLeaseMode.Rebuild);
 
         byte[]? subkey = null;
         try
@@ -644,6 +679,7 @@ public sealed class VaultKeyRingStore
     {
         ArgumentNullException.ThrowIfNull(receipt);
         receipt.Validate();
+        MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
         await using var operation = await MaintenanceGate
             .EnterOperationAsync(lease, cancellationToken)
             .ConfigureAwait(false);
@@ -686,6 +722,7 @@ public sealed class VaultKeyRingStore
     {
         ArgumentNullException.ThrowIfNull(receipt);
         receipt.Validate();
+        MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
         await using var operation = await MaintenanceGate
             .EnterOperationAsync(lease, cancellationToken)
             .ConfigureAwait(false);

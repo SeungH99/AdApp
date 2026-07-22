@@ -66,3 +66,16 @@ public sealed class StorageBusyException : InvalidOperationException
     {
     }
 }
+
+public sealed class StorageCapacityException : IOException
+{
+    public StorageCapacityException()
+        : base("The Vault does not have enough storage capacity to complete the operation.")
+    {
+    }
+
+    internal StorageCapacityException(Exception innerException)
+        : base("The Vault does not have enough storage capacity to complete the operation.", innerException)
+    {
+    }
+}

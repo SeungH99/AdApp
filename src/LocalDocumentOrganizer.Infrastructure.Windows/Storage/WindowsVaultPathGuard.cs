@@ -7,6 +7,7 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
 internal static class WindowsVaultPathGuard
 {
+    private const string ProjectionRebuildMarker = ".projection-rebuild-";
     private const int MaximumPathBuffer = 32_768;
     private const uint InvalidFileAttributes = uint.MaxValue;
     private const uint OpenExisting = 3;
@@ -145,6 +146,39 @@ internal static class WindowsVaultPathGuard
     {
         var fullPath = NormalizeLocalDrivePath(path);
         return TryGetEntryAttributes(fullPath, out _);
+    }
+
+    internal static string RequireReservedProjectionRebuildArtifact(
+        string vaultPath,
+        string artifactPath)
+    {
+        var canonicalVault = NormalizeLocalDrivePath(vaultPath);
+        var canonicalArtifact = NormalizeLocalDrivePath(artifactPath);
+        var vaultDirectory = Path.GetDirectoryName(canonicalVault);
+        var artifactDirectory = Path.GetDirectoryName(canonicalArtifact);
+        var expectedPrefix = Path.GetFileName(canonicalVault) + ProjectionRebuildMarker;
+        var artifactName = Path.GetFileName(canonicalArtifact);
+        if (!string.Equals(vaultDirectory, artifactDirectory, StringComparison.OrdinalIgnoreCase)
+            || !artifactName.StartsWith(expectedPrefix, StringComparison.Ordinal)
+            || !artifactName.EndsWith(".tmp", StringComparison.Ordinal)
+            || artifactName.Length != expectedPrefix.Length + 32 + ".tmp".Length)
+        {
+            throw new VaultRecoveryRequiredException();
+        }
+
+        var generation = artifactName.AsSpan(expectedPrefix.Length, 32);
+        foreach (var character in generation)
+        {
+            if (character is not (>= '0' and <= '9') and not (>= 'a' and <= 'f'))
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+        }
+
+        RequireSafeForOpen(canonicalArtifact);
+        RequireSafeForOpen(canonicalArtifact + "-wal");
+        RequireSafeForOpen(canonicalArtifact + "-shm");
+        return canonicalArtifact;
     }
 
     private static void RequireReadyLocalDrive(string root)

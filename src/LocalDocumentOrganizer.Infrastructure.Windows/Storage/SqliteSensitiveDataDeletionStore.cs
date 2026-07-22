@@ -78,7 +78,7 @@ internal sealed class SqliteSensitiveDataDeletionStore
             _keyRing.MaintenanceGate);
 
         await using var lease = await _keyRing.MaintenanceGate
-            .AcquireAsync(cancellationToken)
+            .AcquireMutationAsync(cancellationToken)
             .ConfigureAwait(false);
         SqliteConnection? connection = null;
         SqliteTransaction? transaction = null;
@@ -273,6 +273,8 @@ internal sealed class SqliteSensitiveDataDeletionStore
             {
                 await SqliteProjectionAuthorizer.RunAsync(
                     connection,
+                    registration,
+                    _projections.AllowsLegacyTestObjects,
                     () => registration.Projection.PurgeOwnerAsync(
                         command.Target,
                         SqliteProjectionContexts.CreateAdministrative(
@@ -284,6 +286,8 @@ internal sealed class SqliteSensitiveDataDeletionStore
                         completionToken));
                 await SqliteProjectionAuthorizer.RunAsync(
                     connection,
+                    registration,
+                    _projections.AllowsLegacyTestObjects,
                     () => registration.Projection.ApplyAsync(
                         replay,
                         globalPosition,
@@ -431,8 +435,19 @@ internal sealed class SqliteSensitiveDataDeletionStore
             _connectionString,
             _keyRing.MaintenanceGate);
         await using var lease = await _keyRing.MaintenanceGate
-            .AcquireAsync(cancellationToken)
+            .AcquireMutationAsync(cancellationToken)
             .ConfigureAwait(false);
+        await RecoverAsync(lease, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task RecoverAsync(
+        VaultMaintenanceLease lease,
+        CancellationToken cancellationToken)
+    {
+        _keyRing.MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
+        SqliteEventStoreSchema.ValidateVaultPath(
+            _connectionString,
+            _keyRing.MaintenanceGate);
         VaultKeyRing initialRing;
         try { initialRing = await _keyRing.OpenAsync(cancellationToken); }
         catch (VaultKeyRingException exception) { throw new VaultRecoveryRequiredException(exception); }
@@ -636,6 +651,8 @@ internal sealed class SqliteSensitiveDataDeletionStore
         {
             await SqliteProjectionAuthorizer.RunAsync(
                 connection,
+                registration,
+                _projections.AllowsLegacyTestObjects,
                 () => registration.Projection.PurgeOwnerAsync(
                     command.Target,
                     SqliteProjectionContexts.CreateAdministrative(
@@ -647,6 +664,8 @@ internal sealed class SqliteSensitiveDataDeletionStore
                     cancellationToken));
             await SqliteProjectionAuthorizer.RunAsync(
                 connection,
+                registration,
+                _projections.AllowsLegacyTestObjects,
                 () => registration.Projection.ApplyAsync(
                     replay,
                     globalPosition,
@@ -1186,6 +1205,8 @@ internal sealed class SqliteSensitiveDataDeletionStore
                 cancellationToken);
             await SqliteProjectionAuthorizer.RunAsync(
                 connection,
+                registration,
+                _projections.AllowsLegacyTestObjects,
                 () => registration.Projection.PurgeOwnerAsync(
                     owner,
                     SqliteProjectionContexts.CreateAdministrative(

@@ -157,11 +157,29 @@ internal static class SqliteEventStoreSchema
     {
         ValidateConnectionString(connectionString);
         ValidateVaultPath(connectionString, keyRing.MaintenanceGate);
+        await using var lease = await keyRing.MaintenanceGate
+            .AcquireMutationAsync(cancellationToken)
+            .ConfigureAwait(false);
+        await InitializeAsync(
+            connectionString,
+            projections,
+            keyRing,
+            lease,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    internal static async Task InitializeAsync(
+        string connectionString,
+        SqliteProjectionRegistry projections,
+        VaultKeyRingStore keyRing,
+        VaultMaintenanceLease lease,
+        CancellationToken cancellationToken)
+    {
+        ValidateConnectionString(connectionString);
+        ValidateVaultPath(connectionString, keyRing.MaintenanceGate);
+        keyRing.MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
         VaultSchemaInspection inspection;
-        await using (var firstLease = await keyRing.MaintenanceGate.AcquireAsync(cancellationToken))
-        {
-            inspection = await InspectBeforeMutationAsync(connectionString, cancellationToken);
-        }
+        inspection = await InspectBeforeMutationAsync(connectionString, cancellationToken);
 
         if (inspection.Kind == VaultSchemaKind.LegacyProjection)
         {
@@ -183,7 +201,7 @@ internal static class SqliteEventStoreSchema
         {
             try
             {
-                try { bootstrapRing = await keyRing.CreateAsync(cancellationToken); }
+                try { bootstrapRing = await keyRing.CreateAsync(lease, cancellationToken); }
                 catch (VaultKeyRingPersistenceException) { bootstrapRing = await keyRing.OpenAsync(cancellationToken); }
             }
             catch (VaultKeyRingException exception)
@@ -201,7 +219,6 @@ internal static class SqliteEventStoreSchema
         if (inspection.Kind is VaultSchemaKind.V4 or VaultSchemaKind.V3 or VaultSchemaKind.EligibleV2)
             RequireKeyRingIdentity(inspection.KeyRingIdentity, bootstrapRing.Identity);
 
-        await using var lease = await keyRing.MaintenanceGate.AcquireAsync(cancellationToken);
         try { await keyRing.EnsureCurrentFormatAsync(lease, cancellationToken); }
         catch (VaultKeyRingException exception) { throw new VaultRecoveryRequiredException(exception); }
         VaultKeyRing ringBeforeDatabaseOpen;
@@ -286,6 +303,8 @@ internal static class SqliteEventStoreSchema
                 var projection = registration.Projection;
                 var compatibility = await SqliteProjectionAuthorizer.RunAsync(
                     connection,
+                    registration,
+                    projections.AllowsLegacyTestObjects,
                     () => projection.InitializeAsync(
                         SqliteProjectionContexts.CreateAdministrative(
                             connection,
@@ -847,8 +866,8 @@ internal static class SqliteEventStoreSchema
             "secure_compaction_queue_immutable_update",
         };
         var registeredTables = projections.Registrations
-            .SelectMany(registration => registration.EncryptedLocations)
-            .Select(location => location.TableName)
+            .SelectMany(registration => registration.OwnedTables)
+            .Select(table => table.Name)
             .ToHashSet(StringComparer.Ordinal);
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
