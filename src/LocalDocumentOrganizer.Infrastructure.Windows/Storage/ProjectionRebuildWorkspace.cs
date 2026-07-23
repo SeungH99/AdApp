@@ -1148,7 +1148,8 @@ internal sealed class ProjectionRebuildWorkspace : IAsyncDisposable
                       'timeline_events',
                       'event_streams',
                       'vault_metadata',
-                      'secure_compaction_queue');
+                      'secure_compaction_queue',
+                      'managed_vault_copies');
                 """;
             if (Convert.ToInt64(
                     await forbiddenCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
@@ -1424,6 +1425,114 @@ internal sealed class ProjectionRebuildWorkspace : IAsyncDisposable
                 throw new VaultRecoveryRequiredException();
             }
         }
+    }
+
+    internal static async Task RequireProjectionStateEquivalentAsync(
+        SqliteConnection source,
+        SqliteTransaction sourceTransaction,
+        SqliteConnection candidate,
+        SqliteTransaction candidateTransaction,
+        SqliteProjectionRegistry registry,
+        VaultKeyRingStore keyRing,
+        VaultMaintenanceLease lease,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(sourceTransaction);
+        ArgumentNullException.ThrowIfNull(candidate);
+        ArgumentNullException.ThrowIfNull(candidateTransaction);
+        ArgumentNullException.ThrowIfNull(registry);
+        ArgumentNullException.ThrowIfNull(keyRing);
+        keyRing.MaintenanceGate.Validate(
+            lease,
+            VaultLeaseMode.Mutation,
+            VaultLeaseMode.Rebuild);
+        foreach (var registration in registry.Registrations)
+        {
+            var sourceHasCheckpoint = await HasProjectionCheckpointAsync(
+                source,
+                sourceTransaction,
+                registration.Name,
+                cancellationToken).ConfigureAwait(false);
+            var candidateHasCheckpoint = await HasProjectionCheckpointAsync(
+                candidate,
+                candidateTransaction,
+                registration.Name,
+                cancellationToken).ConfigureAwait(false);
+            if (sourceHasCheckpoint != candidateHasCheckpoint)
+                throw new VaultRecoveryRequiredException();
+
+            foreach (var table in registration.OwnedTables)
+            {
+                var sourceSchema = await ReadTableSchemaAsync(
+                    source,
+                    sourceTransaction,
+                    "main",
+                    table.Name,
+                    cancellationToken).ConfigureAwait(false);
+                var candidateSchema = await ReadTableSchemaAsync(
+                    candidate,
+                    candidateTransaction,
+                    "main",
+                    table.Name,
+                    cancellationToken).ConfigureAwait(false);
+                if (!SchemasEqual(sourceSchema, candidateSchema))
+                    throw new VaultRecoveryRequiredException();
+            }
+
+            if (!sourceHasCheckpoint) continue;
+
+            var sourceChecksum = await SqliteProjectionAuthorizer.RunAsync(
+                source,
+                registration.OwnedTables,
+                () => registration.Projection.CalculateChecksumAsync(
+                    SqliteProjectionContexts.CreateAdministrative(
+                        source,
+                        sourceTransaction,
+                        keyRing,
+                        lease,
+                        registration),
+                    cancellationToken)).ConfigureAwait(false);
+            var candidateChecksum = await SqliteProjectionAuthorizer.RunAsync(
+                candidate,
+                registration.OwnedTables,
+                () => registration.Projection.CalculateChecksumAsync(
+                    SqliteProjectionContexts.CreateAdministrative(
+                        candidate,
+                        candidateTransaction,
+                        keyRing,
+                        lease,
+                        registration),
+                    cancellationToken)).ConfigureAwait(false);
+            if (!IsLowerSha256(sourceChecksum)
+                || !string.Equals(sourceChecksum, candidateChecksum, StringComparison.Ordinal))
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+        }
+    }
+
+    private static async Task<bool> HasProjectionCheckpointAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string projectionName,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT COUNT(*)
+            FROM main.projection_checkpoints
+            WHERE projection_name = $projection_name;
+            """;
+        command.Parameters.AddWithValue("$projection_name", projectionName);
+        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)
+            switch
+            {
+                0L => false,
+                1L => true,
+                _ => throw new VaultRecoveryRequiredException(),
+            };
     }
 
     private static bool IsLowerSha256(string? value) =>

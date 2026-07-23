@@ -9,6 +9,7 @@ internal enum SqliteVaultBackupFaultPoint
 {
     BeforeBackup,
     AfterBackup,
+    BeforePublicationLease,
     AfterPublish,
     BeforeRegistration,
     AfterRegistration,
@@ -68,6 +69,8 @@ internal sealed class SqliteVaultBackupService
     internal async Task<ManagedVaultCopyId> CreateAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        await ValidateSourceBeforeFileOperationAsync(cancellationToken)
+            .ConfigureAwait(false);
         RequireManagedDirectory();
         var copyId = ManagedVaultCopyId.Create();
         var finalPath = GetPath(copyId);
@@ -80,8 +83,16 @@ internal sealed class SqliteVaultBackupService
             await CreateConsistentDatabaseAsync(temporaryPath, cancellationToken)
                 .ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
+            _injectFault?.Invoke(SqliteVaultBackupFaultPoint.BeforePublicationLease);
             await using var lease = await _keyRing.MaintenanceGate
                 .AcquireMutationAsync(cancellationToken).ConfigureAwait(false);
+            await new SqliteSecureCompactor(
+                _connectionString,
+                _projections,
+                _keyRing).PrepareManagedCopyForPublicationAsync(
+                    temporaryPath,
+                    lease,
+                    cancellationToken).ConfigureAwait(false);
             File.Move(temporaryPath, finalPath);
             _injectFault?.Invoke(SqliteVaultBackupFaultPoint.AfterPublish);
             _injectFault?.Invoke(SqliteVaultBackupFaultPoint.BeforeRegistration);
@@ -110,15 +121,46 @@ internal sealed class SqliteVaultBackupService
         }
     }
 
-    internal SqliteEventStore Open(
+    private async Task ValidateSourceBeforeFileOperationAsync(
+        CancellationToken cancellationToken)
+    {
+        VaultKeyRing ring;
+        try
+        {
+            ring = await _keyRing.OpenAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (VaultKeyRingException exception)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
+        await using var lease = await _keyRing.MaintenanceGate
+            .AcquireReadAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await SqliteEventStoreSchema.OpenConnectionAsync(
+            _connectionString,
+            _keyRing.MaintenanceGate,
+            cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        await ValidateAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+        await SqliteEventStore.ValidateAllOperationMetadataAsync(
+            connection,
+            transaction,
+            cancellationToken).ConfigureAwait(false);
+        await SqliteSecureCompactor.ValidateProtectedKeyStateAsync(
+            connection,
+            transaction,
+            ring,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    internal SqliteManagedCopyReader Open(
         ManagedVaultCopyId copyId,
         EventSchemaRegistry schemaRegistry)
     {
         ArgumentNullException.ThrowIfNull(schemaRegistry);
         var path = GetPath(copyId);
         if (!File.Exists(path)) throw new VaultRecoveryRequiredException();
-        return new SqliteEventStore(
-            ConnectionString(path),
+        return new SqliteManagedCopyReader(
+            path,
             schemaRegistry,
             _projections,
             _keyRing);
@@ -234,13 +276,10 @@ internal sealed class SqliteVaultBackupService
 
         _injectFault?.Invoke(SqliteVaultBackupFaultPoint.BeforeBackup);
 
-        await using (var destination = new SqliteConnection(ConnectionString(destinationPath)))
+        await using (var destination = await SqliteEventStoreSchema.OpenHardenedPathAsync(
+            destinationPath,
+            cancellationToken).ConfigureAwait(false))
         {
-            await destination.OpenAsync(cancellationToken).ConfigureAwait(false);
-            await ExecuteAsync(destination, "PRAGMA main.secure_delete=ON;", cancellationToken)
-                .ConfigureAwait(false);
-            await ExecuteAsync(destination, "PRAGMA main.synchronous=FULL;", cancellationToken)
-                .ConfigureAwait(false);
             source.BackupDatabase(destination);
         }
         _injectFault?.Invoke(SqliteVaultBackupFaultPoint.AfterBackup);

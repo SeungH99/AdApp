@@ -15,6 +15,7 @@ internal enum SqliteSecureCompactionFaultPoint
     BeforeAtomicReplace,
     AfterAtomicReplace,
     BeforeFinalCheckpoint,
+    BeforePostSwapSidecarWait,
 }
 
 internal sealed class SqliteSecureCompactor
@@ -25,6 +26,9 @@ internal sealed class SqliteSecureCompactor
         BEGIN SELECT RAISE(ABORT, 'timeline_events is immutable'); END;
         """;
     private const string ArtifactMarker = ".secure-compaction-";
+    private const int ErasureScanBlockSize = 64 * 1024;
+    private const int MaxErasurePatternLength = 4 * 1024 * 1024;
+    private const int MaxErasurePatternBytes = 16 * 1024 * 1024;
 
     private readonly string _connectionString;
     private readonly string _vaultPath;
@@ -58,7 +62,25 @@ internal sealed class SqliteSecureCompactor
     {
         await using var lease = await _keyRing.MaintenanceGate
             .AcquireMutationAsync(cancellationToken).ConfigureAwait(false);
-        await CompactAsync(lease, cancellationToken).ConfigureAwait(false);
+        await CompactAsync(
+            lease,
+            forceCompaction: true,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task PrepareManagedCopyForPublicationAsync(
+        string path,
+        VaultMaintenanceLease lease,
+        CancellationToken cancellationToken)
+    {
+        _keyRing.MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
+        var ring = await _keyRing.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await CompactDatabaseAsync(
+            path,
+            maintenanceGate: null,
+            ring,
+            lease,
+            cancellationToken).ConfigureAwait(false);
     }
 
     internal static async Task RecoverCanonicalWalAsync(
@@ -83,6 +105,14 @@ internal sealed class SqliteSecureCompactor
             return;
         }
 
+        try
+        {
+            _ = await keyRing.OpenAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (VaultKeyRingException exception)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
         ValidateWalImage(path, walPath);
         if (File.Exists(shmPath)) WindowsVaultPathGuard.RequireSafeForOpen(shmPath);
         cancellationToken.ThrowIfCancellationRequested();
@@ -143,12 +173,20 @@ internal sealed class SqliteSecureCompactor
 
     internal async Task CompactAsync(
         VaultMaintenanceLease lease,
+        bool forceCompaction,
         CancellationToken cancellationToken)
     {
         _keyRing.MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
         cancellationToken.ThrowIfCancellationRequested();
-        await CleanupArtifactsAsync(lease, cancellationToken).ConfigureAwait(false);
-        var ring = await _keyRing.OpenAsync(cancellationToken).ConfigureAwait(false);
+        VaultKeyRing ring;
+        try
+        {
+            ring = await _keyRing.OpenAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (VaultKeyRingException exception)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
         IReadOnlyList<SecureCompactionWorkItem> work;
         await using (var connection = await SqliteEventStoreSchema.OpenConnectionAsync(
             _connectionString,
@@ -160,8 +198,14 @@ internal sealed class SqliteSecureCompactor
                 connection,
                 transaction,
                 ring,
+                lease,
                 cancellationToken).ConfigureAwait(false);
             work = await SecureCompactionQueue.ReadValidatedAsync(
+                connection,
+                transaction,
+                ring,
+                cancellationToken).ConfigureAwait(false);
+            _ = await ReadEventsAsync(
                 connection,
                 transaction,
                 ring,
@@ -170,15 +214,31 @@ internal sealed class SqliteSecureCompactor
 
         var copies = await _backups.ReadRegisteredAsync(lease, cancellationToken)
             .ConfigureAwait(false);
-        RequireExactManagedCopySet(copies);
-        if (work.Count == 0)
+        foreach (var copy in copies)
         {
-            await CheckpointAndWaitForSidecarsAsync(
-                _vaultPath,
-                _keyRing.MaintenanceGate,
+            var copyPath = _backups.GetPath(copy);
+            if (!File.Exists(copyPath)) throw new VaultRecoveryRequiredException();
+            await using var connection = await OpenOperationalAsync(
+                copyPath,
+                maintenanceGate: null,
                 cancellationToken).ConfigureAwait(false);
-            return;
+            await using var transaction = connection.BeginTransaction(deferred: true);
+            await ValidateDatabaseAsync(
+                connection,
+                transaction,
+                ring,
+                lease,
+                cancellationToken).ConfigureAwait(false);
+            _ = await ReadEventsAsync(
+                connection,
+                transaction,
+                ring,
+                cancellationToken).ConfigureAwait(false);
         }
+
+        await CleanupArtifactsAsync(lease, cancellationToken).ConfigureAwait(false);
+        RequireExactManagedCopySet(copies);
+        if (!forceCompaction && work.Count == 0 && copies.Count == 0) return;
 
         foreach (var copy in copies)
         {
@@ -186,6 +246,7 @@ internal sealed class SqliteSecureCompactor
                 _backups.GetPath(copy),
                 maintenanceGate: null,
                 ring,
+                lease,
                 cancellationToken).ConfigureAwait(false);
         }
 
@@ -193,6 +254,7 @@ internal sealed class SqliteSecureCompactor
             _vaultPath,
             _keyRing.MaintenanceGate,
             ring,
+            lease,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -201,13 +263,17 @@ internal sealed class SqliteSecureCompactor
         CancellationToken cancellationToken)
     {
         _keyRing.MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
-        await CompactAsync(lease, cancellationToken).ConfigureAwait(false);
+        await CompactAsync(
+            lease,
+            forceCompaction: false,
+            cancellationToken).ConfigureAwait(false);
     }
 
     private async Task CompactDatabaseAsync(
         string path,
         VaultMaintenanceGate? maintenanceGate,
         VaultKeyRing ring,
+        VaultMaintenanceLease lease,
         CancellationToken cancellationToken)
     {
         _injectFault?.Invoke(SqliteSecureCompactionFaultPoint.BeforeCheckpoint);
@@ -225,17 +291,16 @@ internal sealed class SqliteSecureCompactor
                 artifact,
                 maintenanceGate,
                 ring,
+                lease,
                 destroyedCiphertexts,
                 cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
-            foreach (var ciphertext in destroyedCiphertexts)
+            if (await FileContainsAnyAsync(
+                artifact,
+                destroyedCiphertexts,
+                cancellationToken).ConfigureAwait(false))
             {
-                if (ciphertext.Length != 0
-                    && await FileContainsAsync(artifact, ciphertext, cancellationToken)
-                        .ConfigureAwait(false))
-                {
-                    throw new VaultRecoveryRequiredException();
-                }
+                throw new VaultRecoveryRequiredException();
             }
 
             _injectFault?.Invoke(SqliteSecureCompactionFaultPoint.BeforeAtomicReplace);
@@ -247,8 +312,13 @@ internal sealed class SqliteSecureCompactor
             await CheckpointAndWaitForSidecarsAsync(
                 path,
                 maintenanceGate,
-                CancellationToken.None).ConfigureAwait(false);
-            await ValidatePublishedAsync(path, maintenanceGate, ring).ConfigureAwait(false);
+                CancellationToken.None,
+                () => _injectFault?.Invoke(
+                    SqliteSecureCompactionFaultPoint.BeforePostSwapSidecarWait),
+                maxAttempts: 40)
+                .ConfigureAwait(false);
+            await ValidatePublishedAsync(path, maintenanceGate, ring, lease)
+                .ConfigureAwait(false);
         }
         catch (Exception exception)
         {
@@ -270,12 +340,14 @@ internal sealed class SqliteSecureCompactor
         string artifactPath,
         VaultMaintenanceGate? maintenanceGate,
         VaultKeyRing ring,
+        VaultMaintenanceLease lease,
         List<byte[]> destroyedCiphertexts,
         CancellationToken cancellationToken)
     {
         WindowsVaultPathGuard.RequireSafeDatabaseSet(sourcePath);
         WindowsVaultPathGuard.RequireSafeDatabaseSet(artifactPath);
         IReadOnlyList<CompactionEventImage> sourceEvents;
+        IReadOnlyDictionary<string, string> sourceProjectionState;
         await using (var source = await OpenOperationalAsync(
             sourcePath,
             maintenanceGate,
@@ -287,6 +359,12 @@ internal sealed class SqliteSecureCompactor
                     source,
                     transaction,
                     ring,
+                    lease,
+                    cancellationToken).ConfigureAwait(false);
+                sourceProjectionState = await ReadProjectionStateAsync(
+                    source,
+                    transaction,
+                    lease,
                     cancellationToken).ConfigureAwait(false);
                 sourceEvents = await ReadEventsAsync(
                     source,
@@ -312,7 +390,16 @@ internal sealed class SqliteSecureCompactor
                     destination,
                     transaction,
                     ring,
+                    lease,
                     cancellationToken).ConfigureAwait(false);
+                var copiedProjectionState = await ReadProjectionStateAsync(
+                    destination,
+                    transaction,
+                    lease,
+                    cancellationToken).ConfigureAwait(false);
+                RequireProjectionStateEqual(
+                    sourceProjectionState,
+                    copiedProjectionState);
                 var copiedEvents = await ReadEventsAsync(
                     destination,
                     transaction,
@@ -322,11 +409,11 @@ internal sealed class SqliteSecureCompactor
                 foreach (var item in sourceEvents.Where(item => item.IsDestroyed))
                 {
                     if (item.PayloadNonce is { Length: > 0 })
-                        destroyedCiphertexts.Add(item.PayloadNonce.ToArray());
+                        destroyedCiphertexts.Add(item.PayloadNonce);
                     if (item.PayloadCiphertext.Length != 0)
-                        destroyedCiphertexts.Add(item.PayloadCiphertext.ToArray());
+                        destroyedCiphertexts.Add(item.PayloadCiphertext);
                     if (item.PayloadTag is { Length: > 0 })
-                        destroyedCiphertexts.Add(item.PayloadTag.ToArray());
+                        destroyedCiphertexts.Add(item.PayloadTag);
                 }
 
                 await ExecuteAsync(
@@ -382,7 +469,15 @@ internal sealed class SqliteSecureCompactor
                     destination,
                     transaction,
                     ring,
+                    lease,
                     cancellationToken).ConfigureAwait(false);
+                RequireProjectionStateEqual(
+                    sourceProjectionState,
+                    await ReadProjectionStateAsync(
+                        destination,
+                        transaction,
+                        lease,
+                        cancellationToken).ConfigureAwait(false));
                 cancellationToken.ThrowIfCancellationRequested();
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             }
@@ -411,7 +506,8 @@ internal sealed class SqliteSecureCompactor
     private async Task ValidatePublishedAsync(
         string path,
         VaultMaintenanceGate? maintenanceGate,
-        VaultKeyRing ring)
+        VaultKeyRing ring,
+        VaultMaintenanceLease lease)
     {
         await using var connection = await OpenOperationalAsync(
             path,
@@ -422,6 +518,7 @@ internal sealed class SqliteSecureCompactor
             connection,
             transaction,
             ring,
+            lease,
             CancellationToken.None).ConfigureAwait(false);
         var queue = await SecureCompactionQueue.ReadValidatedAsync(
             connection,
@@ -434,12 +531,18 @@ internal sealed class SqliteSecureCompactor
             transaction,
             ring,
             CancellationToken.None).ConfigureAwait(false);
+        _ = await ReadProjectionStateAsync(
+            connection,
+            transaction,
+            lease,
+            CancellationToken.None).ConfigureAwait(false);
     }
 
     private async Task ValidateDatabaseAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
         VaultKeyRing ring,
+        VaultMaintenanceLease lease,
         CancellationToken cancellationToken)
     {
         await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(
@@ -466,6 +569,73 @@ internal sealed class SqliteSecureCompactor
             cancellationToken).ConfigureAwait(false);
         await RequireForeignKeysAsync(connection, transaction, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    private async Task<IReadOnlyDictionary<string, string>> ReadProjectionStateAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        VaultMaintenanceLease lease,
+        CancellationToken cancellationToken)
+    {
+        await using var headCommand = connection.CreateCommand();
+        headCommand.Transaction = transaction;
+        headCommand.CommandText =
+            "SELECT COALESCE(MAX(global_position),0) FROM main.timeline_events;";
+        if (await headCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)
+                is not long timelineHead
+            || timelineHead < 0)
+        {
+            throw new VaultRecoveryRequiredException();
+        }
+
+        var expected = timelineHead == 0
+            ? Array.Empty<SqliteProjectionRegistration>()
+            : _projections.Registrations.ToArray();
+        await SqliteProjectionCheckpointStore.RequireExactSelectedAsync(
+            connection,
+            transaction,
+            ProjectionCheckpointSchema.Main,
+            expected,
+            timelineHead,
+            requireOnlySelected: true,
+            cancellationToken).ConfigureAwait(false);
+
+        var checksums = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        foreach (var registration in _projections.Registrations)
+        {
+            var checksum = await SqliteProjectionAuthorizer.RunAsync(
+                connection,
+                registration.OwnedTables,
+                () => registration.Projection.CalculateChecksumAsync(
+                    SqliteProjectionContexts.CreateAdministrative(
+                        connection,
+                        transaction,
+                        _keyRing,
+                        lease,
+                        registration),
+                    cancellationToken)).ConfigureAwait(false);
+            if (checksum is not { Length: 64 }
+                || checksum.Any(character =>
+                    character is not (>= '0' and <= '9' or >= 'a' and <= 'f'))
+                || !checksums.TryAdd(registration.Name, checksum))
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+        }
+        return checksums;
+    }
+
+    private static void RequireProjectionStateEqual(
+        IReadOnlyDictionary<string, string> expected,
+        IReadOnlyDictionary<string, string> actual)
+    {
+        if (expected.Count != actual.Count
+            || expected.Any(pair =>
+                !actual.TryGetValue(pair.Key, out var checksum)
+                || !string.Equals(pair.Value, checksum, StringComparison.Ordinal)))
+        {
+            throw new VaultRecoveryRequiredException();
+        }
     }
 
     private static async Task<IReadOnlyList<CompactionEventImage>> ReadEventsAsync(
@@ -528,6 +698,19 @@ internal sealed class SqliteSecureCompactor
                 isDestroyed));
         }
         return result.AsReadOnly();
+    }
+
+    internal static async Task ValidateProtectedKeyStateAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        VaultKeyRing ring,
+        CancellationToken cancellationToken)
+    {
+        _ = await ReadEventsAsync(
+            connection,
+            transaction,
+            ring,
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static void RequireExactClone(
@@ -602,12 +785,14 @@ internal sealed class SqliteSecureCompactor
         var directory = Path.GetDirectoryName(databasePath)!;
         if (!Directory.Exists(directory)) return;
         var prefix = Path.GetFileName(databasePath) + ArtifactMarker;
-        foreach (var candidate in Directory.EnumerateFiles(
+        foreach (var candidate in Directory.EnumerateFileSystemEntries(
             directory,
             prefix + "*.tmp*",
             SearchOption.TopDirectoryOnly))
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (Directory.Exists(candidate))
+                throw new VaultRecoveryRequiredException();
             var name = Path.GetFileName(candidate);
             var coreName = name.EndsWith("-wal", StringComparison.Ordinal)
                 || name.EndsWith("-shm", StringComparison.Ordinal)
@@ -643,8 +828,11 @@ internal sealed class SqliteSecureCompactor
     private static async Task CheckpointAndWaitForSidecarsAsync(
         string path,
         VaultMaintenanceGate? maintenanceGate,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action? beforeSidecarWait = null,
+        int? maxAttempts = null)
     {
+        var checkpointAttempts = 0;
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -663,20 +851,35 @@ internal sealed class SqliteSecureCompactor
                 throw new VaultRecoveryRequiredException();
             }
             if (busy == 0) break;
+            checkpointAttempts++;
+            if (maxAttempts is int checkpointLimit
+                && checkpointAttempts >= checkpointLimit)
+            {
+                throw new VaultRecoveryRequiredException();
+            }
             await Task.Delay(TimeSpan.FromMilliseconds(25), cancellationToken)
                 .ConfigureAwait(false);
         }
         SqliteConnection.ClearAllPools();
-        await WaitForSidecarsAsync(path, cancellationToken).ConfigureAwait(false);
+        beforeSidecarWait?.Invoke();
+        await WaitForSidecarsAsync(
+            path,
+            cancellationToken,
+            maxAttempts).ConfigureAwait(false);
     }
 
     private static async Task WaitForSidecarsAsync(
         string path,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        int? maxAttempts = null)
     {
+        var attempts = 0;
         while (File.Exists(path + "-wal") || File.Exists(path + "-shm"))
         {
             cancellationToken.ThrowIfCancellationRequested();
+            attempts++;
+            if (maxAttempts is int limit && attempts >= limit)
+                throw new VaultRecoveryRequiredException();
             await Task.Delay(TimeSpan.FromMilliseconds(25), cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -713,36 +916,10 @@ internal sealed class SqliteSecureCompactor
 
     private static async Task<SqliteConnection> OpenRawAsync(
         string path,
-        CancellationToken cancellationToken)
-    {
-        WindowsVaultPathGuard.RequireSafeDatabaseSet(path);
-        var connection = new SqliteConnection(ConnectionString(path));
-        try
-        {
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            await ExecuteAsync(
-                connection,
-                transaction: null,
-                "PRAGMA main.foreign_keys=ON;",
-                cancellationToken).ConfigureAwait(false);
-            await ExecuteAsync(
-                connection,
-                transaction: null,
-                "PRAGMA main.secure_delete=ON;",
-                cancellationToken).ConfigureAwait(false);
-            await ExecuteAsync(
-                connection,
-                transaction: null,
-                "PRAGMA main.synchronous=FULL;",
-                cancellationToken).ConfigureAwait(false);
-            return connection;
-        }
-        catch
-        {
-            await connection.DisposeAsync().ConfigureAwait(false);
-            throw;
-        }
-    }
+        CancellationToken cancellationToken) =>
+        await SqliteEventStoreSchema.OpenHardenedPathAsync(
+            path,
+            cancellationToken).ConfigureAwait(false);
 
     private static async Task RequireForeignKeysAsync(
         SqliteConnection connection,
@@ -785,32 +962,73 @@ internal sealed class SqliteSecureCompactor
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task<bool> FileContainsAsync(
+    internal static async Task<bool> FileContainsAnyAsync(
         string path,
-        byte[] needle,
+        IReadOnlyList<byte[]> patterns,
         CancellationToken cancellationToken)
     {
-        if (needle.Length == 0) return false;
-        const int blockSize = 64 * 1024;
-        var buffer = new byte[blockSize + needle.Length - 1];
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        ArgumentNullException.ThrowIfNull(patterns);
+        var unique = new HashSet<byte[]>(ByteArrayComparer.Instance);
+        var totalPatternBytes = 0;
+        var maximumPatternLength = 0;
+        foreach (var pattern in patterns)
+        {
+            if (pattern.Length == 0 || !unique.Add(pattern)) continue;
+            if (pattern.Length > MaxErasurePatternLength)
+                throw new VaultRecoveryRequiredException();
+            totalPatternBytes = checked(totalPatternBytes + pattern.Length);
+            if (totalPatternBytes > MaxErasurePatternBytes)
+                throw new VaultRecoveryRequiredException();
+            maximumPatternLength = Math.Max(maximumPatternLength, pattern.Length);
+        }
+        if (unique.Count == 0) return false;
+
+        var buffer = new byte[checked(
+            ErasureScanBlockSize + maximumPatternLength - 1)];
         var retained = 0;
         await using var stream = new FileStream(
             path,
             FileMode.Open,
             FileAccess.Read,
             FileShare.Read,
-            blockSize,
+            ErasureScanBlockSize,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
         while (true)
         {
             var read = await stream.ReadAsync(
-                buffer.AsMemory(retained, blockSize),
+                buffer.AsMemory(retained, ErasureScanBlockSize),
                 cancellationToken).ConfigureAwait(false);
-            if (read == 0) return false;
             var available = retained + read;
-            if (buffer.AsSpan(0, available).IndexOf(needle) >= 0) return true;
-            retained = Math.Min(needle.Length - 1, available);
+            var window = buffer.AsSpan(0, available);
+            foreach (var pattern in unique)
+            {
+                if (window.IndexOf(pattern) >= 0) return true;
+            }
+            if (read == 0) return false;
+            retained = Math.Min(maximumPatternLength - 1, available);
             buffer.AsSpan(available - retained, retained).CopyTo(buffer);
+        }
+    }
+
+    private sealed class ByteArrayComparer : IEqualityComparer<byte[]>
+    {
+        internal static ByteArrayComparer Instance { get; } = new();
+
+        public bool Equals(byte[]? left, byte[]? right) =>
+            ReferenceEquals(left, right)
+            || left is not null
+                && right is not null
+                && left.AsSpan().SequenceEqual(right);
+
+        public int GetHashCode(byte[] value)
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            var hash = new HashCode();
+            hash.Add(value.Length);
+            foreach (var item in value.AsSpan())
+                hash.Add(item);
+            return hash.ToHashCode();
         }
     }
 

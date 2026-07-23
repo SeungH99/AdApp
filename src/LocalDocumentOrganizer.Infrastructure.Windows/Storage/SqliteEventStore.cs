@@ -161,61 +161,88 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
             payloadSession.BindExpectedIdentity(
                 await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
                     connection, schemaTransaction, cancellationToken));
-            await using var command = connection.CreateCommand();
-            command.Transaction = schemaTransaction;
-            command.CommandText = """
-                SELECT global_position, stream_id, stream_version, event_id, event_type, schema_version,
-                       recorded_at_utc, operation_id, operation_index, operation_count,
-                       protection_kind, owner_kind, owner_id, key_id, envelope_version, payload_nonce,
-                       payload_ciphertext, payload_tag
-                FROM main.timeline_events
-                WHERE CAST(stream_id AS TEXT) COLLATE NOCASE = $stream_id_text
-                ORDER BY global_position;
-                """;
-            AddStreamLookupParameters(command, streamId);
-            var persistedRows = new List<PersistedTimelineRow>();
-            var operationGroups = new OperationGroupSequenceValidator();
-            await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
-            {
-                while (await reader.ReadAsync(cancellationToken))
-                {
-                    var row = ReadPersistedTimelineRow(reader);
-                    if (row.Event.Metadata.StreamId != streamId) throw new VaultRecoveryRequiredException();
-                    operationGroups.Accept(row.Coordinates);
-                    persistedRows.Add(row);
-                }
-            }
-            operationGroups.Complete();
-
-            var storedHead = await ReadHeadAsync(connection, schemaTransaction, streamId, cancellationToken);
-            if (persistedRows.Count == 0)
-            {
-                if (storedHead is not null) throw new EventStreamCorruptionException("A stream head has no timeline events.");
-            }
-            else
-            {
-                for (var index = 0; index < persistedRows.Count; index++)
-                {
-                    if (persistedRows[index].Event.Metadata.StreamVersion != new StreamVersion(index))
-                        throw new EventStreamCorruptionException("A stream contains a noncontiguous version sequence.");
-                }
-
-                if (storedHead != persistedRows[^1].Event.Metadata.StreamVersion)
-                    throw new EventStreamCorruptionException("A stream head does not match its timeline events.");
-            }
-
-            var events = new List<EventForReplay>(persistedRows.Count);
-            foreach (var row in persistedRows)
-            {
-                var replay = await payloadSession.UnprotectAsync(row.Event, cancellationToken);
-                if (replay is ShreddedEvent) events.Add(replay);
-                else events.Add(_schemaRegistry.UpcastToCurrent((DecryptedEvent)replay));
-            }
+            var events = await ReadStreamFromValidatedConnectionAsync(
+                connection,
+                schemaTransaction,
+                streamId,
+                _schemaRegistry,
+                payloadSession,
+                cancellationToken).ConfigureAwait(false);
             await schemaTransaction.CommitAsync(cancellationToken);
             return events;
         }
         catch (VaultRecoveryRequiredException) { throw; }
         catch (SqliteException exception) { throw new VaultRecoveryRequiredException(exception); }
+    }
+
+    internal static async Task<IReadOnlyList<EventForReplay>> ReadStreamFromValidatedConnectionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        StreamId streamId,
+        EventSchemaRegistry schemaRegistry,
+        SqliteEventPayloadReadSession payloadSession,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT global_position, stream_id, stream_version, event_id, event_type, schema_version,
+                   recorded_at_utc, operation_id, operation_index, operation_count,
+                   protection_kind, owner_kind, owner_id, key_id, envelope_version, payload_nonce,
+                   payload_ciphertext, payload_tag
+            FROM main.timeline_events
+            WHERE CAST(stream_id AS TEXT) COLLATE NOCASE = $stream_id_text
+            ORDER BY global_position;
+            """;
+        AddStreamLookupParameters(command, streamId);
+        var persistedRows = new List<PersistedTimelineRow>();
+        var operationGroups = new OperationGroupSequenceValidator();
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var row = ReadPersistedTimelineRow(reader);
+                if (row.Event.Metadata.StreamId != streamId)
+                    throw new VaultRecoveryRequiredException();
+                operationGroups.Accept(row.Coordinates);
+                persistedRows.Add(row);
+            }
+        }
+        operationGroups.Complete();
+
+        var storedHead = await ReadHeadAsync(
+            connection,
+            transaction,
+            streamId,
+            cancellationToken);
+        if (persistedRows.Count == 0)
+        {
+            if (storedHead is not null)
+                throw new EventStreamCorruptionException("A stream head has no timeline events.");
+        }
+        else
+        {
+            for (var index = 0; index < persistedRows.Count; index++)
+            {
+                if (persistedRows[index].Event.Metadata.StreamVersion != new StreamVersion(index))
+                    throw new EventStreamCorruptionException(
+                        "A stream contains a noncontiguous version sequence.");
+            }
+            if (storedHead != persistedRows[^1].Event.Metadata.StreamVersion)
+                throw new EventStreamCorruptionException(
+                    "A stream head does not match its timeline events.");
+        }
+
+        var events = new List<EventForReplay>(persistedRows.Count);
+        foreach (var row in persistedRows)
+        {
+            var replay = await payloadSession.UnprotectAsync(row.Event, cancellationToken)
+                .ConfigureAwait(false);
+            events.Add(replay is ShreddedEvent
+                ? replay
+                : schemaRegistry.UpcastToCurrent((DecryptedEvent)replay));
+        }
+        return events.AsReadOnly();
     }
 
     public async Task<AppendEventsResult> AppendAsync(AppendEventsCommand command, CancellationToken cancellationToken)
