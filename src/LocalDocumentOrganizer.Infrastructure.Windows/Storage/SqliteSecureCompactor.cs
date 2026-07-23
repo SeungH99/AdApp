@@ -122,7 +122,16 @@ internal sealed class SqliteSecureCompactor
             var version = await ReadImmutableUserVersionAsync(
                 path,
                 cancellationToken).ConfigureAwait(false);
-            if (version is not (2 or 3 or 4 or 5 or 6)) return;
+            if (version is null) throw new VaultRecoveryRequiredException();
+            if (version is 0 or 1)
+            {
+                await ValidateBootstrapNoWalPreflightAsync(
+                    path,
+                    cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            if (version is not (2 or 3 or 4 or 5 or 6))
+                throw new VaultRecoveryRequiredException();
             VaultKeyRing noWalRing;
             try
             {
@@ -323,6 +332,20 @@ internal sealed class SqliteSecureCompactor
             ring,
             cancellationToken,
             allowPendingReceipts: true).ConfigureAwait(false);
+    }
+
+    private static async Task ValidateBootstrapNoWalPreflightAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenImmutableReadOnlyAsync(
+            path,
+            cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        await SqliteEventStoreSchema.ValidateBootstrapSchemaAsync(
+            connection,
+            transaction,
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<int?> ReadImmutableUserVersionAsync(

@@ -434,7 +434,7 @@ internal static class SqliteEventStoreSchema
             or VaultSchemaKind.V3
             or VaultSchemaKind.V4)
         {
-            await MigrateExistingVaultToVersionFiveAsync(
+            await MigrateExistingVaultToCurrentVersionAsync(
                 connectionString,
                 projections,
                 keyRing,
@@ -639,7 +639,7 @@ internal static class SqliteEventStoreSchema
         await RecoverMigrationArtifactsAsync(path, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task MigrateExistingVaultToVersionFiveAsync(
+    private static async Task MigrateExistingVaultToCurrentVersionAsync(
         string connectionString,
         SqliteProjectionRegistry projections,
         VaultKeyRingStore keyRing,
@@ -1610,6 +1610,59 @@ internal static class SqliteEventStoreSchema
             return;
         }
         throw new VaultRecoveryRequiredException();
+    }
+
+    internal static async Task ValidateBootstrapSchemaAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var version = Convert.ToInt32(await ExecuteScalarAsync(
+                connection,
+                transaction,
+                "PRAGMA main.user_version;",
+                cancellationToken));
+            if (version == 0)
+            {
+                if (await CountApplicationObjectsAsync(
+                        connection,
+                        transaction,
+                        cancellationToken) != 0)
+                {
+                    throw new VaultRecoveryRequiredException();
+                }
+
+                return;
+            }
+
+            if (version != 1) throw new VaultRecoveryRequiredException();
+            var kind = await ClassifyExactVersionOneAsync(
+                connection,
+                transaction,
+                cancellationToken);
+            if (kind == VaultSchemaKind.EmptyV1) return;
+            if (kind == VaultSchemaKind.LegacyNonEmpty)
+                throw new LegacyPlaintextVaultRecoveryRequiredException();
+            throw new VaultRecoveryRequiredException();
+        }
+        catch (LegacyPlaintextVaultRecoveryRequiredException)
+        {
+            throw;
+        }
+        catch (VaultRecoveryRequiredException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (exception is SqliteException
+            or InvalidCastException
+            or FormatException
+            or OverflowException
+            or InvalidOperationException)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
     }
 
     private static Task ValidateLegacyVersionFourAsync(
