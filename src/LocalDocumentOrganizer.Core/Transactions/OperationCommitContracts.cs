@@ -91,6 +91,31 @@ public sealed record CommitFileOperationCommand
     public FileOperationUsage? Usage { get; }
 }
 
+public abstract record CommitFileOperationResult
+{
+    private protected CommitFileOperationResult()
+    {
+    }
+}
+
+public sealed record OperationCommitted(StreamVersion NewVersion)
+    : CommitFileOperationResult;
+
+public sealed record AlreadyCommitted(StreamVersion ExistingVersion)
+    : CommitFileOperationResult;
+
+public sealed record OperationCommitConflict(OperationId OperationId)
+    : CommitFileOperationResult;
+
+public sealed record OperationCommitStorageBusy : CommitFileOperationResult;
+
+public interface IOperationCommitStore
+{
+    Task<CommitFileOperationResult> CommitAppliedAsync(
+        CommitFileOperationCommand command,
+        CancellationToken cancellationToken);
+}
+
 internal static class OperationCommitContractValidation
 {
     public static void ValidateCode(string code, string parameterName)

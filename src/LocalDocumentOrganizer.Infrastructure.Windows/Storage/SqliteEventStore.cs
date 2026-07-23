@@ -1,13 +1,47 @@
+using System.Buffers.Binary;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using LocalDocumentOrganizer.Core.Deletion;
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
+using LocalDocumentOrganizer.Core.Transactions;
 using LocalDocumentOrganizer.Infrastructure.Windows.Crypto;
 using Microsoft.Data.Sqlite;
 
 namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
-public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
+internal enum SqliteOperationCommitFaultPoint
+{
+    BeforeEventEncryption,
+    BeforeEventInsert,
+    BeforeProjection,
+    BeforeCheckpoint,
+    BeforeOutboxInsert,
+    BeforeUsageInsert,
+    BeforeJournalCas,
+}
+
+internal interface ISqliteOperationCommitFaultInjector
+{
+    void ThrowIfRequested(SqliteOperationCommitFaultPoint point);
+}
+
+internal sealed class NoOpSqliteOperationCommitFaultInjector :
+    ISqliteOperationCommitFaultInjector
+{
+    internal static NoOpSqliteOperationCommitFaultInjector Instance { get; } = new();
+
+    private NoOpSqliteOperationCommitFaultInjector()
+    {
+    }
+
+    public void ThrowIfRequested(SqliteOperationCommitFaultPoint point)
+    {
+    }
+}
+
+public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore, IOperationCommitStore
 {
     private readonly string _connectionString;
     private readonly EventSchemaRegistry _schemaRegistry;
@@ -17,6 +51,8 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
     private readonly TimeProvider _timeProvider;
     private readonly SqliteEventPayloadProtectionProvider _payloads;
     private readonly SqliteSensitiveDataDeletionStore _deletions;
+    private readonly SqliteOperationJournalStore _journal;
+    private readonly ISqliteOperationCommitFaultInjector _operationCommitFaults;
 
     public SqliteEventStore(
         string connectionString,
@@ -36,7 +72,8 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
             schemaRegistry,
             projections,
             timeProvider,
-            keyRing: null)
+            keyRing: null,
+            operationCommitFaultInjector: null)
     {
     }
 
@@ -51,7 +88,8 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
             schemaRegistry,
             projections,
             timeProvider,
-            RequireKeyRing(keyRing))
+            RequireKeyRing(keyRing),
+            operationCommitFaultInjector: null)
     {
     }
 
@@ -68,7 +106,27 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
             projections,
             timeProvider,
             RequireKeyRing(keyRing),
-            faultInjector)
+            faultInjector,
+            operationCommitFaultInjector: null)
+    {
+    }
+
+    internal SqliteEventStore(
+        string connectionString,
+        EventSchemaRegistry schemaRegistry,
+        SqliteProjectionRegistry projections,
+        VaultKeyRingStore keyRing,
+        TimeProvider? timeProvider,
+        ISqliteSensitiveDataDeletionFaultInjector? deletionFaultInjector,
+        ISqliteOperationCommitFaultInjector? operationCommitFaultInjector)
+        : this(
+            connectionString,
+            schemaRegistry,
+            projections,
+            timeProvider,
+            RequireKeyRing(keyRing),
+            deletionFaultInjector,
+            operationCommitFaultInjector)
     {
     }
 
@@ -78,7 +136,8 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
         SqliteProjectionRegistry projections,
         TimeProvider? timeProvider,
         VaultKeyRingStore? keyRing,
-        ISqliteSensitiveDataDeletionFaultInjector? faultInjector = null)
+        ISqliteSensitiveDataDeletionFaultInjector? faultInjector = null,
+        ISqliteOperationCommitFaultInjector? operationCommitFaultInjector = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         ArgumentNullException.ThrowIfNull(schemaRegistry);
@@ -98,6 +157,12 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
             _payloads.KeyRing,
             _timeProvider,
             faultInjector);
+        _journal = new SqliteOperationJournalStore(
+            _connectionString,
+            _payloads.KeyRing,
+            _timeProvider);
+        _operationCommitFaults = operationCommitFaultInjector
+            ?? NoOpSqliteOperationCommitFaultInjector.Instance;
     }
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
@@ -142,6 +207,406 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
         DeleteSensitiveObjectCommand command,
         CancellationToken cancellationToken) =>
         _deletions.DeleteAsync(command, cancellationToken);
+
+    public async Task<CommitFileOperationResult> CommitAppliedAsync(
+        CommitFileOperationCommand command,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        ValidateAppendBatchIdentifiers(command.AppendEvents.Events);
+        RejectReservedDeletionEvents(command.AppendEvents.Events);
+        if (command.AppendEvents.OperationId != command.OperationId)
+        {
+            throw new ArgumentException(
+                "The event append operation ID must match the commit operation ID.",
+                nameof(command));
+        }
+
+        SqliteEventStoreSchema.ValidateVaultPath(
+            _connectionString,
+            _payloads.KeyRing.MaintenanceGate);
+        await using var lease = await _payloads.KeyRing.MaintenanceGate
+            .AcquireMutationAsync(cancellationToken).ConfigureAwait(false);
+        VaultKeyRingStore.VaultKeyRingSession? keySession = null;
+        SqliteConnection? connection = null;
+        SqliteTransaction? transaction = null;
+        try
+        {
+            connection = await SqliteEventStoreSchema.OpenConnectionAsync(
+                _connectionString,
+                _payloads.KeyRing.MaintenanceGate,
+                cancellationToken).ConfigureAwait(false);
+            transaction = connection.BeginTransaction(deferred: false);
+            await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(
+                connection,
+                transaction,
+                cancellationToken).ConfigureAwait(false);
+            await SqliteEventStoreSchema.ValidateProjectionMembershipAsync(
+                connection,
+                transaction,
+                _projectionRegistry,
+                cancellationToken).ConfigureAwait(false);
+            var expectedKeyRingIdentity =
+                await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
+                    connection,
+                    transaction,
+                    cancellationToken).ConfigureAwait(false);
+            await SqliteSensitiveDataDeletionStore.RequireNoPendingReceiptsAsync(
+                _payloads.KeyRing,
+                expectedKeyRingIdentity,
+                cancellationToken).ConfigureAwait(false);
+            keySession = await _payloads.OpenWriteSessionAsync(
+                lease,
+                expectedKeyRingIdentity,
+                cancellationToken).ConfigureAwait(false);
+            await SqliteEventStoreSchema.ValidateKeyRingIdentityAsync(
+                connection,
+                transaction,
+                keySession.Identity,
+                cancellationToken).ConfigureAwait(false);
+
+            var candidate = await _journal.ReadCommitCandidateAsync(
+                connection,
+                transaction,
+                command.OperationId,
+                keySession,
+                cancellationToken).ConfigureAwait(false);
+            if (candidate is null
+                || !CommitIdentityMatches(candidate.Entry, command)
+                || command.ExpectedJournalRevision == long.MaxValue)
+            {
+                await transaction.RollbackAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                return new OperationCommitConflict(command.OperationId);
+            }
+
+            var commitFingerprint = CreateContributionFingerprint(command);
+            var expectedCommittedRevision =
+                checked(command.ExpectedJournalRevision + 1);
+            if (candidate.Entry.State
+                    == OperationJournalState.EventAndProjectionCommitted
+                && candidate.Entry.Revision == expectedCommittedRevision)
+            {
+                var retry = await AppendInTransactionAsync(
+                    connection,
+                    transaction,
+                    keySession,
+                    command.AppendEvents,
+                    operationCommitFaults: null,
+                    cancellationToken).ConfigureAwait(false);
+                var exactContributions = await ContributionsMatchAsync(
+                    connection,
+                    transaction,
+                    command,
+                    cancellationToken).ConfigureAwait(false);
+                var exactFingerprint = candidate.CommitFingerprint is { } persisted
+                    && CryptographicOperations.FixedTimeEquals(
+                        persisted,
+                        commitFingerprint);
+                await transaction.RollbackAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                return retry is AlreadyApplied already
+                    && exactContributions
+                    && exactFingerprint
+                    ? new AlreadyCommitted(already.ExistingVersion)
+                    : new OperationCommitConflict(command.OperationId);
+            }
+
+            if (candidate.Entry.State != OperationJournalState.FileApplied
+                || candidate.Entry.Revision != command.ExpectedJournalRevision)
+            {
+                await transaction.RollbackAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                return new OperationCommitConflict(command.OperationId);
+            }
+
+            var append = await AppendInTransactionAsync(
+                connection,
+                transaction,
+                keySession,
+                command.AppendEvents,
+                _operationCommitFaults,
+                cancellationToken).ConfigureAwait(false);
+            if (append is not Appended appended)
+            {
+                await transaction.RollbackAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                return new OperationCommitConflict(command.OperationId);
+            }
+
+            await InsertSideEffectsAsync(
+                connection,
+                transaction,
+                command,
+                _operationCommitFaults,
+                cancellationToken).ConfigureAwait(false);
+            await InsertUsageAsync(
+                connection,
+                transaction,
+                command,
+                _operationCommitFaults,
+                cancellationToken).ConfigureAwait(false);
+            _operationCommitFaults.ThrowIfRequested(
+                SqliteOperationCommitFaultPoint.BeforeJournalCas);
+            var committedEntry = await _journal.CommitAppliedInTransactionAsync(
+                connection,
+                transaction,
+                candidate,
+                command.ExpectedJournalRevision,
+                commitFingerprint,
+                keySession,
+                cancellationToken).ConfigureAwait(false);
+            if (committedEntry.OperationId != command.OperationId
+                || committedEntry.State
+                    != OperationJournalState.EventAndProjectionCommitted
+                || committedEntry.Revision != expectedCommittedRevision
+                || !await ContributionsMatchAsync(
+                    connection,
+                    transaction,
+                    command,
+                    cancellationToken).ConfigureAwait(false))
+            {
+                throw new OperationJournalRecoveryRequiredException();
+            }
+
+            await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(
+                connection,
+                transaction,
+                cancellationToken).ConfigureAwait(false);
+            await SqliteEventStoreSchema.ValidateProjectionMembershipAsync(
+                connection,
+                transaction,
+                _projectionRegistry,
+                cancellationToken).ConfigureAwait(false);
+            await keySession.RequireCanonicalImageAsync(cancellationToken)
+                .ConfigureAwait(false);
+            await SqliteEventStoreSchema.ValidateKeyRingIdentityAsync(
+                connection,
+                transaction,
+                keySession.Identity,
+                cancellationToken).ConfigureAwait(false);
+            SqliteEventStoreSchema.ValidateVaultPath(
+                _connectionString,
+                _payloads.KeyRing.MaintenanceGate);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new OperationCommitted(appended.NewVersion);
+        }
+        catch (SqliteException exception) when (exception.SqliteErrorCode is 5 or 6)
+        {
+            if (transaction is not null)
+            {
+                await RollbackWithoutMaskingAsync(transaction).ConfigureAwait(false);
+            }
+
+            return new OperationCommitStorageBusy();
+        }
+        catch
+        {
+            if (transaction is not null)
+            {
+                await RollbackWithoutMaskingAsync(transaction).ConfigureAwait(false);
+            }
+
+            throw;
+        }
+        finally
+        {
+            if (keySession is not null)
+            {
+                await keySession.DisposeAsync().ConfigureAwait(false);
+            }
+
+            if (transaction is not null)
+            {
+                await transaction.DisposeAsync().ConfigureAwait(false);
+            }
+
+            if (connection is not null)
+            {
+                await connection.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static bool CommitIdentityMatches(
+        OperationJournalEntry entry,
+        CommitFileOperationCommand command) =>
+        entry.OperationId == command.OperationId
+        && entry.Intent.StreamId == command.AppendEvents.StreamId
+        && entry.Intent.ExpectedStreamVersion == command.AppendEvents.ExpectedVersion;
+
+    private static byte[] CreateContributionFingerprint(
+        CommitFileOperationCommand command)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        AppendInt64(hash, command.SideEffects.Count);
+        foreach (var effect in command.SideEffects)
+        {
+            AppendUtf8(hash, effect.Code);
+            var data = effect.Data;
+            AppendInt64(hash, data.Length);
+            hash.AppendData(data.Span);
+        }
+
+        hash.AppendData([command.Usage is null ? (byte)0 : (byte)1]);
+        if (command.Usage is not null)
+        {
+            AppendUtf8(hash, command.Usage.Code);
+            AppendInt64(hash, command.Usage.Units);
+        }
+
+        return hash.GetHashAndReset();
+    }
+
+    private static void AppendUtf8(IncrementalHash hash, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        AppendInt64(hash, bytes.Length);
+        hash.AppendData(bytes);
+    }
+
+    private static void AppendInt64(IncrementalHash hash, long value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(long)];
+        BinaryPrimitives.WriteInt64BigEndian(bytes, value);
+        hash.AppendData(bytes);
+    }
+
+    private static async Task InsertSideEffectsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CommitFileOperationCommand command,
+        ISqliteOperationCommitFaultInjector faults,
+        CancellationToken cancellationToken)
+    {
+        faults.ThrowIfRequested(SqliteOperationCommitFaultPoint.BeforeOutboxInsert);
+        for (var index = 0; index < command.SideEffects.Count; index++)
+        {
+            await using var insert = connection.CreateCommand();
+            insert.Transaction = transaction;
+            insert.CommandText = """
+                INSERT INTO main.operation_side_effects(
+                    operation_id, effect_index, effect_code, state)
+                VALUES($operation_id, $effect_index, $effect_code, 0);
+                """;
+            insert.Parameters.Add("$operation_id", SqliteType.Text).Value =
+                command.OperationId.Value.ToString("D");
+            insert.Parameters.Add("$effect_index", SqliteType.Integer).Value = index;
+            insert.Parameters.Add("$effect_code", SqliteType.Text).Value =
+                command.SideEffects[index].Code;
+            if (await insert.ExecuteNonQueryAsync(cancellationToken)
+                    .ConfigureAwait(false) != 1)
+            {
+                throw new OperationJournalRecoveryRequiredException();
+            }
+        }
+    }
+
+    private static async Task InsertUsageAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CommitFileOperationCommand command,
+        ISqliteOperationCommitFaultInjector faults,
+        CancellationToken cancellationToken)
+    {
+        faults.ThrowIfRequested(SqliteOperationCommitFaultPoint.BeforeUsageInsert);
+        if (command.Usage is null)
+        {
+            return;
+        }
+
+        await using var insert = connection.CreateCommand();
+        insert.Transaction = transaction;
+        insert.CommandText = """
+            INSERT INTO main.operation_usage_ledger(
+                operation_id, usage_code, units)
+            VALUES($operation_id, $usage_code, $units);
+            """;
+        insert.Parameters.Add("$operation_id", SqliteType.Text).Value =
+            command.OperationId.Value.ToString("D");
+        insert.Parameters.Add("$usage_code", SqliteType.Text).Value =
+            command.Usage.Code;
+        insert.Parameters.Add("$units", SqliteType.Integer).Value =
+            command.Usage.Units;
+        if (await insert.ExecuteNonQueryAsync(cancellationToken)
+                .ConfigureAwait(false) != 1)
+        {
+            throw new OperationJournalRecoveryRequiredException();
+        }
+    }
+
+    private static async Task<bool> ContributionsMatchAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CommitFileOperationCommand command,
+        CancellationToken cancellationToken)
+    {
+        await using (var effects = connection.CreateCommand())
+        {
+            effects.Transaction = transaction;
+            effects.CommandText = """
+                SELECT effect_index, effect_code, state
+                FROM main.operation_side_effects
+                WHERE operation_id=$operation_id
+                ORDER BY effect_index;
+                """;
+            effects.Parameters.Add("$operation_id", SqliteType.Text).Value =
+                command.OperationId.Value.ToString("D");
+            await using var reader = await effects.ExecuteReaderAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var index = 0;
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (index >= command.SideEffects.Count
+                    || reader.GetValue(0) is not long persistedIndex
+                    || persistedIndex != index
+                    || reader.GetValue(1) is not string code
+                    || !string.Equals(
+                        code,
+                        command.SideEffects[index].Code,
+                        StringComparison.Ordinal)
+                    || reader.GetValue(2) is not long state
+                    || state != 0)
+                {
+                    return false;
+                }
+
+                index++;
+            }
+
+            if (index != command.SideEffects.Count)
+            {
+                return false;
+            }
+        }
+
+        await using var usage = connection.CreateCommand();
+        usage.Transaction = transaction;
+        usage.CommandText = """
+            SELECT usage_code, units
+            FROM main.operation_usage_ledger
+            WHERE operation_id=$operation_id;
+            """;
+        usage.Parameters.Add("$operation_id", SqliteType.Text).Value =
+            command.OperationId.Value.ToString("D");
+        await using var usageReader = await usage.ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (!await usageReader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            return command.Usage is null;
+        }
+
+        var matches = command.Usage is not null
+            && usageReader.GetValue(0) is string usageCode
+            && string.Equals(
+                usageCode,
+                command.Usage.Code,
+                StringComparison.Ordinal)
+            && usageReader.GetValue(1) is long units
+            && units == command.Usage.Units;
+        return matches
+            && !await usageReader.ReadAsync(cancellationToken).ConfigureAwait(false);
+    }
 
     public async Task<IReadOnlyList<EventForReplay>> ReadStreamAsync(StreamId streamId, CancellationToken cancellationToken)
     {
@@ -275,114 +740,27 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
                 lease, expectedKeyRingIdentity, cancellationToken);
             await SqliteEventStoreSchema.ValidateKeyRingIdentityAsync(
                 connection, transaction, keySession.Identity, cancellationToken);
-            var existing = await ReadOperationAsync(connection, transaction, command.OperationId, cancellationToken);
-            if (existing.Count != 0)
+            var result = await AppendInTransactionAsync(
+                connection,
+                transaction,
+                keySession,
+                command,
+                operationCommitFaults: null,
+                cancellationToken).ConfigureAwait(false);
+            if (result is not Appended)
             {
-                ValidateOperationGroup(existing, command.OperationId);
-                var comparison = await CompareRetryAsync(existing, command, keySession, cancellationToken);
-                if (comparison is RetryComparison.Exact or RetryComparison.Unavailable)
-                {
-                    await ValidateTargetStreamMetadataAsync(
-                        connection, transaction, command.StreamId, expectedHead: null,
-                        cancellationToken: cancellationToken);
-                }
-                await transaction.RollbackAsync(cancellationToken);
-                return comparison switch
-                {
-                    RetryComparison.Exact => new AlreadyApplied(existing[^1].Event.Metadata.StreamVersion),
-                    RetryComparison.Unavailable => new OperationComparisonUnavailable(command.OperationId),
-                    _ => new OperationConflict(command.OperationId),
-                };
+                await transaction.RollbackAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                return result;
             }
-            ValidateCurrentEventSchemas(command.Events);
-            var rebuildRequirement = await SqliteProjectionCheckpointStore.FindRebuildRequirementAsync(
-                connection, transaction, _projectionRegistrations, cancellationToken);
-            if (rebuildRequirement.ProjectionNames.Count != 0)
-                throw new ProjectionRebuildRequiredException(rebuildRequirement.ProjectionNames, rebuildRequirement.RequiredGlobalPosition);
 
-            await ValidateTargetStreamMetadataAsync(
-                connection, transaction, command.StreamId, expectedHead: null,
-                cancellationToken: cancellationToken);
-            var newVersion = new StreamVersion(checked(command.ExpectedVersion.Value + command.Events.Count));
-            var actualVersion = await ReserveStreamAsync(connection, transaction, command.StreamId, command.ExpectedVersion, newVersion, cancellationToken);
-            if (actualVersion is not null)
-            {
-                await transaction.RollbackAsync(cancellationToken);
-                return new ConcurrencyConflict(command.ExpectedVersion, actualVersion.Value);
-            }
-            var streamVersion = command.ExpectedVersion;
-            var appendedSnapshots = new List<AppendedEventSnapshot>(command.Events.Count);
-            for (var operationIndex = 0; operationIndex < command.Events.Count; operationIndex++)
-            {
-                var eventToAppend = command.Events[operationIndex];
-                streamVersion = streamVersion.Next();
-                var recordedAtUtc = _timeProvider.GetUtcNow();
-                var recordedAtText = recordedAtUtc.ToUniversalTime()
-                    .ToString("O", CultureInfo.InvariantCulture);
-                var protectedPayload = await _payloads.ProtectAsync(
-                    eventToAppend, command.StreamId, streamVersion, command.OperationId,
-                    keySession, cancellationToken);
-                var globalPosition = await InsertEventAsync(connection, transaction, command.StreamId, streamVersion,
-                    eventToAppend, command.OperationId, operationIndex, command.Events.Count,
-                    recordedAtText, protectedPayload, cancellationToken);
-                appendedSnapshots.Add(AppendedEventSnapshot.Create(
-                    globalPosition,
-                    command.StreamId,
-                    streamVersion,
-                    eventToAppend,
-                    command.OperationId,
-                    operationIndex,
-                    command.Events.Count,
-                    recordedAtText,
-                    protectedPayload));
-                var metadata = new EventMetadata(command.StreamId, streamVersion, eventToAppend.EventId, eventToAppend.EventType, eventToAppend.SchemaVersion, recordedAtUtc, command.OperationId, protectedPayload.KeyId, protectedPayload.EnvelopeVersion);
-                var decrypted = new DecryptedEvent(metadata, eventToAppend.Payload);
-                foreach (var registration in _projectionRegistrations)
-                {
-                    var projection = registration.Projection;
-                    await SqliteProjectionAuthorizer.RunAsync(
-                        connection,
-                        registration,
-                        _projectionRegistry.AllowsLegacyTestObjects,
-                        () => projection.ApplyAsync(
-                            decrypted,
-                            globalPosition,
-                            protectedPayload.Owner is { } owner
-                                && protectedPayload.KeyId is { } dataKeyId
-                                ? SqliteProjectionContexts.CreateApply(
-                                    connection,
-                                    transaction,
-                                    _payloads.KeyRing,
-                                    keySession,
-                                    registration,
-                                    owner,
-                                    dataKeyId)
-                                : SqliteProjectionContexts.CreateDisabledApply(
-                                    connection,
-                                    transaction),
-                            cancellationToken));
-                    await SqliteProjectionCheckpointStore.AdvanceAsync(
-                        connection, transaction, registration, globalPosition, cancellationToken);
-                }
-            }
-            await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(
-                connection, transaction, cancellationToken);
-            await SqliteEventStoreSchema.ValidateProjectionMembershipAsync(
-                connection, transaction, _projectionRegistry, cancellationToken);
-            var appended = await ReadOperationAsync(
-                connection, transaction, command.OperationId, cancellationToken);
-            ValidateOperationGroup(appended, command.OperationId);
-            await RequireExactAppendedOperationAsync(
-                appended, appendedSnapshots, command, keySession, cancellationToken);
-            await ValidateTargetStreamMetadataAsync(
-                connection, transaction, command.StreamId, newVersion, cancellationToken);
             await keySession.RequireCanonicalImageAsync(cancellationToken);
             await SqliteEventStoreSchema.ValidateKeyRingIdentityAsync(
                 connection, transaction, keySession.Identity, cancellationToken);
             SqliteEventStoreSchema.ValidateVaultPath(
                 _connectionString, _payloads.KeyRing.MaintenanceGate);
             await transaction.CommitAsync(cancellationToken);
-            return new Appended(newVersion);
+            return result;
         }
         catch (SqliteException exception) when (exception.SqliteErrorCode is 5 or 6)
         {
@@ -400,6 +778,206 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
             if (transaction is not null) await transaction.DisposeAsync();
             if (connection is not null) await connection.DisposeAsync();
         }
+    }
+
+    private async Task<AppendEventsResult> AppendInTransactionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        VaultKeyRingStore.VaultKeyRingSession keySession,
+        AppendEventsCommand command,
+        ISqliteOperationCommitFaultInjector? operationCommitFaults,
+        CancellationToken cancellationToken)
+    {
+        var existing = await ReadOperationAsync(
+            connection,
+            transaction,
+            command.OperationId,
+            cancellationToken).ConfigureAwait(false);
+        if (existing.Count != 0)
+        {
+            ValidateOperationGroup(existing, command.OperationId);
+            var comparison = await CompareRetryAsync(
+                existing,
+                command,
+                keySession,
+                cancellationToken).ConfigureAwait(false);
+            if (comparison is RetryComparison.Exact or RetryComparison.Unavailable)
+            {
+                await ValidateTargetStreamMetadataAsync(
+                    connection,
+                    transaction,
+                    command.StreamId,
+                    expectedHead: null,
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            return comparison switch
+            {
+                RetryComparison.Exact =>
+                    new AlreadyApplied(existing[^1].Event.Metadata.StreamVersion),
+                RetryComparison.Unavailable =>
+                    new OperationComparisonUnavailable(command.OperationId),
+                _ => new OperationConflict(command.OperationId),
+            };
+        }
+
+        ValidateCurrentEventSchemas(command.Events);
+        var rebuildRequirement =
+            await SqliteProjectionCheckpointStore.FindRebuildRequirementAsync(
+                connection,
+                transaction,
+                _projectionRegistrations,
+                cancellationToken).ConfigureAwait(false);
+        if (rebuildRequirement.ProjectionNames.Count != 0)
+        {
+            throw new ProjectionRebuildRequiredException(
+                rebuildRequirement.ProjectionNames,
+                rebuildRequirement.RequiredGlobalPosition);
+        }
+
+        await ValidateTargetStreamMetadataAsync(
+            connection,
+            transaction,
+            command.StreamId,
+            expectedHead: null,
+            cancellationToken).ConfigureAwait(false);
+        var newVersion = new StreamVersion(
+            checked(command.ExpectedVersion.Value + command.Events.Count));
+        var actualVersion = await ReserveStreamAsync(
+            connection,
+            transaction,
+            command.StreamId,
+            command.ExpectedVersion,
+            newVersion,
+            cancellationToken).ConfigureAwait(false);
+        if (actualVersion is not null)
+        {
+            return new ConcurrencyConflict(
+                command.ExpectedVersion,
+                actualVersion.Value);
+        }
+
+        var streamVersion = command.ExpectedVersion;
+        var appendedSnapshots =
+            new List<AppendedEventSnapshot>(command.Events.Count);
+        for (var operationIndex = 0;
+             operationIndex < command.Events.Count;
+             operationIndex++)
+        {
+            var eventToAppend = command.Events[operationIndex];
+            streamVersion = streamVersion.Next();
+            var recordedAtUtc = _timeProvider.GetUtcNow();
+            var recordedAtText = recordedAtUtc.ToUniversalTime()
+                .ToString("O", CultureInfo.InvariantCulture);
+            operationCommitFaults?.ThrowIfRequested(
+                SqliteOperationCommitFaultPoint.BeforeEventEncryption);
+            var protectedPayload = await _payloads.ProtectAsync(
+                eventToAppend,
+                command.StreamId,
+                streamVersion,
+                command.OperationId,
+                keySession,
+                cancellationToken).ConfigureAwait(false);
+            operationCommitFaults?.ThrowIfRequested(
+                SqliteOperationCommitFaultPoint.BeforeEventInsert);
+            var globalPosition = await InsertEventAsync(
+                connection,
+                transaction,
+                command.StreamId,
+                streamVersion,
+                eventToAppend,
+                command.OperationId,
+                operationIndex,
+                command.Events.Count,
+                recordedAtText,
+                protectedPayload,
+                cancellationToken).ConfigureAwait(false);
+            appendedSnapshots.Add(AppendedEventSnapshot.Create(
+                globalPosition,
+                command.StreamId,
+                streamVersion,
+                eventToAppend,
+                command.OperationId,
+                operationIndex,
+                command.Events.Count,
+                recordedAtText,
+                protectedPayload));
+            var metadata = new EventMetadata(
+                command.StreamId,
+                streamVersion,
+                eventToAppend.EventId,
+                eventToAppend.EventType,
+                eventToAppend.SchemaVersion,
+                recordedAtUtc,
+                command.OperationId,
+                protectedPayload.KeyId,
+                protectedPayload.EnvelopeVersion);
+            var decrypted = new DecryptedEvent(metadata, eventToAppend.Payload);
+            foreach (var registration in _projectionRegistrations)
+            {
+                operationCommitFaults?.ThrowIfRequested(
+                    SqliteOperationCommitFaultPoint.BeforeProjection);
+                var projection = registration.Projection;
+                await SqliteProjectionAuthorizer.RunAsync(
+                    connection,
+                    registration,
+                    _projectionRegistry.AllowsLegacyTestObjects,
+                    () => projection.ApplyAsync(
+                        decrypted,
+                        globalPosition,
+                        protectedPayload.Owner is { } owner
+                            && protectedPayload.KeyId is { } dataKeyId
+                            ? SqliteProjectionContexts.CreateApply(
+                                connection,
+                                transaction,
+                                _payloads.KeyRing,
+                                keySession,
+                                registration,
+                                owner,
+                                dataKeyId)
+                            : SqliteProjectionContexts.CreateDisabledApply(
+                                connection,
+                                transaction),
+                        cancellationToken)).ConfigureAwait(false);
+                operationCommitFaults?.ThrowIfRequested(
+                    SqliteOperationCommitFaultPoint.BeforeCheckpoint);
+                await SqliteProjectionCheckpointStore.AdvanceAsync(
+                    connection,
+                    transaction,
+                    registration,
+                    globalPosition,
+                    cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(
+            connection,
+            transaction,
+            cancellationToken).ConfigureAwait(false);
+        await SqliteEventStoreSchema.ValidateProjectionMembershipAsync(
+            connection,
+            transaction,
+            _projectionRegistry,
+            cancellationToken).ConfigureAwait(false);
+        var appended = await ReadOperationAsync(
+            connection,
+            transaction,
+            command.OperationId,
+            cancellationToken).ConfigureAwait(false);
+        ValidateOperationGroup(appended, command.OperationId);
+        await RequireExactAppendedOperationAsync(
+            appended,
+            appendedSnapshots,
+            command,
+            keySession,
+            cancellationToken).ConfigureAwait(false);
+        await ValidateTargetStreamMetadataAsync(
+            connection,
+            transaction,
+            command.StreamId,
+            newVersion,
+            cancellationToken).ConfigureAwait(false);
+        return new Appended(newVersion);
     }
 
     private async Task<RetryComparison> CompareRetryAsync(

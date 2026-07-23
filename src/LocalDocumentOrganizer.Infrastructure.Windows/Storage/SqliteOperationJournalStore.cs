@@ -669,14 +669,144 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         && left.ExpectedStreamVersion == right.ExpectedStreamVersion
         && left.ApprovedProposal.Span.SequenceEqual(right.ApprovedProposal.Span);
 
+    internal async Task<OperationJournalCommitCandidate?> ReadCommitCandidateAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        OperationId operationId,
+        VaultKeyRingStore.VaultKeyRingSession keySession,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(transaction);
+        ArgumentNullException.ThrowIfNull(keySession);
+        ValidateOperationId(operationId);
+        var row = await ReadPersistedRowAsync(
+            connection,
+            transaction,
+            operationId,
+            cancellationToken).ConfigureAwait(false);
+        if (row is null)
+        {
+            return null;
+        }
+
+        var payload = await DecryptPayloadAsync(
+            row,
+            keySession,
+            cancellationToken).ConfigureAwait(false);
+        return new OperationJournalCommitCandidate(
+            payload.Entry,
+            row.Envelope.KeyId,
+            payload.CommitFingerprint);
+    }
+
+    internal async Task<OperationJournalEntry> CommitAppliedInTransactionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        OperationJournalCommitCandidate candidate,
+        long expectedRevision,
+        ReadOnlyMemory<byte> commitFingerprint,
+        VaultKeyRingStore.VaultKeyRingSession keySession,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(transaction);
+        ArgumentNullException.ThrowIfNull(candidate);
+        ArgumentNullException.ThrowIfNull(keySession);
+        var current = candidate.Entry;
+        if (current.State != OperationJournalState.FileApplied
+            || current.Revision != expectedRevision)
+        {
+            throw new InvalidOperationException(
+                "The operation Journal is not at the commit boundary.");
+        }
+
+        OperationJournalStateMachine.EnsureCanTransition(
+            current.Kind,
+            current.State,
+            OperationJournalState.EventAndProjectionCommitted);
+        var nextRevision = checked(expectedRevision + 1);
+        var updatedAtUtc = NextTimestamp(current.UpdatedAtUtc);
+        var nextEnvelope = await keySession.ResolveDataKeyAsync(
+            current.Owner,
+            candidate.KeyId,
+            static () => throw new OperationJournalRecoveryRequiredException(),
+            (keyId, dataKey, _) =>
+            {
+                if (keyId != candidate.KeyId)
+                {
+                    throw new OperationJournalRecoveryRequiredException();
+                }
+
+                return ValueTask.FromResult(Protect(
+                    current.Intent,
+                    keyId,
+                    dataKey.Span,
+                    OperationJournalState.EventAndProjectionCommitted,
+                    nextRevision,
+                    commitFingerprint.Span));
+            },
+            cancellationToken).ConfigureAwait(false);
+
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE main.operation_journal
+            SET state=$next_state,
+                revision=$next_revision,
+                source_health=$source_health,
+                payload_nonce=$payload_nonce,
+                payload_ciphertext=$payload_ciphertext,
+                payload_tag=$payload_tag,
+                updated_at_utc=$updated_at_utc
+            WHERE operation_id=$operation_id
+              AND state=$expected_state
+              AND revision=$expected_revision;
+            """;
+        command.Parameters.Add("$next_state", SqliteType.Integer).Value =
+            (int)OperationJournalState.EventAndProjectionCommitted;
+        command.Parameters.Add("$next_revision", SqliteType.Integer).Value =
+            nextRevision;
+        command.Parameters.Add("$source_health", SqliteType.Integer).Value =
+            (int)current.SourceHealth;
+        command.Parameters.Add("$payload_nonce", SqliteType.Blob).Value =
+            nextEnvelope.Nonce.ToArray();
+        command.Parameters.Add("$payload_ciphertext", SqliteType.Blob).Value =
+            nextEnvelope.Ciphertext.ToArray();
+        command.Parameters.Add("$payload_tag", SqliteType.Blob).Value =
+            nextEnvelope.Tag.ToArray();
+        command.Parameters.Add("$updated_at_utc", SqliteType.Text).Value =
+            FormatTimestamp(updatedAtUtc);
+        command.Parameters.Add("$operation_id", SqliteType.Text).Value =
+            current.OperationId.Value.ToString("D");
+        command.Parameters.Add("$expected_state", SqliteType.Integer).Value =
+            (int)OperationJournalState.FileApplied;
+        command.Parameters.Add("$expected_revision", SqliteType.Integer).Value =
+            expectedRevision;
+        if (await command.ExecuteNonQueryAsync(cancellationToken)
+                .ConfigureAwait(false) != 1)
+        {
+            throw new OperationJournalRecoveryRequiredException();
+        }
+
+        return new OperationJournalEntry(
+            current.Intent,
+            OperationJournalState.EventAndProjectionCommitted,
+            nextRevision,
+            current.SourceHealth,
+            current.CreatedAtUtc,
+            updatedAtUtc);
+    }
+
     private EncryptedOperationJournalPayload Protect(
         FileOperationIntent intent,
         DataKeyId keyId,
         ReadOnlySpan<byte> dataKey,
         OperationJournalState state,
-        long revision)
+        long revision,
+        ReadOnlySpan<byte> commitFingerprint = default)
     {
-        var plaintext = SerializeIntent(intent);
+        var plaintext = SerializeIntent(intent, commitFingerprint);
         try
         {
             return _protector.Protect(
@@ -691,6 +821,15 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
     }
 
     private async ValueTask<OperationJournalEntry> DecryptAsync(
+        PersistedOperationJournalRow row,
+        VaultKeyRingStore.VaultKeyRingSession keySession,
+        CancellationToken cancellationToken) =>
+        (await DecryptPayloadAsync(
+            row,
+            keySession,
+            cancellationToken).ConfigureAwait(false)).Entry;
+
+    private async ValueTask<DecryptedOperationJournalPayload> DecryptPayloadAsync(
         PersistedOperationJournalRow row,
         VaultKeyRingStore.VaultKeyRingSession keySession,
         CancellationToken cancellationToken)
@@ -713,7 +852,8 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         dataKey.Span,
                         row.Envelope,
                         CreateContext(row, keyId));
-                    var intent = DeserializeIntent(plaintext);
+                    var payload = DeserializePayload(plaintext);
+                    var intent = payload.Intent;
                     if (intent.OperationId != row.OperationId
                         || intent.Owner != row.Owner
                         || intent.Kind != row.Kind)
@@ -721,13 +861,16 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         throw new OperationJournalRecoveryRequiredException();
                     }
 
-                    return ValueTask.FromResult(new OperationJournalEntry(
-                        intent,
-                        row.State,
-                        row.Revision,
-                        row.SourceHealth,
-                        row.CreatedAtUtc,
-                        row.UpdatedAtUtc));
+                    return ValueTask.FromResult(
+                        new DecryptedOperationJournalPayload(
+                            new OperationJournalEntry(
+                                intent,
+                                row.State,
+                                row.Revision,
+                                row.SourceHealth,
+                                row.CreatedAtUtc,
+                                row.UpdatedAtUtc),
+                            payload.CommitFingerprint));
                 }
                 finally
                 {
@@ -1022,8 +1165,18 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         };
     }
 
-    private static byte[] SerializeIntent(FileOperationIntent intent)
+    private static byte[] SerializeIntent(
+        FileOperationIntent intent,
+        ReadOnlySpan<byte> commitFingerprint = default)
     {
+        if (!commitFingerprint.IsEmpty
+            && commitFingerprint.Length != SHA256.HashSizeInBytes)
+        {
+            throw new ArgumentException(
+                "The commit fingerprint must be a SHA-256 digest.",
+                nameof(commitFingerprint));
+        }
+
         var buffer = new ArrayBufferWriter<byte>();
         using (var writer = new Utf8JsonWriter(buffer))
         {
@@ -1044,13 +1197,21 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
             writer.WriteBase64String(
                 "approvedProposal",
                 intent.ApprovedProposal.Span);
+            if (!commitFingerprint.IsEmpty)
+            {
+                writer.WriteBase64String(
+                    "commitFingerprint",
+                    commitFingerprint);
+            }
+
             writer.WriteEndObject();
         }
 
         return buffer.WrittenSpan.ToArray();
     }
 
-    private static FileOperationIntent DeserializeIntent(ReadOnlyMemory<byte> payload)
+    private static DeserializedOperationJournalPayload DeserializePayload(
+        ReadOnlyMemory<byte> payload)
     {
         try
         {
@@ -1063,7 +1224,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 throw new OperationJournalRecoveryRequiredException();
             }
 
-            return new FileOperationIntent(
+            var intent = new FileOperationIntent(
                 new OperationId(root.GetProperty("operationId").GetGuid()),
                 new SensitiveObjectRef(
                     (SensitiveObjectKind)root.GetProperty("ownerKind").GetInt32(),
@@ -1081,6 +1242,19 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 new StreamVersion(
                     root.GetProperty("expectedStreamVersion").GetInt64()),
                 root.GetProperty("approvedProposal").GetBytesFromBase64());
+            byte[]? commitFingerprint = null;
+            if (root.TryGetProperty("commitFingerprint", out var fingerprintElement))
+            {
+                commitFingerprint = fingerprintElement.GetBytesFromBase64();
+                if (commitFingerprint.Length != SHA256.HashSizeInBytes)
+                {
+                    throw new OperationJournalRecoveryRequiredException();
+                }
+            }
+
+            return new DeserializedOperationJournalPayload(
+                intent,
+                commitFingerprint);
         }
         catch (OperationJournalRecoveryRequiredException)
         {
@@ -1209,4 +1383,17 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         EncryptedOperationJournalPayload Envelope,
         DateTimeOffset CreatedAtUtc,
         DateTimeOffset UpdatedAtUtc);
+
+    internal sealed record OperationJournalCommitCandidate(
+        OperationJournalEntry Entry,
+        DataKeyId KeyId,
+        byte[]? CommitFingerprint);
+
+    private sealed record DecryptedOperationJournalPayload(
+        OperationJournalEntry Entry,
+        byte[]? CommitFingerprint);
+
+    private sealed record DeserializedOperationJournalPayload(
+        FileOperationIntent Intent,
+        byte[]? CommitFingerprint);
 }
