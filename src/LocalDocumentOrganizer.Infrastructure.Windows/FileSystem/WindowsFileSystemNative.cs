@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 namespace LocalDocumentOrganizer.Infrastructure.Windows.FileSystem;
@@ -7,6 +8,7 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.FileSystem;
 internal static class WindowsFileSystemNative
 {
     internal const uint GenericRead = 0x80000000;
+    internal const uint Delete = 0x00010000;
     internal const uint FileShareRead = 0x00000001;
     internal const uint FileShareWrite = 0x00000002;
     internal const uint FileShareDelete = 0x00000004;
@@ -32,14 +34,15 @@ internal static class WindowsFileSystemNative
     private const int ErrorFileNotFound = 2;
     private const int ErrorPathNotFound = 3;
     private const int ErrorAccessDenied = 5;
+    private const int ErrorInvalidParameter = 87;
     private const uint InvalidFileAttributes = uint.MaxValue;
 
-    internal static SafeFileHandle OpenSourceReadHandle(string canonicalPath)
+    internal static SafeFileHandle OpenVerifiedSourceHandle(string canonicalPath)
     {
         RequireWindows();
         var handle = CreateFile(
             ToExtendedPath(canonicalPath),
-            GenericRead,
+            GenericRead | Delete,
             FileShareRead,
             IntPtr.Zero,
             OpenExisting,
@@ -184,6 +187,121 @@ internal static class WindowsFileSystemNative
         return information;
     }
 
+    internal static StableSourceSnapshot GetStableSourceSnapshot(
+        SafeFileHandle handle)
+    {
+        RequireUsableHandle(handle);
+        var isLocal = IsLocalFileHandle(handle);
+        if (!isLocal)
+        {
+            return new StableSourceSnapshot(
+                IsLocal: false,
+                HasVolumeInformation: false,
+                string.Empty,
+                default,
+                Length: 0,
+                DateTimeOffset.UnixEpoch);
+        }
+
+        var fileSystemName = new StringBuilder(32);
+        if (!GetVolumeInformationByHandle(
+                handle,
+                volumeNameBuffer: null,
+                volumeNameSize: 0,
+                out _,
+                out _,
+                out _,
+                fileSystemName,
+                checked((uint)fileSystemName.Capacity)))
+        {
+            return new StableSourceSnapshot(
+                isLocal,
+                HasVolumeInformation: false,
+                string.Empty,
+                default,
+                Length: 0,
+                DateTimeOffset.UnixEpoch);
+        }
+
+        var fileId = GetFileIdInfo(handle);
+        var standard = GetStandardInfo(handle);
+        if (standard.EndOfFile < 0)
+        {
+            throw new FileSystemBoundaryException(
+                "The source handle reported an invalid file length.");
+        }
+
+        var basic = GetBasicInfo(handle);
+        DateTimeOffset lastWriteTimeUtc;
+        try
+        {
+            lastWriteTimeUtc = DateTimeOffset
+                .FromFileTime(basic.LastWriteTime)
+                .ToUniversalTime();
+        }
+        catch (ArgumentOutOfRangeException exception)
+        {
+            throw new FileSystemBoundaryException(
+                "The source handle reported an invalid last-write time.",
+                exception);
+        }
+
+        return new StableSourceSnapshot(
+            isLocal,
+            HasVolumeInformation: true,
+            fileSystemName.ToString(),
+            fileId,
+            standard.EndOfFile,
+            lastWriteTimeUtc);
+    }
+
+    private static bool IsLocalFileHandle(SafeFileHandle handle)
+    {
+        if (GetFileInformationByHandleEx(
+                handle,
+                FileInfoByHandleClass.FileRemoteProtocolInfo,
+                out FILE_REMOTE_PROTOCOL_INFO information,
+                checked((uint)Marshal.SizeOf<FILE_REMOTE_PROTOCOL_INFO>())))
+        {
+            return information.Protocol == 0;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        if (error == ErrorInvalidParameter)
+            return true;
+        throw new StableSourceBoundaryException(
+            StableSourceBoundaryFailure.UnsupportedVolume,
+            new Win32Exception(error));
+    }
+
+    private static FILE_STANDARD_INFO GetStandardInfo(SafeFileHandle handle)
+    {
+        if (!GetFileInformationByHandleEx(
+                handle,
+                FileInfoByHandleClass.FileStandardInfo,
+                out FILE_STANDARD_INFO information,
+                checked((uint)Marshal.SizeOf<FILE_STANDARD_INFO>())))
+        {
+            throw CreateNativeException(Marshal.GetLastPInvokeError());
+        }
+
+        return information;
+    }
+
+    private static FILE_BASIC_INFO GetBasicInfo(SafeFileHandle handle)
+    {
+        if (!GetFileInformationByHandleEx(
+                handle,
+                FileInfoByHandleClass.FileBasicInfo,
+                out FILE_BASIC_INFO information,
+                checked((uint)Marshal.SizeOf<FILE_BASIC_INFO>())))
+        {
+            throw CreateNativeException(Marshal.GetLastPInvokeError());
+        }
+
+        return information;
+    }
+
     internal static string ToExtendedPath(string canonicalPath)
     {
         if (canonicalPath.StartsWith(@"\\?\", StringComparison.Ordinal))
@@ -256,6 +374,55 @@ internal static class WindowsFileSystemNative
 
     [DllImport(
         "kernel32.dll",
+        EntryPoint = "GetFileInformationByHandleEx",
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(
+        SafeFileHandle file,
+        FileInfoByHandleClass fileInformationClass,
+        out FILE_STANDARD_INFO fileInformation,
+        uint bufferSize);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "GetFileInformationByHandleEx",
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(
+        SafeFileHandle file,
+        FileInfoByHandleClass fileInformationClass,
+        out FILE_BASIC_INFO fileInformation,
+        uint bufferSize);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "GetFileInformationByHandleEx",
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(
+        SafeFileHandle file,
+        FileInfoByHandleClass fileInformationClass,
+        out FILE_REMOTE_PROTOCOL_INFO fileInformation,
+        uint bufferSize);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "GetVolumeInformationByHandleW",
+        CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetVolumeInformationByHandle(
+        SafeFileHandle file,
+        StringBuilder? volumeNameBuffer,
+        uint volumeNameSize,
+        out uint volumeSerialNumber,
+        out uint maximumComponentLength,
+        out uint fileSystemFlags,
+        StringBuilder fileSystemNameBuffer,
+        uint fileSystemNameSize);
+
+    [DllImport(
+        "kernel32.dll",
         EntryPoint = "SetFileInformationByHandle",
         SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -321,6 +488,46 @@ internal static class WindowsFileSystemNative
         internal uint FileAttributes;
         internal uint ReparseTag;
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct FILE_STANDARD_INFO
+    {
+        internal long AllocationSize;
+        internal long EndOfFile;
+        internal uint NumberOfLinks;
+
+        [MarshalAs(UnmanagedType.U1)]
+        internal bool DeletePending;
+
+        [MarshalAs(UnmanagedType.U1)]
+        internal bool Directory;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct FILE_BASIC_INFO
+    {
+        internal long CreationTime;
+        internal long LastAccessTime;
+        internal long LastWriteTime;
+        internal long ChangeTime;
+        internal uint FileAttributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Size = 116)]
+    internal struct FILE_REMOTE_PROTOCOL_INFO
+    {
+        internal ushort StructureVersion;
+        internal ushort StructureSize;
+        internal uint Protocol;
+    }
+
+    internal readonly record struct StableSourceSnapshot(
+        bool IsLocal,
+        bool HasVolumeInformation,
+        string FileSystemName,
+        FILE_ID_INFO FileId,
+        long Length,
+        DateTimeOffset LastWriteTimeUtc);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct FILE_RENAME_INFO_EX

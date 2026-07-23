@@ -25,7 +25,7 @@ public sealed class ApprovedRootPathGuard
 
     public string ApprovedRoot { get; }
 
-    public SafeFileHandle OpenSourceReadHandle(string candidatePath)
+    public VerifiedStableSource OpenVerifiedSource(string candidatePath)
     {
         var canonical = RequireContainedCanonicalPath(candidatePath);
         var components = EnumerateComponents(
@@ -76,7 +76,9 @@ public sealed class ApprovedRootPathGuard
                 }
             }
 
-            return WindowsFileSystemNative.OpenSourceReadHandle(canonical);
+            var sourceHandle =
+                WindowsFileSystemNative.OpenVerifiedSourceHandle(canonical);
+            return VerifiedStableSource.Create(sourceHandle);
         }
         finally
         {
