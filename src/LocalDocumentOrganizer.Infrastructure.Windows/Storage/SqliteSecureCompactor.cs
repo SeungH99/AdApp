@@ -122,7 +122,7 @@ internal sealed class SqliteSecureCompactor
             var version = await ReadImmutableUserVersionAsync(
                 path,
                 cancellationToken).ConfigureAwait(false);
-            if (version is not (2 or 3 or 4 or 5)) return;
+            if (version is not (2 or 3 or 4 or 5 or 6)) return;
             VaultKeyRing noWalRing;
             try
             {
