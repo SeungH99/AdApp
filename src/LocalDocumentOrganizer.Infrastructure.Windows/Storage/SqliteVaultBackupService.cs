@@ -69,9 +69,6 @@ internal sealed class SqliteVaultBackupService
     internal async Task<ManagedVaultCopyId> CreateAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        await ValidateSourceBeforeFileOperationAsync(cancellationToken)
-            .ConfigureAwait(false);
-        RequireManagedDirectory();
         var copyId = ManagedVaultCopyId.Create();
         var finalPath = GetPath(copyId);
         var temporaryPath = finalPath + ".creating-" + Guid.NewGuid().ToString("N");
@@ -119,37 +116,6 @@ internal sealed class SqliteVaultBackupService
             primary.Throw();
             throw;
         }
-    }
-
-    private async Task ValidateSourceBeforeFileOperationAsync(
-        CancellationToken cancellationToken)
-    {
-        VaultKeyRing ring;
-        try
-        {
-            ring = await _keyRing.OpenAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (VaultKeyRingException exception)
-        {
-            throw new VaultRecoveryRequiredException(exception);
-        }
-        await using var lease = await _keyRing.MaintenanceGate
-            .AcquireReadAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await SqliteEventStoreSchema.OpenConnectionAsync(
-            _connectionString,
-            _keyRing.MaintenanceGate,
-            cancellationToken).ConfigureAwait(false);
-        await using var transaction = connection.BeginTransaction(deferred: true);
-        await ValidateAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
-        await SqliteEventStore.ValidateAllOperationMetadataAsync(
-            connection,
-            transaction,
-            cancellationToken).ConfigureAwait(false);
-        await SqliteSecureCompactor.ValidateProtectedKeyStateAsync(
-            connection,
-            transaction,
-            ring,
-            cancellationToken).ConfigureAwait(false);
     }
 
     internal SqliteManagedCopyReader Open(
@@ -259,6 +225,15 @@ internal sealed class SqliteVaultBackupService
     {
         await using var lease = await _keyRing.MaintenanceGate
             .AcquireReadAsync(cancellationToken).ConfigureAwait(false);
+        VaultKeyRing ring;
+        try
+        {
+            ring = await _keyRing.OpenAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (VaultKeyRingException exception)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
         await using var source = await SqliteEventStoreSchema.OpenConnectionAsync(
             _connectionString,
             _keyRing.MaintenanceGate,
@@ -273,9 +248,19 @@ internal sealed class SqliteVaultBackupService
             _keyRing,
             expectedIdentity,
             cancellationToken).ConfigureAwait(false);
+        await SqliteEventStore.ValidateAllOperationMetadataAsync(
+            source,
+            sourceTransaction,
+            cancellationToken).ConfigureAwait(false);
+        await SqliteSecureCompactor.ValidateProtectedKeyStateAsync(
+            source,
+            sourceTransaction,
+            ring,
+            cancellationToken).ConfigureAwait(false);
 
         _injectFault?.Invoke(SqliteVaultBackupFaultPoint.BeforeBackup);
 
+        RequireManagedDirectory();
         await using (var destination = await SqliteEventStoreSchema.OpenHardenedPathAsync(
             destinationPath,
             cancellationToken).ConfigureAwait(false))
@@ -306,6 +291,15 @@ internal sealed class SqliteVaultBackupService
             cancellationToken).ConfigureAwait(false);
         await RequireIntegrityAsync(verification, verificationTransaction, cancellationToken)
             .ConfigureAwait(false);
+        await SqliteEventStore.ValidateAllOperationMetadataAsync(
+            verification,
+            verificationTransaction,
+            cancellationToken).ConfigureAwait(false);
+        await SqliteSecureCompactor.ValidateProtectedKeyStateAsync(
+            verification,
+            verificationTransaction,
+            ring,
+            cancellationToken).ConfigureAwait(false);
         await SqliteEventStoreSchema.ValidateCurrentKeyRingIdentityAsync(
             _keyRing,
             expectedIdentity,

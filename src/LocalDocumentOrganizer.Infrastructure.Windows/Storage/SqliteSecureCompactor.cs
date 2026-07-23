@@ -18,6 +18,11 @@ internal enum SqliteSecureCompactionFaultPoint
     BeforePostSwapSidecarWait,
 }
 
+internal enum SqliteCanonicalWalRecoveryPhase
+{
+    BeforeShmRestoreOpen,
+}
+
 internal sealed class SqliteSecureCompactor
 {
     private const string TimelineUpdateTriggerSql = """
@@ -73,6 +78,11 @@ internal sealed class SqliteSecureCompactor
     {
         _keyRing.MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
         var ring = await _keyRing.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await ValidateManagedCopyCandidateBeforeCheckpointAsync(
+            path,
+            ring,
+            lease,
+            cancellationToken).ConfigureAwait(false);
         await CompactDatabaseAsync(
             path,
             maintenanceGate: null,
@@ -86,7 +96,8 @@ internal sealed class SqliteSecureCompactor
         SqliteProjectionRegistry projections,
         VaultKeyRingStore keyRing,
         VaultMaintenanceLease lease,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<SqliteCanonicalWalRecoveryPhase>? observeRecovery = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         ArgumentNullException.ThrowIfNull(projections);
@@ -153,7 +164,8 @@ internal sealed class SqliteSecureCompactor
                 shmPath,
                 hadShm,
                 shmImage,
-                CancellationToken.None).ConfigureAwait(false);
+                CancellationToken.None,
+                observeRecovery).ConfigureAwait(false);
             if (exception is VaultRecoveryRequiredException) throw;
             if (exception is SqliteException sqliteException)
                 throw new VaultRecoveryRequiredException(sqliteException);
@@ -390,7 +402,8 @@ internal sealed class SqliteSecureCompactor
         string path,
         bool existed,
         byte[]? image,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<SqliteCanonicalWalRecoveryPhase>? observeRecovery)
     {
         if (!existed)
         {
@@ -403,18 +416,69 @@ internal sealed class SqliteSecureCompactor
         }
         if (image is null) throw new VaultRecoveryRequiredException();
         WindowsVaultPathGuard.RequireSafeForOpen(path);
-        await using var output = new FileStream(
+        observeRecovery?.Invoke(SqliteCanonicalWalRecoveryPhase.BeforeShmRestoreOpen);
+        FileStream output;
+        try
+        {
+            output = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 64 * 1024,
+                FileOptions.Asynchronous | FileOptions.WriteThrough);
+        }
+        catch (FileNotFoundException)
+        {
+            WindowsVaultPathGuard.RequireSafeForOpen(path);
+            output = new FileStream(
+                path,
+                FileMode.CreateNew,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 64 * 1024,
+                FileOptions.Asynchronous | FileOptions.WriteThrough);
+        }
+        await using (output)
+        {
+            WindowsVaultPathGuard.RequireOpenedCanonicalSingleLinkFile(
+                path,
+                output.SafeFileHandle);
+            output.SetLength(0);
+            output.Position = 0;
+            await output.WriteAsync(image, cancellationToken).ConfigureAwait(false);
+            await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task ValidateManagedCopyCandidateBeforeCheckpointAsync(
+        string path,
+        VaultKeyRing ring,
+        VaultMaintenanceLease lease,
+        CancellationToken cancellationToken)
+    {
+        WindowsVaultPathGuard.RequireSafeDatabaseSet(path);
+        if (File.Exists(path + "-wal")
+            || File.Exists(path + "-shm")
+            || File.Exists(path + "-journal"))
+        {
+            throw new VaultRecoveryRequiredException();
+        }
+        await using var connection = await OpenImmutableReadOnlyAsync(
             path,
-            FileMode.Create,
-            FileAccess.Write,
-            FileShare.None,
-            bufferSize: 64 * 1024,
-            FileOptions.Asynchronous | FileOptions.WriteThrough);
-        WindowsVaultPathGuard.RequireOpenedCanonicalSingleLinkFile(
-            path,
-            output.SafeFileHandle);
-        await output.WriteAsync(image, cancellationToken).ConfigureAwait(false);
-        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+            cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        await ValidateDatabaseAsync(
+            connection,
+            transaction,
+            ring,
+            lease,
+            cancellationToken).ConfigureAwait(false);
+        _ = await ReadEventPreflightAsync(
+            connection,
+            transaction,
+            ring,
+            cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task CompactAsync(
@@ -887,7 +951,7 @@ internal sealed class SqliteSecureCompactor
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT protection_kind,owner_kind,owner_id,key_id,
+            SELECT protection_kind,owner_kind,owner_id,key_id,envelope_version,
                    length(payload_nonce),length(payload_ciphertext),length(payload_tag)
             FROM main.timeline_events ORDER BY global_position;
             """;
@@ -896,11 +960,18 @@ internal sealed class SqliteSecureCompactor
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             var protectionKind = reader.GetInt64(0);
+            var nonceLength = protectionKind == 1 ? ReadBlobLength(reader, 5) : 0;
+            var ciphertextLength = protectionKind == 1 ? ReadBlobLength(reader, 6) : 0;
+            var tagLength = protectionKind == 1 ? ReadBlobLength(reader, 7) : 0;
             var isDestroyed = ClassifyDestroyed(
                 protectionKind,
                 reader.IsDBNull(1) ? null : reader.GetInt64(1),
                 reader.IsDBNull(2) ? null : reader.GetString(2),
                 reader.IsDBNull(3) ? null : reader.GetString(3),
+                reader.GetInt64(4),
+                nonceLength,
+                ciphertextLength,
+                tagLength,
                 active,
                 destroyed,
                 allowPendingReceipts);
@@ -913,9 +984,9 @@ internal sealed class SqliteSecureCompactor
                 groups[key] = groups.TryGetValue(key, out var count)
                     ? checked(count + 1)
                     : 1;
-                requiresScrub |= ReadBlobLength(reader, 4) != 0
-                    || ReadBlobLength(reader, 5) != 0
-                    || ReadBlobLength(reader, 6) != 0;
+                requiresScrub |= nonceLength != 0
+                    || ciphertextLength != 0
+                    || tagLength != 0;
             }
         }
         return new EventPreflight(
@@ -955,12 +1026,19 @@ internal sealed class SqliteSecureCompactor
         long? ownerKind,
         string? ownerId,
         string? keyId,
+        long envelopeVersion,
+        long nonceLength,
+        long ciphertextLength,
+        long tagLength,
         IReadOnlyDictionary<SensitiveObjectRef, VaultActiveKeyMetadata> active,
         IReadOnlyDictionary<SensitiveObjectRef, VaultDestroyedKeyReceipt> destroyed,
         bool allowPendingReceipts = false)
     {
         if (protectionKind != 1) return false;
-        if (ownerKind is null || ownerId is null || keyId is null)
+        if (ownerKind is null
+            || ownerId is null
+            || keyId is null
+            || envelopeVersion != 1)
             throw new VaultRecoveryRequiredException();
         var owner = new SensitiveObjectRef(
             (SensitiveObjectKind)ownerKind.Value,
@@ -976,8 +1054,19 @@ internal sealed class SqliteSecureCompactor
         var isPending = hasReceipt && !isDestroyed;
         var recognizedStates = (isActive ? 1 : 0)
             + (isDestroyed ? 1 : 0)
-            + (allowPendingReceipts && isPending ? 1 : 0);
+            + (isPending ? 1 : 0);
         if (recognizedStates != 1) throw new VaultRecoveryRequiredException();
+        var encryptedShape = nonceLength == 12 && tagLength == 16;
+        var structuralShape =
+            nonceLength == 0 && ciphertextLength == 0 && tagLength == 0;
+        if (isDestroyed
+            ? !encryptedShape && !structuralShape
+            : !encryptedShape)
+        {
+            throw new VaultRecoveryRequiredException();
+        }
+        if (isPending && !allowPendingReceipts)
+            throw new VaultRecoveryRequiredException();
         return isDestroyed;
     }
 
@@ -1058,11 +1147,18 @@ internal sealed class SqliteSecureCompactor
         long? ownerKind = reader.IsDBNull(11) ? null : reader.GetInt64(11);
         var ownerId = reader.IsDBNull(12) ? null : reader.GetString(12);
         var keyId = reader.IsDBNull(13) ? null : reader.GetString(13);
+        var nonce = reader.IsDBNull(15) ? null : reader.GetFieldValue<byte[]>(15);
+        var ciphertext = reader.GetFieldValue<byte[]>(16);
+        var tag = reader.IsDBNull(17) ? null : reader.GetFieldValue<byte[]>(17);
         var isDestroyed = ClassifyDestroyed(
             protectionKind,
             ownerKind,
             ownerId,
             keyId,
+            reader.GetInt64(14),
+            nonce?.LongLength ?? -1,
+            ciphertext.LongLength,
+            tag?.LongLength ?? -1,
             active,
             destroyed);
         return new CompactionEventImage(
@@ -1081,9 +1177,9 @@ internal sealed class SqliteSecureCompactor
             ownerId,
             keyId,
             reader.GetInt64(14),
-            reader.IsDBNull(15) ? null : reader.GetFieldValue<byte[]>(15),
-            reader.GetFieldValue<byte[]>(16),
-            reader.IsDBNull(17) ? null : reader.GetFieldValue<byte[]>(17),
+            nonce,
+            ciphertext,
+            tag,
             isDestroyed);
     }
 
@@ -1099,7 +1195,8 @@ internal sealed class SqliteSecureCompactor
         await using var command = source.CreateCommand();
         command.Transaction = sourceTransaction;
         command.CommandText = """
-            SELECT owner_kind,owner_id,key_id,payload_nonce,payload_ciphertext,payload_tag
+            SELECT owner_kind,owner_id,key_id,envelope_version,
+                   payload_nonce,payload_ciphertext,payload_tag
             FROM main.timeline_events
             WHERE protection_kind=1
             ORDER BY global_position;
@@ -1108,17 +1205,24 @@ internal sealed class SqliteSecureCompactor
             .ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
+            var nonceLength = reader.GetBytes(4, 0, null, 0, 0);
+            var ciphertextLength = reader.GetBytes(5, 0, null, 0, 0);
+            var tagLength = reader.GetBytes(6, 0, null, 0, 0);
             if (!ClassifyDestroyed(
                     protectionKind: 1,
                     reader.GetInt64(0),
                     reader.GetString(1),
                     reader.GetString(2),
+                    reader.GetInt64(3),
+                    nonceLength,
+                    ciphertextLength,
+                    tagLength,
                     active,
                     destroyed))
             {
                 continue;
             }
-            for (var ordinal = 3; ordinal <= 5; ordinal++)
+            for (var ordinal = 4; ordinal <= 6; ordinal++)
             {
                 var pattern = reader.GetFieldValue<byte[]>(ordinal);
                 try
