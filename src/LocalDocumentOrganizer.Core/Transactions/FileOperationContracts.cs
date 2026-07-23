@@ -91,6 +91,11 @@ public sealed record FileOperationIntent
         ValidateNonBlank(sourceRoot, nameof(sourceRoot));
         ValidateNonBlank(destinationRoot, nameof(destinationRoot));
         ArgumentNullException.ThrowIfNull(streamId);
+        if (streamId.Value == Guid.Empty)
+        {
+            throw new ArgumentException("A stream ID cannot be empty.", nameof(streamId));
+        }
+
         if (expectedStreamVersion.Value < -1)
         {
             throw new ArgumentOutOfRangeException(nameof(expectedStreamVersion));
