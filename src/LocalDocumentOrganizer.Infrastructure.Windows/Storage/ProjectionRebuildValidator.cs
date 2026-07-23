@@ -125,7 +125,8 @@ internal sealed class ProjectionRebuildSourceSnapshot
         IEnumerable<string> projectionNames,
         IEnumerable<KeyValuePair<StreamId, StreamVersion>> streamHeads,
         IEnumerable<KeyValuePair<string, string>> compatibleProjectionChecksums,
-        VaultKeyRingIdentity keyRingIdentity)
+        VaultKeyRingIdentity keyRingIdentity,
+        IEnumerable<VaultDestroyedKeyReceipt> destroyedReceipts)
     {
         if (totalEventCount < 0 || requiredGlobalPosition < 0)
             throw new ArgumentOutOfRangeException(nameof(totalEventCount));
@@ -133,6 +134,7 @@ internal sealed class ProjectionRebuildSourceSnapshot
         ArgumentNullException.ThrowIfNull(streamHeads);
         ArgumentNullException.ThrowIfNull(compatibleProjectionChecksums);
         ArgumentNullException.ThrowIfNull(keyRingIdentity);
+        ArgumentNullException.ThrowIfNull(destroyedReceipts);
 
         TotalEventCount = totalEventCount;
         RequiredGlobalPosition = requiredGlobalPosition;
@@ -152,6 +154,8 @@ internal sealed class ProjectionRebuildSourceSnapshot
             .OrderBy(pair => pair.Key, StringComparer.Ordinal)
             .ToFrozenDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
         KeyRingIdentity = new VaultKeyRingIdentity(keyRingIdentity.Export());
+        DestroyedReceipts = destroyedReceipts
+            .ToFrozenDictionary(receipt => receipt.Owner);
     }
 
     internal long TotalEventCount { get; }
@@ -166,20 +170,25 @@ internal sealed class ProjectionRebuildSourceSnapshot
 
     internal VaultKeyRingIdentity KeyRingIdentity { get; }
 
+    internal FrozenDictionary<SensitiveObjectRef, VaultDestroyedKeyReceipt>
+        DestroyedReceipts { get; }
+
     internal static ProjectionRebuildSourceSnapshot Create(
         long totalEventCount,
         long requiredGlobalPosition,
         IEnumerable<string> projectionNames,
         IEnumerable<KeyValuePair<StreamId, StreamVersion>> streamHeads,
         IEnumerable<KeyValuePair<string, string>> compatibleProjectionChecksums,
-        VaultKeyRingIdentity keyRingIdentity) =>
+        VaultKeyRingIdentity keyRingIdentity,
+        IEnumerable<VaultDestroyedKeyReceipt> destroyedReceipts) =>
         new(
             totalEventCount,
             requiredGlobalPosition,
             projectionNames,
             streamHeads,
             compatibleProjectionChecksums,
-            keyRingIdentity);
+            keyRingIdentity,
+            destroyedReceipts);
 
     private static string CanonicalGuidHex(Guid value)
     {

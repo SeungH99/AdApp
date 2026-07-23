@@ -405,7 +405,7 @@ internal sealed class SqliteSensitiveDataDeletionStore
         }
     }
 
-    internal static async Task RequireNoPendingReceiptsAsync(
+    internal static async Task<VaultKeyRing> RequireNoPendingReceiptsAsync(
         VaultKeyRingStore keyRing,
         VaultKeyRingIdentity expectedIdentity,
         CancellationToken cancellationToken)
@@ -421,6 +421,8 @@ internal sealed class SqliteSensitiveDataDeletionStore
             {
                 throw new VaultRecoveryRequiredException();
             }
+
+            return ring;
         }
         catch (VaultRecoveryRequiredException) { throw; }
         catch (VaultKeyRingException exception)
@@ -522,7 +524,8 @@ internal sealed class SqliteSensitiveDataDeletionStore
                         receipt.KeyId,
                         payload,
                         allowSubsequentHistory: true,
-                        recoveryToken);
+                        cancellationToken: recoveryToken,
+                        allowCompactedImage: true);
                 }
 
                 await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(
@@ -1019,7 +1022,8 @@ internal sealed class SqliteSensitiveDataDeletionStore
         DataKeyId keyId,
         byte[] payload,
         bool allowSubsequentHistory,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool allowCompactedImage = false)
     {
         await SqliteEventStore.ValidateAllOperationMetadataAsync(
             connection,
@@ -1121,8 +1125,19 @@ internal sealed class SqliteSensitiveDataDeletionStore
         queue.Parameters.AddWithValue("$owner_kind", (int)command.Target.Kind);
         queue.Parameters.AddWithValue("$owner_id", command.Target.Id.Value.ToString("D"));
         await using var queueReader = await queue.ExecuteReaderAsync(cancellationToken);
-        if (!await queueReader.ReadAsync(cancellationToken)
-            || queueReader.GetValue(0) is not long ownerKind
+        if (!await queueReader.ReadAsync(cancellationToken))
+        {
+            if (!allowCompactedImage) throw new VaultRecoveryRequiredException();
+            await queueReader.DisposeAsync();
+            await RequirePhysicallyCompactedOwnerAsync(
+                connection,
+                transaction,
+                command.Target,
+                keyId,
+                cancellationToken);
+            return;
+        }
+        if (queueReader.GetValue(0) is not long ownerKind
             || ownerKind != (int)command.Target.Kind
             || queueReader.GetValue(1) is not string ownerId
             || ownerId != command.Target.Id.Value.ToString("D")
@@ -1137,6 +1152,40 @@ internal sealed class SqliteSensitiveDataDeletionStore
             || queueReader.GetValue(6) is not string queueEventId
             || queueEventId != command.TombstoneEventId.Value.ToString("D")
             || await queueReader.ReadAsync(cancellationToken))
+        {
+            throw new VaultRecoveryRequiredException();
+        }
+    }
+
+    private static async Task RequirePhysicallyCompactedOwnerAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        SensitiveObjectRef owner,
+        DataKeyId keyId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT COUNT(*),
+                   SUM(CASE WHEN length(payload_nonce)=0
+                                  AND length(payload_ciphertext)=0
+                                  AND length(payload_tag)=0
+                            THEN 1 ELSE 0 END)
+            FROM main.timeline_events
+            WHERE protection_kind=1 AND owner_kind=$owner_kind
+              AND owner_id=$owner_id AND key_id=$key_id;
+            """;
+        command.Parameters.AddWithValue("$owner_kind", (int)owner.Kind);
+        command.Parameters.AddWithValue("$owner_id", owner.Id.Value.ToString("D"));
+        command.Parameters.AddWithValue("$key_id", keyId.Value.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)
+            || reader.GetValue(0) is not long total
+            || total <= 0
+            || reader.GetValue(1) is not long compacted
+            || compacted != total
+            || await reader.ReadAsync(cancellationToken))
         {
             throw new VaultRecoveryRequiredException();
         }

@@ -16,6 +16,7 @@ internal static class SqliteProjectionAuthorizer
         "projection_checkpoints",
         "projection_rebuild_manifest",
         "secure_compaction_queue",
+        "managed_vault_copies",
         "sqlite_sequence",
         "event_streams_stream_id_nocase",
         "timeline_events_stream_position_nocase",
@@ -26,6 +27,7 @@ internal static class SqliteProjectionAuthorizer
         "timeline_events_immutable_update",
         "timeline_events_immutable_delete",
         "secure_compaction_queue_immutable_update",
+        "managed_vault_copies_immutable_update",
     };
 
     private static readonly strdelegate_authorizer Authorizer = Authorize;

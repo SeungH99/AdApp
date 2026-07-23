@@ -303,6 +303,13 @@ public sealed class VaultKeyRingStore
     {
         ValidateOwner(owner);
         ArgumentNullException.ThrowIfNull(callback);
+        await using var lease = await MaintenanceGate
+            .AcquireReadAsync(cancellationToken)
+            .ConfigureAwait(false);
+        await using var operation = await MaintenanceGate
+            .EnterOperationAsync(lease, cancellationToken)
+            .ConfigureAwait(false);
+        CleanupOrphans(requireCanonical: true);
         var image = await ReadCanonicalAsync(cancellationToken).ConfigureAwait(false);
         using var state = Deserialize(image);
         ThrowIfDestroyed(state, owner);

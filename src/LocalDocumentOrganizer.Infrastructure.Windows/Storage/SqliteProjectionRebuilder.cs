@@ -210,7 +210,7 @@ internal sealed class SqliteProjectionRebuilder
             connection,
             transaction,
             cancellationToken).ConfigureAwait(false);
-        await SqliteSensitiveDataDeletionStore.RequireNoPendingReceiptsAsync(
+        var keyRing = await SqliteSensitiveDataDeletionStore.RequireNoPendingReceiptsAsync(
             _payloads.KeyRing,
             identity,
             cancellationToken).ConfigureAwait(false);
@@ -251,7 +251,8 @@ internal sealed class SqliteProjectionRebuilder
             requirement.ProjectionNames,
             streamHeads,
             compatibleChecksums,
-            identity);
+            identity,
+            keyRing.DestroyedReceipts);
     }
 
     private async Task<IReadOnlyList<SqliteProjectionRegistration>> InitializeSelectedAsync(
@@ -390,14 +391,18 @@ internal sealed class SqliteProjectionRebuilder
                         SensitiveObjectDeletedEventContract.EventType,
                         StringComparison.Ordinal))
                 {
-                    var owner = ReadTombstoneOwner(tombstone.Payload.Span);
+                    var tombstonePayload = ReadTombstonePayload(tombstone.Payload.Span);
+                    RequireAuthenticatedDeletionReceipt(
+                        source.DestroyedReceipts,
+                        tombstonePayload,
+                        rawEvent);
                     foreach (var registration in selected)
                     {
                         await RunProjectionAsync(
                             temporaryConnection,
                             registration,
                             () => registration.Projection.PurgeOwnerAsync(
-                                owner,
+                                tombstonePayload.Owner,
                                 SqliteProjectionContexts.CreateAdministrative(
                                     temporaryConnection,
                                     temporaryTransaction,
@@ -616,7 +621,7 @@ internal sealed class SqliteProjectionRebuilder
         return batch;
     }
 
-    private static SensitiveObjectRef ReadTombstoneOwner(ReadOnlySpan<byte> payload)
+    private static DeletionTombstonePayload ReadTombstonePayload(ReadOnlySpan<byte> payload)
     {
         try
         {
@@ -642,13 +647,40 @@ internal sealed class SqliteProjectionRebuilder
             };
             var owner = new SensitiveObjectRef(kind, new SensitiveObjectId(id));
             _ = SensitiveObjectDeletedEventContract.CreatePayload(owner, reason);
-            return owner;
+            return new DeletionTombstonePayload(owner, reason);
         }
         catch (VaultRecoveryRequiredException) { throw; }
         catch (Exception exception) when (exception is ArgumentException or FormatException
             or InvalidOperationException or JsonException)
         {
             throw new VaultRecoveryRequiredException(exception);
+        }
+    }
+
+    private static void RequireAuthenticatedDeletionReceipt(
+        IReadOnlyDictionary<SensitiveObjectRef, VaultDestroyedKeyReceipt> receipts,
+        DeletionTombstonePayload payload,
+        RawTimelineEvent rawEvent)
+    {
+        if (rawEvent.Persisted.Kind != PersistedProtectionKind.Structural
+            || rawEvent.Persisted.Metadata.SchemaVersion
+                != SensitiveObjectDeletedEventContract.SchemaVersion
+            || rawEvent.Coordinates.OperationIndex != 0
+            || rawEvent.Coordinates.OperationCount != 1
+            || !receipts.TryGetValue(payload.Owner, out var receipt)
+            || receipt.State != VaultDestroyedReceiptState.Completed
+            || receipt.Owner != payload.Owner
+            || receipt.StreamId != rawEvent.Persisted.Metadata.StreamId
+            || receipt.OperationId != rawEvent.Coordinates.OperationId
+            || receipt.TombstoneEventId != rawEvent.Persisted.Metadata.EventId
+            || receipt.ExpectedStreamVersion.Value
+                != rawEvent.Persisted.Metadata.StreamVersion.Value - 1
+            || !string.Equals(
+                receipt.ReasonCode,
+                payload.ReasonCode,
+                StringComparison.Ordinal))
+        {
+            throw new VaultRecoveryRequiredException();
         }
     }
 
@@ -670,6 +702,10 @@ internal sealed class SqliteProjectionRebuilder
     {
         internal long GlobalPosition => Coordinates.GlobalPosition;
     }
+
+    private sealed record DeletionTombstonePayload(
+        SensitiveObjectRef Owner,
+        string ReasonCode);
 }
 
 public sealed class ShreddedProjectionReplayNotSupportedException : InvalidOperationException
