@@ -108,6 +108,12 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
         await using var lease = await _payloads.KeyRing.MaintenanceGate
             .AcquireMutationAsync(cancellationToken)
             .ConfigureAwait(false);
+        await SqliteSecureCompactor.RecoverCanonicalWalAsync(
+            _connectionString,
+            _projectionRegistry,
+            _payloads.KeyRing,
+            lease,
+            cancellationToken).ConfigureAwait(false);
         await ProjectionRebuildWorkspace.CleanupOrphansAsync(
             _connectionString,
             _projectionRegistry,
@@ -121,6 +127,10 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
             lease,
             cancellationToken).ConfigureAwait(false);
         await _deletions.RecoverAsync(lease, cancellationToken).ConfigureAwait(false);
+        await new SqliteSecureCompactor(
+            _connectionString,
+            _projectionRegistry,
+            _payloads.KeyRing).RecoverAsync(lease, cancellationToken).ConfigureAwait(false);
     }
 
     public Task<ProjectionRebuildResult> RebuildProjectionsAsync(CancellationToken cancellationToken = default) =>
@@ -891,7 +901,12 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
                 nonce = ReadRequiredBlob(reader, 15);
                 ciphertext = ReadRequiredBlob(reader, 16);
                 tag = ReadRequiredBlob(reader, 17);
-                if (nonce.Length != AesGcmRecordProtector.NonceSize || tag.Length != AesGcmRecordProtector.TagSize)
+                var isEncryptedEnvelope = nonce.Length == AesGcmRecordProtector.NonceSize
+                    && tag.Length == AesGcmRecordProtector.TagSize;
+                var isStructurallyShredded = nonce.Length == 0
+                    && ciphertext.Length == 0
+                    && tag.Length == 0;
+                if (!isEncryptedEnvelope && !isStructurallyShredded)
                     throw new VaultRecoveryRequiredException();
             }
             var metadata = new EventMetadata(stream, streamVersion, eventId, eventType, schemaVersion,

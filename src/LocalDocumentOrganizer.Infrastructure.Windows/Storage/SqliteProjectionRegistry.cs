@@ -32,6 +32,7 @@ internal readonly record struct ProjectionOwnedTable
         "vault_metadata",
         "projection_checkpoints",
         "secure_compaction_queue",
+        "managed_vault_copies",
         "projection_rebuild_manifest",
         "sqlite_sequence",
         "sqlite_schema",
