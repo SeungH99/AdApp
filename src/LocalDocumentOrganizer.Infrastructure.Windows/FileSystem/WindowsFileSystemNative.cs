@@ -34,6 +34,8 @@ internal static class WindowsFileSystemNative
     private const int ErrorFileNotFound = 2;
     private const int ErrorPathNotFound = 3;
     private const int ErrorAccessDenied = 5;
+    private const int ErrorInvalidFunction = 1;
+    private const int ErrorNotSupported = 50;
     private const int ErrorInvalidParameter = 87;
     private const uint InvalidFileAttributes = uint.MaxValue;
 
@@ -203,16 +205,8 @@ internal static class WindowsFileSystemNative
                 DateTimeOffset.UnixEpoch);
         }
 
-        var fileSystemName = new StringBuilder(32);
-        if (!GetVolumeInformationByHandle(
-                handle,
-                volumeNameBuffer: null,
-                volumeNameSize: 0,
-                out _,
-                out _,
-                out _,
-                fileSystemName,
-                checked((uint)fileSystemName.Capacity)))
+        var fileSystemName = GetVolumeFileSystemName(handle);
+        if (fileSystemName is null)
         {
             return new StableSourceSnapshot(
                 isLocal,
@@ -249,7 +243,7 @@ internal static class WindowsFileSystemNative
         return new StableSourceSnapshot(
             isLocal,
             HasVolumeInformation: true,
-            fileSystemName.ToString(),
+            fileSystemName,
             fileId,
             standard.EndOfFile,
             lastWriteTimeUtc);
@@ -269,10 +263,56 @@ internal static class WindowsFileSystemNative
         var error = Marshal.GetLastPInvokeError();
         if (error == ErrorInvalidParameter)
             return true;
-        throw new StableSourceBoundaryException(
-            StableSourceBoundaryFailure.UnsupportedVolume,
-            new Win32Exception(error));
+        if (IsApprovedUnsupportedError(
+                StableSourceNativeBoundary.RemoteProtocolInformation,
+                error))
+        {
+            throw new StableSourceBoundaryException(
+                StableSourceBoundaryFailure.UnsupportedVolume,
+                new Win32Exception(error));
+        }
+
+        throw CreateNativeException(error);
     }
+
+    private static string? GetVolumeFileSystemName(SafeFileHandle handle)
+    {
+        var fileSystemName = new StringBuilder(32);
+        if (GetVolumeInformationByHandle(
+                handle,
+                volumeNameBuffer: null,
+                volumeNameSize: 0,
+                out _,
+                out _,
+                out _,
+                fileSystemName,
+                checked((uint)fileSystemName.Capacity)))
+        {
+            return fileSystemName.ToString();
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        if (IsApprovedUnsupportedError(
+                StableSourceNativeBoundary.VolumeInformation,
+                error))
+        {
+            return null;
+        }
+
+        throw CreateNativeException(error);
+    }
+
+    internal static bool IsApprovedUnsupportedError(
+        StableSourceNativeBoundary boundary,
+        int error) =>
+        boundary switch
+        {
+            StableSourceNativeBoundary.RemoteProtocolInformation =>
+                error == ErrorNotSupported,
+            StableSourceNativeBoundary.VolumeInformation =>
+                error is ErrorInvalidFunction or ErrorNotSupported,
+            _ => false,
+        };
 
     private static FILE_STANDARD_INFO GetStandardInfo(SafeFileHandle handle)
     {
@@ -436,6 +476,12 @@ internal static class WindowsFileSystemNative
     {
         Opened,
         Missing,
+    }
+
+    internal enum StableSourceNativeBoundary
+    {
+        RemoteProtocolInformation,
+        VolumeInformation,
     }
 
     internal enum FileInfoByHandleClass
