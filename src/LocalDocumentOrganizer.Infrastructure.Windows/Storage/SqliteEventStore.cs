@@ -1,4 +1,5 @@
 using System.Globalization;
+using LocalDocumentOrganizer.Core.Deletion;
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
 using LocalDocumentOrganizer.Infrastructure.Windows.Crypto;
@@ -6,7 +7,7 @@ using Microsoft.Data.Sqlite;
 
 namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
-public sealed class SqliteEventStore : IEventStore
+public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
 {
     private readonly string _connectionString;
     private readonly EventSchemaRegistry _schemaRegistry;
@@ -15,6 +16,7 @@ public sealed class SqliteEventStore : IEventStore
     private readonly SqliteProjectionRegistry _projectionRegistry;
     private readonly TimeProvider _timeProvider;
     private readonly SqliteEventPayloadProtectionProvider _payloads;
+    private readonly SqliteSensitiveDataDeletionStore _deletions;
 
     public SqliteEventStore(
         string connectionString,
@@ -53,12 +55,30 @@ public sealed class SqliteEventStore : IEventStore
     {
     }
 
+    internal SqliteEventStore(
+        string connectionString,
+        EventSchemaRegistry schemaRegistry,
+        SqliteProjectionRegistry projections,
+        VaultKeyRingStore keyRing,
+        TimeProvider? timeProvider,
+        ISqliteSensitiveDataDeletionFaultInjector faultInjector)
+        : this(
+            connectionString,
+            schemaRegistry,
+            projections,
+            timeProvider,
+            RequireKeyRing(keyRing),
+            faultInjector)
+    {
+    }
+
     private SqliteEventStore(
         string connectionString,
         EventSchemaRegistry schemaRegistry,
         SqliteProjectionRegistry projections,
         TimeProvider? timeProvider,
-        VaultKeyRingStore? keyRing)
+        VaultKeyRingStore? keyRing,
+        ISqliteSensitiveDataDeletionFaultInjector? faultInjector = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         ArgumentNullException.ThrowIfNull(schemaRegistry);
@@ -71,23 +91,54 @@ public sealed class SqliteEventStore : IEventStore
         _timeProvider = timeProvider ?? TimeProvider.System;
         _payloads = new SqliteEventPayloadProtectionProvider(
             keyRing ?? CreateDefaultKeyRing(_connectionString));
+        _deletions = new SqliteSensitiveDataDeletionStore(
+            _connectionString,
+            _schemaRegistry,
+            _projectionRegistry,
+            _payloads.KeyRing,
+            _timeProvider,
+            faultInjector);
     }
 
-    public Task InitializeAsync(CancellationToken cancellationToken = default) =>
-        SqliteEventStoreSchema.InitializeAsync(
-            _connectionString, _projectionRegistry, _payloads.KeyRing, cancellationToken);
+    public async Task InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        SqliteEventStoreSchema.ValidateVaultPath(
+            _connectionString,
+            _payloads.KeyRing.MaintenanceGate);
+        await using var lease = await _payloads.KeyRing.MaintenanceGate
+            .AcquireMutationAsync(cancellationToken)
+            .ConfigureAwait(false);
+        await ProjectionRebuildWorkspace.CleanupOrphansAsync(
+            _connectionString,
+            _projectionRegistry,
+            _payloads.KeyRing,
+            lease,
+            cancellationToken).ConfigureAwait(false);
+        await SqliteEventStoreSchema.InitializeAsync(
+            _connectionString,
+            _projectionRegistry,
+            _payloads.KeyRing,
+            lease,
+            cancellationToken).ConfigureAwait(false);
+        await _deletions.RecoverAsync(lease, cancellationToken).ConfigureAwait(false);
+    }
 
     public Task<ProjectionRebuildResult> RebuildProjectionsAsync(CancellationToken cancellationToken = default) =>
         new SqliteProjectionRebuilder(
             _connectionString, _schemaRegistry, _projectionRegistry, _payloads)
             .RebuildAsync(cancellationToken);
 
+    public Task<DeleteSensitiveObjectResult> DeleteAsync(
+        DeleteSensitiveObjectCommand command,
+        CancellationToken cancellationToken) =>
+        _deletions.DeleteAsync(command, cancellationToken);
+
     public async Task<IReadOnlyList<EventForReplay>> ReadStreamAsync(StreamId streamId, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(streamId);
         SqliteEventStoreSchema.ValidateVaultPath(
             _connectionString, _payloads.KeyRing.MaintenanceGate);
-        await using var lease = await _payloads.KeyRing.MaintenanceGate.AcquireAsync(cancellationToken);
+        await using var lease = await _payloads.KeyRing.MaintenanceGate.AcquireReadAsync(cancellationToken);
         await using var payloadSession = _payloads.CreateReadSession(lease);
         await using var connection = await SqliteEventStoreSchema.OpenConnectionAsync(
             _connectionString, _payloads.KeyRing.MaintenanceGate, cancellationToken);
@@ -163,7 +214,7 @@ public sealed class SqliteEventStore : IEventStore
         ValidateAppendBatchIdentifiers(command.Events);
         SqliteEventStoreSchema.ValidateVaultPath(
             _connectionString, _payloads.KeyRing.MaintenanceGate);
-        await using var lease = await _payloads.KeyRing.MaintenanceGate.AcquireAsync(cancellationToken);
+        await using var lease = await _payloads.KeyRing.MaintenanceGate.AcquireMutationAsync(cancellationToken);
         VaultKeyRingStore.VaultKeyRingSession? keySession = null;
         SqliteConnection? connection = null;
         SqliteTransaction? transaction = null;
@@ -178,6 +229,10 @@ public sealed class SqliteEventStore : IEventStore
             var expectedKeyRingIdentity =
                 await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
                     connection, transaction, cancellationToken);
+            await SqliteSensitiveDataDeletionStore.RequireNoPendingReceiptsAsync(
+                _payloads.KeyRing,
+                expectedKeyRingIdentity,
+                cancellationToken);
             keySession = await _payloads.OpenWriteSessionAsync(
                 lease, expectedKeyRingIdentity, cancellationToken);
             await SqliteEventStoreSchema.ValidateKeyRingIdentityAsync(
@@ -249,6 +304,8 @@ public sealed class SqliteEventStore : IEventStore
                     var projection = registration.Projection;
                     await SqliteProjectionAuthorizer.RunAsync(
                         connection,
+                        registration,
+                        _projectionRegistry.AllowsLegacyTestObjects,
                         () => projection.ApplyAsync(
                             decrypted,
                             globalPosition,
@@ -633,7 +690,8 @@ public sealed class SqliteEventStore : IEventStore
     internal static async Task ValidateAllOperationMetadataAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool useProjectionRebuildCorruptionContract = false)
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
@@ -648,7 +706,14 @@ public sealed class SqliteEventStore : IEventStore
         while (await reader.ReadAsync(cancellationToken))
         {
             var coordinates = ReadOperationCoordinates(reader);
-            validator.Accept(coordinates);
+            try
+            {
+                validator.Accept(coordinates);
+            }
+            catch (VaultRecoveryRequiredException) when (useProjectionRebuildCorruptionContract)
+            {
+                throw ProjectionRebuildStreamCorruption();
+            }
             StreamVersion expected;
             try
             {
@@ -661,19 +726,35 @@ public sealed class SqliteEventStore : IEventStore
                 throw new VaultRecoveryRequiredException(exception);
             }
             if (coordinates.StreamVersion != expected)
+            {
+                if (useProjectionRebuildCorruptionContract)
+                    throw ProjectionRebuildStreamCorruption();
                 throw new VaultRecoveryRequiredException();
+            }
             computedHeads[coordinates.StreamId] = coordinates.StreamVersion;
         }
-        validator.Complete();
+        try
+        {
+            validator.Complete();
+        }
+        catch (VaultRecoveryRequiredException) when (useProjectionRebuildCorruptionContract)
+        {
+            throw ProjectionRebuildStreamCorruption();
+        }
         await ValidateStoredStreamHeadsAsync(
-            connection, transaction, computedHeads, cancellationToken);
+            connection,
+            transaction,
+            computedHeads,
+            cancellationToken,
+            useProjectionRebuildCorruptionContract);
     }
 
     internal static async Task ValidateStoredStreamHeadsAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
         IReadOnlyDictionary<StreamId, StreamVersion> computedHeads,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool useProjectionRebuildCorruptionContract = false)
     {
         var unmatched = new Dictionary<StreamId, StreamVersion>(computedHeads);
         await using var command = connection.CreateCommand();
@@ -703,12 +784,23 @@ public sealed class SqliteEventStore : IEventStore
             }
 
             if (!unmatched.Remove(stream, out var expected) || head != expected)
+            {
+                if (useProjectionRebuildCorruptionContract)
+                    throw ProjectionRebuildStreamCorruption();
                 throw new VaultRecoveryRequiredException();
+            }
         }
 
         if (unmatched.Count != 0)
+        {
+            if (useProjectionRebuildCorruptionContract)
+                throw ProjectionRebuildStreamCorruption();
             throw new VaultRecoveryRequiredException();
+        }
     }
+
+    private static EventStreamCorruptionException ProjectionRebuildStreamCorruption() =>
+        new("Stored event stream operation metadata is inconsistent.");
 
     private static async Task<IReadOnlyList<PersistedOperationEvent>> ReadOperationAsync(SqliteConnection c, SqliteTransaction t, OperationId operation, CancellationToken ct)
     {

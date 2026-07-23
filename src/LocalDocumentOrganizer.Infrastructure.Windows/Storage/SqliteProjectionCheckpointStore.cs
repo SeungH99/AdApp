@@ -3,6 +3,12 @@ using LocalDocumentOrganizer.Infrastructure.Windows.Crypto;
 
 namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
+internal enum ProjectionCheckpointSchema
+{
+    Main,
+    Rebuild,
+}
+
 internal static class SqliteProjectionCheckpointStore
 {
     internal static async Task ValidateMembershipAsync(
@@ -128,12 +134,32 @@ internal static class SqliteProjectionCheckpointStore
         SqliteTransaction transaction,
         SqliteProjectionRegistration projection,
         long globalPosition,
+        CancellationToken cancellationToken) =>
+        await AdvanceAsync(
+            connection,
+            transaction,
+            ProjectionCheckpointSchema.Main,
+            projection,
+            globalPosition,
+            cancellationToken).ConfigureAwait(false);
+
+    internal static async Task AdvanceAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ProjectionCheckpointSchema schema,
+        SqliteProjectionRegistration projection,
+        long globalPosition,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(transaction);
+        ArgumentNullException.ThrowIfNull(projection);
+        if (globalPosition < 0) throw new ArgumentOutOfRangeException(nameof(globalPosition));
+        var schemaName = RequireSchemaName(schema);
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = """
-            INSERT INTO main.projection_checkpoints(
+        command.CommandText = $"""
+            INSERT INTO {schemaName}.projection_checkpoints(
                 projection_name, projection_schema_version, encryption_version, last_global_position)
             VALUES ($projection_name, $projection_schema_version, $encryption_version, $global_position)
             ON CONFLICT(projection_name) DO UPDATE SET
@@ -147,4 +173,123 @@ internal static class SqliteProjectionCheckpointStore
         command.Parameters.AddWithValue("$global_position", globalPosition);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
+
+    internal static async Task RequireExactSelectedAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ProjectionCheckpointSchema schema,
+        IReadOnlyList<SqliteProjectionRegistration> selected,
+        long expectedGlobalPosition,
+        CancellationToken cancellationToken) =>
+        await RequireExactSelectedAsync(
+            connection,
+            transaction,
+            schema,
+            selected,
+            expectedGlobalPosition,
+            requireOnlySelected: false,
+            cancellationToken).ConfigureAwait(false);
+
+    internal static async Task RequireExactSelectedAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ProjectionCheckpointSchema schema,
+        IReadOnlyList<SqliteProjectionRegistration> selected,
+        long expectedGlobalPosition,
+        bool requireOnlySelected,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(transaction);
+        ArgumentNullException.ThrowIfNull(selected);
+        if (expectedGlobalPosition < 0)
+            throw new ArgumentOutOfRangeException(nameof(expectedGlobalPosition));
+
+        var expected = selected.ToDictionary(
+            registration => registration.Name,
+            registration => new ProjectionCheckpointSnapshot(
+                registration.SchemaVersion,
+                registration.EncryptionVersion,
+                expectedGlobalPosition),
+            StringComparer.Ordinal);
+        var actual = await ReadAsync(
+            connection,
+            transaction,
+            RequireSchemaName(schema),
+            cancellationToken).ConfigureAwait(false);
+        if ((requireOnlySelected && actual.Count != expected.Count)
+            || expected.Any(pair =>
+                !actual.TryGetValue(pair.Key, out var snapshot)
+                || snapshot != pair.Value))
+        {
+            throw new VaultRecoveryRequiredException();
+        }
+    }
+
+    internal static async Task<IReadOnlyDictionary<string, ProjectionCheckpointSnapshot>>
+        ReadUnselectedAsync(
+            SqliteConnection connection,
+            SqliteTransaction transaction,
+            IReadOnlySet<string> selectedNames,
+            CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(transaction);
+        ArgumentNullException.ThrowIfNull(selectedNames);
+        var all = await ReadAsync(
+            connection,
+            transaction,
+            RequireSchemaName(ProjectionCheckpointSchema.Main),
+            cancellationToken).ConfigureAwait(false);
+        return all
+            .Where(pair => !selectedNames.Contains(pair.Key))
+            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+    }
+
+    private static async Task<IReadOnlyDictionary<string, ProjectionCheckpointSnapshot>> ReadAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string schemaName,
+        CancellationToken cancellationToken)
+    {
+        var checkpoints = new SortedDictionary<string, ProjectionCheckpointSnapshot>(StringComparer.Ordinal);
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"""
+            SELECT projection_name, projection_schema_version, encryption_version, last_global_position
+            FROM {schemaName}.projection_checkpoints
+            ORDER BY projection_name COLLATE BINARY;
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            if (reader.GetValue(0) is not string name
+                || string.IsNullOrWhiteSpace(name)
+                || reader.GetValue(1) is not long rawSchema
+                || rawSchema is <= 0 or > int.MaxValue
+                || reader.GetValue(2) is not long rawEncryption
+                || rawEncryption is <= 0 or > int.MaxValue
+                || reader.GetValue(3) is not long position
+                || position < 0
+                || !checkpoints.TryAdd(
+                    name,
+                    new ProjectionCheckpointSnapshot(
+                        checked((int)rawSchema),
+                        checked((int)rawEncryption),
+                        position)))
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+        }
+
+        return checkpoints;
+    }
+
+    private static string RequireSchemaName(ProjectionCheckpointSchema schema) => schema switch
+    {
+        ProjectionCheckpointSchema.Main => "main",
+        ProjectionCheckpointSchema.Rebuild => "rebuild",
+        _ => throw new ArgumentOutOfRangeException(nameof(schema)),
+    };
 }

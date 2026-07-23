@@ -12,7 +12,10 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.Crypto;
 
 public sealed class VaultKeyRingStore
 {
-    private static readonly byte[] Magic = "LDOVKEY1"u8.ToArray();
+    private static readonly byte[] CurrentMagic = "LDOVKEY2"u8.ToArray();
+    private static readonly byte[] LegacyMagic = "LDOVKEY1"u8.ToArray();
+    private const int LegacyFormatVersion = 1;
+    private const int KeyWrappingFormatVersion = 1;
     private static readonly byte[] AuthenticationDomain =
         "LocalDocumentOrganizer/VaultKeyRing/Authentication/v1"u8.ToArray();
     private static readonly byte[] WrappingDomain =
@@ -72,11 +75,22 @@ public sealed class VaultKeyRingStore
 
     public async Task<VaultKeyRing> CreateAsync(CancellationToken cancellationToken)
     {
+        await using var lease = await MaintenanceGate.AcquireMutationAsync(cancellationToken).ConfigureAwait(false);
+        return await CreateAsync(lease, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task<VaultKeyRing> CreateAsync(
+        VaultMaintenanceLease lease,
+        CancellationToken cancellationToken)
+    {
+        MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
+        await using var operation = await MaintenanceGate
+            .EnterOperationAsync(lease, cancellationToken)
+            .ConfigureAwait(false);
         WindowsVaultPathGuard.RequireSafeEntryShape(_path);
         var directory = Path.GetDirectoryName(_path)
             ?? throw new ArgumentException("The keyring path has no parent directory.", nameof(_path));
         Directory.CreateDirectory(directory);
-        await using var lease = await MaintenanceGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
         WindowsVaultPathGuard.RequireSafeForOpen(_path);
         CleanupOrphans(requireCanonical: true);
         if (WindowsVaultPathGuard.EntryExists(_path))
@@ -94,7 +108,13 @@ public sealed class VaultKeyRingStore
                 throw new VaultKeyProtectionException("The protected Vault root length is invalid.");
             }
 
-            using var state = new KeyRingState(1, protectedRoot, root, [], []);
+            using var state = new KeyRingState(
+                VaultKeyRing.FormatVersion,
+                1,
+                protectedRoot,
+                root,
+                [],
+                []);
             var image = Serialize(state);
             await PublishAsync(image, oldImage: null, cancellationToken).ConfigureAwait(false);
             return state.ToMetadata();
@@ -115,6 +135,31 @@ public sealed class VaultKeyRingStore
         var image = await ReadCanonicalAsync(cancellationToken).ConfigureAwait(false);
         using var state = Deserialize(image);
         return state.ToMetadata();
+    }
+
+    internal async Task EnsureCurrentFormatAsync(
+        VaultMaintenanceLease lease,
+        CancellationToken cancellationToken)
+    {
+        MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
+        await using var operation = await MaintenanceGate
+            .EnterOperationAsync(lease, cancellationToken)
+            .ConfigureAwait(false);
+        CleanupOrphans(requireCanonical: true);
+        var oldImage = await ReadCanonicalAsync(cancellationToken).ConfigureAwait(false);
+        using var state = Deserialize(oldImage);
+        if (state.SourceFormatVersion == VaultKeyRing.FormatVersion)
+        {
+            return;
+        }
+
+        if (state.SourceFormatVersion != LegacyFormatVersion || state.Destroyed.Count != 0)
+        {
+            throw new VaultKeyRingRecoveryRequiredException();
+        }
+
+        state.Revision = NextRevision(state.Revision);
+        await PublishAsync(Serialize(state), oldImage, cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task RequireCanonicalIdentityAsync(
@@ -155,6 +200,18 @@ public sealed class VaultKeyRingStore
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(expectedIdentity);
+        if (writable)
+        {
+            MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
+        }
+        else
+        {
+            MaintenanceGate.Validate(
+                lease,
+                VaultLeaseMode.Read,
+                VaultLeaseMode.Mutation,
+                VaultLeaseMode.Rebuild);
+        }
         var operation = await MaintenanceGate
             .EnterOperationAsync(lease, cancellationToken)
             .ConfigureAwait(false);
@@ -194,7 +251,7 @@ public sealed class VaultKeyRingStore
         Func<DataKeyId, ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>> callback,
         CancellationToken cancellationToken)
     {
-        await using var lease = await MaintenanceGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        await using var lease = await MaintenanceGate.AcquireMutationAsync(cancellationToken).ConfigureAwait(false);
         return await GetOrCreateDataKeyAsync(owner, lease, callback, cancellationToken).ConfigureAwait(false);
     }
 
@@ -206,6 +263,7 @@ public sealed class VaultKeyRingStore
     {
         ValidateOwner(owner);
         ArgumentNullException.ThrowIfNull(callback);
+        MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
         await using var operation = await MaintenanceGate
             .EnterOperationAsync(lease, cancellationToken)
             .ConfigureAwait(false);
@@ -260,7 +318,7 @@ public sealed class VaultKeyRingStore
         Func<DataKeyId, ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>> activeCallback,
         CancellationToken cancellationToken)
     {
-        await using var lease = await MaintenanceGate.AcquireAsync(cancellationToken).ConfigureAwait(false);
+        await using var lease = await MaintenanceGate.AcquireReadAsync(cancellationToken).ConfigureAwait(false);
         return await ResolveDataKeyAsync(
             owner, expectedKeyId, lease, destroyedCallback, activeCallback, cancellationToken).ConfigureAwait(false);
     }
@@ -277,6 +335,11 @@ public sealed class VaultKeyRingStore
         if (expectedKeyId.Value == Guid.Empty) throw new ArgumentException("A data-key ID is required.", nameof(expectedKeyId));
         ArgumentNullException.ThrowIfNull(destroyedCallback);
         ArgumentNullException.ThrowIfNull(activeCallback);
+        MaintenanceGate.Validate(
+            lease,
+            VaultLeaseMode.Read,
+            VaultLeaseMode.Mutation,
+            VaultLeaseMode.Rebuild);
         await using var operation = await MaintenanceGate
             .EnterOperationAsync(lease, cancellationToken)
             .ConfigureAwait(false);
@@ -307,6 +370,11 @@ public sealed class VaultKeyRingStore
         if (expectedKeyId.Value == Guid.Empty)
             throw new ArgumentException("A data-key ID is required.", nameof(expectedKeyId));
         ArgumentNullException.ThrowIfNull(callback);
+        MaintenanceGate.Validate(
+            lease,
+            VaultLeaseMode.Read,
+            VaultLeaseMode.Mutation,
+            VaultLeaseMode.Rebuild);
 
         byte[]? subkey = null;
         try
@@ -611,6 +679,7 @@ public sealed class VaultKeyRingStore
     {
         ArgumentNullException.ThrowIfNull(receipt);
         receipt.Validate();
+        MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
         await using var operation = await MaintenanceGate
             .EnterOperationAsync(lease, cancellationToken)
             .ConfigureAwait(false);
@@ -653,6 +722,7 @@ public sealed class VaultKeyRingStore
     {
         ArgumentNullException.ThrowIfNull(receipt);
         receipt.Validate();
+        MaintenanceGate.Validate(lease, VaultLeaseMode.Mutation);
         await using var operation = await MaintenanceGate
             .EnterOperationAsync(lease, cancellationToken)
             .ConfigureAwait(false);
@@ -770,7 +840,7 @@ public sealed class VaultKeyRingStore
         state.Active.Sort(ActiveEntryComparer.Instance);
         state.Destroyed.Sort(DestroyedEntryComparer.Instance);
         using var stream = new MemoryStream();
-        Write(stream, Magic);
+        Write(stream, CurrentMagic);
         WriteUInt32(stream, VaultKeyRing.FormatVersion);
         WriteUInt64(stream, state.Revision);
         WriteBytes(stream, state.ProtectedRoot);
@@ -789,6 +859,7 @@ public sealed class VaultKeyRingStore
         {
             WriteOwner(stream, receipt.Owner);
             WriteGuid(stream, receipt.KeyId.Value);
+            WriteGuid(stream, receipt.StreamId.Value);
             WriteGuid(stream, receipt.OperationId.Value);
             WriteGuid(stream, receipt.TombstoneEventId.Value);
             WriteInt64(stream, receipt.ExpectedStreamVersion.Value);
@@ -836,21 +907,30 @@ public sealed class VaultKeyRingStore
 
     private KeyRingState DeserializeCore(byte[] image)
     {
-        if (image.Length < Magic.Length + 4 + 8 + 4 + 1 + AuthenticationTagSize
+        if (image.Length < CurrentMagic.Length + 4 + 8 + 4 + 1 + AuthenticationTagSize
             || image.Length > MaximumFileSize)
         {
             throw new VaultKeyRingFormatException("The Vault keyring size is invalid.");
         }
 
         var offset = 0;
-        if (!image.AsSpan(0, Magic.Length).SequenceEqual(Magic))
+        int sourceFormatVersion;
+        if (image.AsSpan(0, CurrentMagic.Length).SequenceEqual(CurrentMagic))
+        {
+            sourceFormatVersion = VaultKeyRing.FormatVersion;
+        }
+        else if (image.AsSpan(0, LegacyMagic.Length).SequenceEqual(LegacyMagic))
+        {
+            sourceFormatVersion = LegacyFormatVersion;
+        }
+        else
         {
             throw new VaultKeyRingFormatException("The Vault keyring magic is invalid.");
         }
 
-        offset += Magic.Length;
+        offset += CurrentMagic.Length;
         var version = ReadUInt32(image, ref offset);
-        if (version != VaultKeyRing.FormatVersion)
+        if (version != sourceFormatVersion)
         {
             throw new VaultKeyRingFormatException("The Vault keyring version is unsupported.");
         }
@@ -909,12 +989,18 @@ public sealed class VaultKeyRingStore
             }
 
             var destroyedCount = ReadCount(image, ref offset, bodyLimit);
+            if (sourceFormatVersion == LegacyFormatVersion && destroyedCount != 0)
+            {
+                throw new VaultKeyRingRecoveryRequiredException();
+            }
+
             var destroyed = new List<VaultDestroyedKeyReceipt>(destroyedCount);
             for (var index = 0; index < destroyedCount; index++)
             {
                 var receipt = new VaultDestroyedKeyReceipt(
                     ReadOwner(image, ref offset, bodyLimit),
                     new DataKeyId(ReadGuid(image, ref offset, bodyLimit)),
+                    new StreamId(ReadGuid(image, ref offset, bodyLimit)),
                     new OperationId(ReadGuid(image, ref offset, bodyLimit)),
                     new EventId(ReadGuid(image, ref offset, bodyLimit)),
                     new StreamVersion(ReadInt64(image, ref offset, bodyLimit)),
@@ -930,7 +1016,13 @@ public sealed class VaultKeyRingStore
             }
 
             ValidateCanonical(active, destroyed);
-            return new KeyRingState(revision, protectedRoot, root, active, destroyed);
+            return new KeyRingState(
+                sourceFormatVersion,
+                revision,
+                protectedRoot,
+                root,
+                active,
+                destroyed);
         }
         catch
         {
@@ -1121,7 +1213,7 @@ public sealed class VaultKeyRingStore
                 64L
                 + protectedRootSize
                 + ((long)activeCount * 100)
-                + ((long)destroyedCount * 84)
+                + ((long)destroyedCount * 100)
                 + destroyedReasonBytes);
         }
         catch (OverflowException exception)
@@ -1397,6 +1489,7 @@ public sealed class VaultKeyRingStore
         VaultDestroyedKeyReceipt left,
         VaultDestroyedKeyReceipt right) =>
         left.Owner == right.Owner && left.KeyId == right.KeyId
+        && left.StreamId == right.StreamId
         && left.OperationId == right.OperationId
         && left.TombstoneEventId == right.TombstoneEventId
         && left.ExpectedStreamVersion == right.ExpectedStreamVersion
@@ -1441,7 +1534,7 @@ public sealed class VaultKeyRingStore
     private static byte[] CreateWrappingAad(SensitiveObjectRef owner, DataKeyId keyId)
     {
         var aad = new byte[4 + 4 + 16 + 16];
-        BinaryPrimitives.WriteUInt32BigEndian(aad, VaultKeyRing.FormatVersion);
+        BinaryPrimitives.WriteUInt32BigEndian(aad, KeyWrappingFormatVersion);
         BinaryPrimitives.WriteInt32BigEndian(aad.AsSpan(4), (int)owner.Kind);
         owner.Id.Value.TryWriteBytes(aad.AsSpan(8, 16), bigEndian: true, out _);
         keyId.Value.TryWriteBytes(aad.AsSpan(24, 16), bigEndian: true, out _);
@@ -1567,12 +1660,14 @@ public sealed class VaultKeyRingStore
     private sealed class KeyRingState : IDisposable
     {
         public KeyRingState(
+            int sourceFormatVersion,
             ulong revision,
             byte[] protectedRoot,
             byte[] root,
             List<ActiveEntry> active,
             List<VaultDestroyedKeyReceipt> destroyed)
         {
+            SourceFormatVersion = sourceFormatVersion;
             Revision = revision;
             ProtectedRoot = protectedRoot;
             Root = root;
@@ -1580,6 +1675,7 @@ public sealed class VaultKeyRingStore
             Destroyed = destroyed;
         }
 
+        public int SourceFormatVersion { get; }
         public ulong Revision { get; set; }
         public byte[] ProtectedRoot { get; }
         public byte[] Root { get; }
