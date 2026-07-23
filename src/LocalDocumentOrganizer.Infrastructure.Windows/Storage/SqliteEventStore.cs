@@ -249,6 +249,7 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
     {
         ArgumentNullException.ThrowIfNull(command);
         ValidateAppendBatchIdentifiers(command.Events);
+        RejectReservedDeletionEvents(command.Events);
         SqliteEventStoreSchema.ValidateVaultPath(
             _connectionString, _payloads.KeyRing.MaintenanceGate);
         await using var lease = await _payloads.KeyRing.MaintenanceGate.AcquireMutationAsync(cancellationToken);
@@ -533,6 +534,22 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore
         foreach (var eventToAppend in events)
         {
             if (!eventIds.Add(eventToAppend.EventId.Value)) throw new ArgumentException("An event ID occurs more than once in the batch.", nameof(events));
+        }
+    }
+
+    private static void RejectReservedDeletionEvents(IReadOnlyList<EventToAppend> events)
+    {
+        foreach (var eventToAppend in events)
+        {
+            if (string.Equals(
+                eventToAppend.EventType,
+                SensitiveObjectDeletedEventContract.EventType,
+                StringComparison.Ordinal))
+            {
+                throw new ArgumentException(
+                    "The sensitive-object deletion event is reserved for the deletion store.",
+                    nameof(events));
+            }
         }
     }
 

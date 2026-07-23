@@ -32,6 +32,13 @@ internal sealed class SqliteSecureCompactor
         """;
     private const string ArtifactMarker = ".secure-compaction-";
     private const int ErasureScanBlockSize = 64 * 1024;
+    private const int ErasureScanBatchPatternCount = 128;
+    private const int ErasureScanBatchByteCount = 256 * 1024;
+    // Very short ciphertext is not unique physical-erasure evidence: the same
+    // bytes can legitimately occur in retained structural content. Logical
+    // clone validation remains exact, and the 96/128-bit nonce/tag are still
+    // scanned independently.
+    private const int MinimumIndependentCiphertextScanLength = 16;
 
     private readonly string _connectionString;
     private readonly string _vaultPath;
@@ -1203,46 +1210,131 @@ internal sealed class SqliteSecureCompactor
             """;
         await using var reader = await command.ExecuteReaderAsync(cancellationToken)
             .ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        var patterns = new List<byte[]>(ErasureScanBatchPatternCount);
+        var patternBytes = 0;
+        try
         {
-            var nonceLength = reader.GetBytes(4, 0, null, 0, 0);
-            var ciphertextLength = reader.GetBytes(5, 0, null, 0, 0);
-            var tagLength = reader.GetBytes(6, 0, null, 0, 0);
-            if (!ClassifyDestroyed(
-                    protectionKind: 1,
-                    reader.GetInt64(0),
-                    reader.GetString(1),
-                    reader.GetString(2),
-                    reader.GetInt64(3),
-                    nonceLength,
-                    ciphertextLength,
-                    tagLength,
-                    active,
-                    destroyed))
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
-                continue;
-            }
-            for (var ordinal = 4; ordinal <= 6; ordinal++)
-            {
-                var pattern = reader.GetFieldValue<byte[]>(ordinal);
-                try
+                var nonceLength = reader.GetBytes(4, 0, null, 0, 0);
+                var ciphertextLength = reader.GetBytes(5, 0, null, 0, 0);
+                var tagLength = reader.GetBytes(6, 0, null, 0, 0);
+                if (!ClassifyDestroyed(
+                        protectionKind: 1,
+                        reader.GetInt64(0),
+                        reader.GetString(1),
+                        reader.GetString(2),
+                        reader.GetInt64(3),
+                        nonceLength,
+                        ciphertextLength,
+                        tagLength,
+                        active,
+                        destroyed))
                 {
-                    if (pattern.Length != 0
-                        && await FileContainsPatternAsync(
-                            artifactPath,
-                            pattern,
-                            cancellationToken).ConfigureAwait(false))
+                    continue;
+                }
+
+                for (var ordinal = 4; ordinal <= 6; ordinal++)
+                {
+                    var pattern = reader.GetFieldValue<byte[]>(ordinal);
+                    var ownedByBatch = false;
+                    try
                     {
-                        throw new VaultRecoveryRequiredException();
+                        if (pattern.Length == 0
+                            || ordinal == 5
+                            && pattern.Length < MinimumIndependentCiphertextScanLength)
+                        {
+                            continue;
+                        }
+
+                        if (pattern.Length > ErasureScanBatchByteCount)
+                        {
+                            await FlushOwnedPatternBatchAsync(
+                                artifactPath,
+                                patterns,
+                                cancellationToken).ConfigureAwait(false);
+                            patternBytes = 0;
+                            if (await FileContainsPatternAsync(
+                                    artifactPath,
+                                    pattern,
+                                    cancellationToken).ConfigureAwait(false))
+                            {
+                                throw new VaultRecoveryRequiredException();
+                            }
+                            continue;
+                        }
+
+                        if (patterns.Any(
+                            candidate => candidate.AsSpan().SequenceEqual(pattern)))
+                        {
+                            continue;
+                        }
+                        if (patterns.Count == ErasureScanBatchPatternCount
+                            || patternBytes + pattern.Length > ErasureScanBatchByteCount)
+                        {
+                            await FlushOwnedPatternBatchAsync(
+                                artifactPath,
+                                patterns,
+                                cancellationToken).ConfigureAwait(false);
+                            patternBytes = 0;
+                        }
+
+                        patterns.Add(pattern);
+                        patternBytes += pattern.Length;
+                        ownedByBatch = true;
+                    }
+                    finally
+                    {
+                        if (!ownedByBatch)
+                        {
+                            System.Security.Cryptography.CryptographicOperations
+                                .ZeroMemory(pattern);
+                        }
                     }
                 }
-                finally
-                {
-                    System.Security.Cryptography.CryptographicOperations
-                        .ZeroMemory(pattern);
-                }
+            }
+
+            await FlushOwnedPatternBatchAsync(
+                artifactPath,
+                patterns,
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            ZeroOwnedPatterns(patterns);
+        }
+    }
+
+    private static async Task FlushOwnedPatternBatchAsync(
+        string artifactPath,
+        List<byte[]> patterns,
+        CancellationToken cancellationToken)
+    {
+        if (patterns.Count == 0) return;
+        try
+        {
+            if (await FileContainsPatternBatchAsync(
+                artifactPath,
+                patterns,
+                cancellationToken).ConfigureAwait(false))
+            {
+                throw new VaultRecoveryRequiredException();
             }
         }
+        finally
+        {
+            ZeroOwnedPatterns(patterns);
+        }
+    }
+
+    private static void ZeroOwnedPatterns(List<byte[]> patterns)
+    {
+        foreach (var pattern in patterns)
+        {
+            System.Security.Cryptography.CryptographicOperations
+                .ZeroMemory(pattern);
+        }
+        patterns.Clear();
     }
 
     private void RequireExactManagedCopySet(IReadOnlyList<ManagedVaultCopyId> copies)
@@ -1469,28 +1561,106 @@ internal sealed class SqliteSecureCompactor
     internal static async Task<bool> FileContainsAnyAsync(
         string path,
         IReadOnlyList<byte[]> patterns,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action? beforeScanPass = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         ArgumentNullException.ThrowIfNull(patterns);
+        var batch = new List<byte[]>(ErasureScanBatchPatternCount);
+        var unique = new HashSet<byte[]>(ByteArrayComparer.Instance);
+        var batchBytes = 0;
         foreach (var pattern in patterns)
         {
-            if (pattern.Length != 0
-                && await FileContainsPatternAsync(
+            ArgumentNullException.ThrowIfNull(pattern);
+            if (pattern.Length == 0 || !unique.Add(pattern)) continue;
+            if (pattern.Length > ErasureScanBatchByteCount)
+            {
+                if (batch.Count != 0
+                    && await FileContainsPatternBatchAsync(
+                        path,
+                        batch,
+                        cancellationToken,
+                        beforeScanPass).ConfigureAwait(false))
+                {
+                    return true;
+                }
+                batch.Clear();
+                batchBytes = 0;
+                if (await FileContainsPatternAsync(
                     path,
                     pattern,
-                    cancellationToken).ConfigureAwait(false))
+                    cancellationToken,
+                    beforeScanPass).ConfigureAwait(false))
+                    return true;
+                continue;
+            }
+
+            if (batch.Count == ErasureScanBatchPatternCount
+                || batchBytes + pattern.Length > ErasureScanBatchByteCount)
             {
-                return true;
+                if (await FileContainsPatternBatchAsync(
+                    path,
+                    batch,
+                    cancellationToken,
+                    beforeScanPass).ConfigureAwait(false))
+                {
+                    return true;
+                }
+                batch.Clear();
+                batchBytes = 0;
+            }
+
+            batch.Add(pattern);
+            batchBytes += pattern.Length;
+        }
+        return batch.Count != 0
+            && await FileContainsPatternBatchAsync(
+                path,
+                batch,
+                cancellationToken,
+                beforeScanPass).ConfigureAwait(false);
+    }
+
+    private static async Task<bool> FileContainsPatternBatchAsync(
+        string path,
+        IReadOnlyList<byte[]> patterns,
+        CancellationToken cancellationToken,
+        Action? beforeScanPass = null)
+    {
+        if (patterns.Count == 0) return false;
+        using var matcher = new ExactMultiPatternMatcher(patterns);
+        var buffer = new byte[ErasureScanBlockSize];
+        try
+        {
+            beforeScanPass?.Invoke();
+            await using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                ErasureScanBlockSize,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            while (true)
+            {
+                var read = await stream.ReadAsync(
+                    buffer,
+                    cancellationToken).ConfigureAwait(false);
+                if (read == 0) return false;
+                if (matcher.Accept(buffer.AsSpan(0, read))) return true;
             }
         }
-        return false;
+        finally
+        {
+            System.Security.Cryptography.CryptographicOperations
+                .ZeroMemory(buffer);
+        }
     }
 
     private static async Task<bool> FileContainsPatternAsync(
         string path,
         byte[] pattern,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action? beforeScanPass = null)
     {
         if (pattern.Length == 0) return false;
         var prefix = new int[pattern.Length];
@@ -1503,26 +1673,149 @@ internal sealed class SqliteSecureCompactor
         }
         var buffer = new byte[ErasureScanBlockSize];
         var matchedLength = 0;
-        await using var stream = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            ErasureScanBlockSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
-        while (true)
+        try
         {
-            var read = await stream.ReadAsync(
-                buffer,
-                cancellationToken).ConfigureAwait(false);
-            if (read == 0) return false;
-            foreach (var value in buffer.AsSpan(0, read))
+            beforeScanPass?.Invoke();
+            await using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                ErasureScanBlockSize,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            while (true)
             {
-                while (matchedLength > 0 && value != pattern[matchedLength])
-                    matchedLength = prefix[matchedLength - 1];
-                if (value == pattern[matchedLength]) matchedLength++;
-                if (matchedLength == pattern.Length) return true;
+                var read = await stream.ReadAsync(
+                    buffer,
+                    cancellationToken).ConfigureAwait(false);
+                if (read == 0) return false;
+                foreach (var value in buffer.AsSpan(0, read))
+                {
+                    while (matchedLength > 0 && value != pattern[matchedLength])
+                        matchedLength = prefix[matchedLength - 1];
+                    if (value == pattern[matchedLength]) matchedLength++;
+                    if (matchedLength == pattern.Length) return true;
+                }
             }
+        }
+        finally
+        {
+            System.Security.Cryptography.CryptographicOperations
+                .ZeroMemory(buffer);
+            Array.Clear(prefix);
+        }
+    }
+
+    private sealed class ExactMultiPatternMatcher : IDisposable
+    {
+        private readonly List<ExactMultiPatternNode> _nodes = [new()];
+        private int _state;
+
+        internal ExactMultiPatternMatcher(IReadOnlyList<byte[]> patterns)
+        {
+            try
+            {
+                foreach (var pattern in patterns)
+                {
+                    if (pattern.Length == 0)
+                        throw new ArgumentException("Scan patterns must not be empty.", nameof(patterns));
+                    var nodeIndex = 0;
+                    foreach (var value in pattern)
+                    {
+                        if (!_nodes[nodeIndex].Transitions.TryGetValue(value, out var next))
+                        {
+                            next = _nodes.Count;
+                            _nodes[nodeIndex].Transitions.Add(value, next);
+                            _nodes.Add(new ExactMultiPatternNode());
+                        }
+                        nodeIndex = next;
+                    }
+                    _nodes[nodeIndex].Terminal = true;
+                }
+                BuildFailureLinks();
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
+        }
+
+        internal bool Accept(ReadOnlySpan<byte> input)
+        {
+            foreach (var value in input)
+            {
+                while (_state != 0
+                    && !_nodes[_state].Transitions.ContainsKey(value))
+                {
+                    _state = _nodes[_state].Failure;
+                }
+                if (_nodes[_state].Transitions.TryGetValue(value, out var next))
+                    _state = next;
+                if (_nodes[_state].Terminal) return true;
+            }
+            return false;
+        }
+
+        private void BuildFailureLinks()
+        {
+            var pending = new Queue<int>();
+            foreach (var child in _nodes[0].Transitions.Values)
+                pending.Enqueue(child);
+            while (pending.Count != 0)
+            {
+                var parentIndex = pending.Dequeue();
+                foreach (var (value, childIndex) in _nodes[parentIndex].Transitions)
+                {
+                    pending.Enqueue(childIndex);
+                    var fallback = _nodes[parentIndex].Failure;
+                    while (fallback != 0
+                        && !_nodes[fallback].Transitions.ContainsKey(value))
+                    {
+                        fallback = _nodes[fallback].Failure;
+                    }
+                    if (_nodes[fallback].Transitions.TryGetValue(value, out var next)
+                        && next != childIndex)
+                    {
+                        fallback = next;
+                    }
+                    _nodes[childIndex].Failure = fallback;
+                    _nodes[childIndex].Terminal |= _nodes[fallback].Terminal;
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            foreach (var node in _nodes)
+                node.Transitions.Clear();
+            _nodes.Clear();
+            _state = 0;
+        }
+    }
+
+    private sealed class ExactMultiPatternNode
+    {
+        internal Dictionary<byte, int> Transitions { get; } = [];
+        internal int Failure { get; set; }
+        internal bool Terminal { get; set; }
+    }
+
+    private sealed class ByteArrayComparer : IEqualityComparer<byte[]>
+    {
+        internal static ByteArrayComparer Instance { get; } = new();
+
+        public bool Equals(byte[]? left, byte[]? right) =>
+            ReferenceEquals(left, right)
+            || left is not null
+            && right is not null
+            && left.AsSpan().SequenceEqual(right);
+
+        public int GetHashCode(byte[] value)
+        {
+            var hash = new HashCode();
+            hash.AddBytes(value);
+            return hash.ToHashCode();
         }
     }
 

@@ -405,7 +405,7 @@ internal sealed class SqliteSensitiveDataDeletionStore
         }
     }
 
-    internal static async Task RequireNoPendingReceiptsAsync(
+    internal static async Task<VaultKeyRing> RequireNoPendingReceiptsAsync(
         VaultKeyRingStore keyRing,
         VaultKeyRingIdentity expectedIdentity,
         CancellationToken cancellationToken)
@@ -421,6 +421,8 @@ internal sealed class SqliteSensitiveDataDeletionStore
             {
                 throw new VaultRecoveryRequiredException();
             }
+
+            return ring;
         }
         catch (VaultRecoveryRequiredException) { throw; }
         catch (VaultKeyRingException exception)
