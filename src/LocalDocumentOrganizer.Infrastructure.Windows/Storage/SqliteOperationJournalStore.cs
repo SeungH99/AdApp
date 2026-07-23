@@ -352,7 +352,12 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         ArgumentNullException.ThrowIfNull(filesystemCallback);
         var result = await PersistIntentAsync(intent, cancellationToken)
             .ConfigureAwait(false);
-        if (result.Status != PersistOperationIntentStatus.Conflict)
+        if (result.Status == PersistOperationIntentStatus.Persisted
+            || result is
+            {
+                Status: PersistOperationIntentStatus.AlreadyPersisted,
+                Entry.State: OperationJournalState.IntentPersisted,
+            })
         {
             await filesystemCallback(CancellationToken.None).ConfigureAwait(false);
         }
@@ -408,26 +413,6 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                     actualRevision: null);
             }
 
-            var isExactReplay = row.State == command.NextState
-                && row.Revision == checked(command.ExpectedRevision + 1)
-                && row.SourceHealth == command.SourceHealth;
-            if (!isExactReplay)
-            {
-                OperationJournalStateMachine.EnsureCanTransition(
-                    row.Kind,
-                    row.State,
-                    command.NextState);
-                if (row.Revision != command.ExpectedRevision)
-                {
-                    await transaction.RollbackAsync(cancellationToken)
-                        .ConfigureAwait(false);
-                    return new TransitionOperationResult(
-                        TransitionOperationStatus.RevisionConflict,
-                        entry: null,
-                        row.Revision);
-                }
-            }
-
             await using var keySession = await _keyRing.OpenWriteSessionAsync(
                 lease,
                 expectedIdentity,
@@ -441,12 +426,29 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 row,
                 keySession,
                 cancellationToken).ConfigureAwait(false);
+            var isExactReplay = row.State == command.NextState
+                && row.Revision == checked(command.ExpectedRevision + 1)
+                && row.SourceHealth == command.SourceHealth;
             if (isExactReplay)
             {
                 await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
                 return new TransitionOperationResult(
                     TransitionOperationStatus.AlreadyApplied,
                     current,
+                    row.Revision);
+            }
+
+            OperationJournalStateMachine.EnsureCanTransition(
+                row.Kind,
+                row.State,
+                command.NextState);
+            if (row.Revision != command.ExpectedRevision)
+            {
+                await transaction.RollbackAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                return new TransitionOperationResult(
+                    TransitionOperationStatus.RevisionConflict,
+                    entry: null,
                     row.Revision);
             }
 
