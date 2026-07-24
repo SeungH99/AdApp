@@ -123,6 +123,7 @@ public sealed class FileOperationCoordinator :
     private readonly SameVolumeFileTransaction _sameVolume;
     private readonly IOperationCommitStore _commitStore;
     private readonly IFileOperationFaultInjector _faults;
+    private readonly OperationRecoveryCoordinator _liveRecovery;
 
     public FileOperationCoordinator(
         IOperationJournalStore journal,
@@ -160,6 +161,11 @@ public sealed class FileOperationCoordinator :
         _sameVolume = sameVolume;
         _commitStore = commitStore;
         _faults = faultInjector;
+        _liveRecovery = new OperationRecoveryCoordinator(
+            journal,
+            mutationGate,
+            new HandleSafeOperationRecoveryObserver(fingerprints),
+            this);
     }
 
     public async Task<FileOperationExecutionResult> ExecuteAsync(
@@ -221,15 +227,22 @@ public sealed class FileOperationCoordinator :
             }
 
             durableState = current.State;
-            if (current.State is
-                OperationJournalState.FileApplied
-                or OperationJournalState.EventAndProjectionCommitted
-                or OperationJournalState.SideEffectsPending
-                or OperationJournalState.Completed)
+            if (current.State == OperationJournalState.Completed)
             {
                 return await FinalizeCommitWithinGateAsync(
                         current,
                         request.RecoveryRecipe,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+
+            if (current.State is
+                OperationJournalState.FileApplied
+                or OperationJournalState.EventAndProjectionCommitted
+                or OperationJournalState.SideEffectsPending)
+            {
+                return await _liveRecovery.RecoverWithinGateAsync(
+                        current,
                         CancellationToken.None)
                     .ConfigureAwait(false);
             }
@@ -425,7 +438,8 @@ public sealed class FileOperationCoordinator :
                 current,
                 recipe,
                 verifiedIdentity,
-                OperationJournalState.FileApplied)
+                OperationJournalState.FileApplied,
+                sourceAbsenceGuard: null)
             .ConfigureAwait(false);
     }
 
@@ -465,7 +479,10 @@ public sealed class FileOperationCoordinator :
         if (!RecipeMatches(entry, recipe)
             || entry.Identity is null
             || observation is not null
-                && (observation.Destination
+                && (observation.Source
+                        != RecoveryPathObservation.Missing
+                    || observation.SourceAbsenceGuard is null
+                    || observation.Destination
                         != RecoveryPathObservation.Exact
                     || observation.ExactDestination is null))
         {
@@ -477,6 +494,15 @@ public sealed class FileOperationCoordinator :
         var identity = entry.Identity
             ?? throw new OperationJournalRecoveryRequiredException();
         var current = entry;
+        if (observation is not null
+            && !observation.SourceAbsenceGuard!
+                .IsStillSafelyAbsent())
+        {
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.IdentityMismatch,
+                current.State);
+        }
+
         if (current.State == OperationJournalState.Renaming)
         {
             current = await TransitionAsync(
@@ -501,7 +527,8 @@ public sealed class FileOperationCoordinator :
                 current,
                 recipe,
                 identity,
-                current.State)
+                current.State,
+                observation?.SourceAbsenceGuard)
             .ConfigureAwait(false);
     }
 
@@ -509,8 +536,22 @@ public sealed class FileOperationCoordinator :
         OperationJournalEntry entry,
         OperationRecoveryRecipe recipe,
         StableFileIdentity identity,
-        OperationJournalState durableState)
+        OperationJournalState durableState,
+        ISourceAbsenceGuard? sourceAbsenceGuard)
     {
+        if (sourceAbsenceGuard is not null)
+        {
+            _faults.ThrowIfRequested(
+                FileOperationFaultPoint
+                    .BeforeFinalizeSourceAbsenceRevalidation);
+            if (!sourceAbsenceGuard.IsStillSafelyAbsent())
+            {
+                return new FileOperationRecoveryRequired(
+                    FileOperationFailure.IdentityMismatch,
+                    durableState);
+            }
+        }
+
         var commit = new CommitFileOperationCommand(
             entry.OperationId,
             expectedJournalRevision: 4,
@@ -569,6 +610,14 @@ public sealed class FileOperationCoordinator :
 
         if (current?.State == OperationJournalState.SideEffectsPending)
         {
+            if (sourceAbsenceGuard is not null
+                && !sourceAbsenceGuard.IsStillSafelyAbsent())
+            {
+                return new FileOperationRecoveryRequired(
+                    FileOperationFailure.IdentityMismatch,
+                    current.State);
+            }
+
             current = await TransitionAsync(
                     current,
                     OperationJournalState.Completed)

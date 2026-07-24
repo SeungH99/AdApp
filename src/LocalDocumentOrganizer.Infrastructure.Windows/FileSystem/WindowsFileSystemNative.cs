@@ -19,6 +19,7 @@ internal static class WindowsFileSystemNative
     internal const uint FileFlagOpenReparsePoint = 0x00200000;
     internal const uint FileAttributeDirectory = 0x00000010;
     internal const uint FileAttributeReparsePoint = 0x00000400;
+    internal const uint FileListDirectory = 0x00000001;
 
     internal const uint FILE_RENAME_REPLACE_IF_EXISTS = 0x00000001;
     internal const uint FILE_RENAME_POSIX_SEMANTICS = 0x00000002;
@@ -37,6 +38,7 @@ internal static class WindowsFileSystemNative
     private const int ErrorInvalidFunction = 1;
     private const int ErrorNotSupported = 50;
     private const int ErrorInvalidParameter = 87;
+    private const int ErrorIoIncomplete = 996;
     private const uint InvalidFileAttributes = uint.MaxValue;
 
     internal static SafeFileHandle OpenVerifiedSourceHandle(string canonicalPath)
@@ -157,6 +159,221 @@ internal static class WindowsFileSystemNative
         if (error is ErrorFileNotFound or ErrorPathNotFound)
             return PathComponentOpenOutcome.Missing;
         throw CreateNativeException(error);
+    }
+
+    internal static SafeFileHandle OpenDirectoryChangeHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var opened = CreateFile(
+            ToExtendedPath(canonicalPath),
+            FileListDirectory,
+            FileShareRead | FileShareWrite,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics
+                | FileFlagOpenReparsePoint
+                | FileFlagOverlapped,
+            IntPtr.Zero);
+        if (opened.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            opened.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        try
+        {
+            var information = GetAttributeTagInfo(opened);
+            if ((information.FileAttributes
+                    & FileAttributeReparsePoint) != 0
+                || (information.FileAttributes
+                    & FileAttributeDirectory) == 0)
+            {
+                throw new FileSystemBoundaryException(
+                    "The source parent is not an approved directory.");
+            }
+
+            return opened;
+        }
+        catch
+        {
+            opened.Dispose();
+            throw;
+        }
+    }
+
+    internal static SafeWaitHandle CreateDirectoryChangeEvent()
+    {
+        var handle = CreateEvent(
+            IntPtr.Zero,
+            manualReset: true,
+            initialState: false,
+            name: null);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        return handle;
+    }
+
+    internal static void BeginDirectoryChangeObservation(
+        SafeFileHandle directory,
+        SafeWaitHandle changeEvent,
+        IntPtr buffer,
+        uint bufferLength,
+        IntPtr overlapped)
+    {
+        RequireUsableHandle(directory);
+        ArgumentNullException.ThrowIfNull(changeEvent);
+        if (changeEvent.IsInvalid
+            || changeEvent.IsClosed)
+        {
+            throw new ArgumentException(
+                "A live change event is required.",
+                nameof(changeEvent));
+        }
+
+        if (!ResetEvent(changeEvent))
+        {
+            throw CreateNativeException(Marshal.GetLastPInvokeError());
+        }
+
+        if (!ReadDirectoryChanges(
+                directory,
+                buffer,
+                bufferLength,
+                watchSubtree: false,
+                notifyFilter: 0x00000001 | 0x00000002,
+                IntPtr.Zero,
+                overlapped,
+                IntPtr.Zero))
+        {
+            throw CreateNativeException(Marshal.GetLastPInvokeError());
+        }
+    }
+
+    internal static DirectoryChangeObservationStatus
+        GetDirectoryChangeObservationStatus(
+            SafeFileHandle directory,
+            IntPtr buffer,
+            uint bufferLength,
+            IntPtr overlapped,
+            string watchedFileName,
+            out uint bytesTransferred,
+            bool wait)
+    {
+        RequireUsableHandle(directory);
+        ArgumentException.ThrowIfNullOrEmpty(watchedFileName);
+        if (GetOverlappedResult(
+                directory,
+                overlapped,
+                out bytesTransferred,
+                wait))
+        {
+            return ClassifyDirectoryChanges(
+                buffer,
+                bufferLength,
+                bytesTransferred,
+                watchedFileName);
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        bytesTransferred = 0;
+        return !wait && error == ErrorIoIncomplete
+            ? DirectoryChangeObservationStatus.Pending
+            : DirectoryChangeObservationStatus.Unreliable;
+    }
+
+    internal static DirectoryChangeObservationStatus ClassifyDirectoryChanges(
+        IntPtr buffer,
+        uint bufferLength,
+        uint bytesTransferred,
+        string watchedFileName)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(watchedFileName);
+        if (buffer == IntPtr.Zero
+            || bytesTransferred == 0
+            || bytesTransferred > bufferLength
+            || bytesTransferred > int.MaxValue)
+        {
+            return DirectoryChangeObservationStatus.Unreliable;
+        }
+
+        const int headerLength = sizeof(uint) * 3;
+        var available = checked((int)bytesTransferred);
+        var offset = 0;
+        var watchedNameChanged = false;
+        while (true)
+        {
+            if (available - offset < headerLength)
+            {
+                return DirectoryChangeObservationStatus.Unreliable;
+            }
+
+            var record = IntPtr.Add(buffer, offset);
+            var nextOffset = unchecked((uint)Marshal.ReadInt32(record));
+            var action = unchecked(
+                (uint)Marshal.ReadInt32(record, sizeof(uint)));
+            var fileNameLength = unchecked(
+                (uint)Marshal.ReadInt32(record, sizeof(uint) * 2));
+            if (action is < 1 or > 5
+                || fileNameLength == 0
+                || (fileNameLength & 1) != 0
+                || fileNameLength > int.MaxValue
+                || fileNameLength
+                    > checked((uint)(available - offset - headerLength)))
+            {
+                return DirectoryChangeObservationStatus.Unreliable;
+            }
+
+            var fileName = Marshal.PtrToStringUni(
+                IntPtr.Add(record, headerLength),
+                checked((int)fileNameLength / sizeof(char)));
+            if (fileName is null)
+            {
+                return DirectoryChangeObservationStatus.Unreliable;
+            }
+
+            watchedNameChanged |= string.Equals(
+                fileName,
+                watchedFileName,
+                StringComparison.OrdinalIgnoreCase);
+            if (nextOffset == 0)
+            {
+                return watchedNameChanged
+                    ? DirectoryChangeObservationStatus.Changed
+                    : DirectoryChangeObservationStatus.Unrelated;
+            }
+
+            var minimumRecordLength =
+                checked(headerLength + (int)fileNameLength);
+            if ((nextOffset & 3) != 0
+                || nextOffset < minimumRecordLength
+                || nextOffset > checked((uint)(available - offset)))
+            {
+                return DirectoryChangeObservationStatus.Unreliable;
+            }
+
+            offset = checked(offset + (int)nextOffset);
+        }
+    }
+
+    internal static void CancelDirectoryChangeObservation(
+        SafeFileHandle directory,
+        IntPtr overlapped)
+    {
+        if (directory.IsInvalid || directory.IsClosed)
+            return;
+        _ = CancelIoEx(directory, overlapped);
+        _ = GetOverlappedResult(
+            directory,
+            overlapped,
+            out _,
+            wait: true);
     }
 
     internal static FILE_ATTRIBUTE_TAG_INFO GetAttributeTagInfo(SafeFileHandle handle)
@@ -411,6 +628,59 @@ internal static class WindowsFileSystemNative
 
     [DllImport(
         "kernel32.dll",
+        EntryPoint = "CreateEventW",
+        CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    private static extern SafeWaitHandle CreateEvent(
+        IntPtr eventAttributes,
+        [MarshalAs(UnmanagedType.Bool)] bool manualReset,
+        [MarshalAs(UnmanagedType.Bool)] bool initialState,
+        string? name);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "ResetEvent",
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ResetEvent(SafeWaitHandle eventHandle);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "ReadDirectoryChangesW",
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReadDirectoryChanges(
+        SafeFileHandle directory,
+        IntPtr buffer,
+        uint bufferLength,
+        [MarshalAs(UnmanagedType.Bool)] bool watchSubtree,
+        uint notifyFilter,
+        IntPtr bytesReturned,
+        IntPtr overlapped,
+        IntPtr completionRoutine);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "GetOverlappedResult",
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetOverlappedResult(
+        SafeFileHandle file,
+        IntPtr overlapped,
+        out uint bytesTransferred,
+        [MarshalAs(UnmanagedType.Bool)] bool wait);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "CancelIoEx",
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CancelIoEx(
+        SafeFileHandle file,
+        IntPtr overlapped);
+
+    [DllImport(
+        "kernel32.dll",
         EntryPoint = "GetFileAttributesW",
         CharSet = CharSet.Unicode,
         SetLastError = true)]
@@ -502,6 +772,14 @@ internal static class WindowsFileSystemNative
     {
         Opened,
         Missing,
+    }
+
+    internal enum DirectoryChangeObservationStatus
+    {
+        Pending,
+        Unrelated,
+        Changed,
+        Unreliable,
     }
 
     internal enum StableSourceNativeBoundary

@@ -1,8 +1,10 @@
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using LocalDocumentOrganizer.Core.Transactions;
 using LocalDocumentOrganizer.Infrastructure.Windows.Storage;
+using Microsoft.Win32.SafeHandles;
 
 [assembly: InternalsVisibleTo("LocalDocumentOrganizer.Transactions.Tests")]
 
@@ -19,6 +21,7 @@ internal enum FileOperationFaultPoint
     AfterFileApplied,
     AfterEventAndProjectionCommitted,
     AfterSideEffectsPending,
+    BeforeFinalizeSourceAbsenceRevalidation,
 }
 
 internal interface IFileOperationFaultInjector
@@ -75,18 +78,25 @@ internal interface IOperationRecoveryExecutor
         CancellationToken cancellationToken);
 }
 
+internal interface ISourceAbsenceGuard : IAsyncDisposable
+{
+    bool IsStillSafelyAbsent();
+}
+
 internal sealed class OperationRecoveryObservationScope : IAsyncDisposable
 {
     internal OperationRecoveryObservationScope(
         RecoveryPathObservation source,
         RecoveryPathObservation destination,
         VerifiedStableSource? exactSource,
-        VerifiedStableSource? exactDestination = null)
+        VerifiedStableSource? exactDestination = null,
+        ISourceAbsenceGuard? sourceAbsenceGuard = null)
     {
         Source = source;
         Destination = destination;
         ExactSource = exactSource;
         ExactDestination = exactDestination;
+        SourceAbsenceGuard = sourceAbsenceGuard;
     }
 
     internal RecoveryPathObservation Source { get; }
@@ -96,6 +106,8 @@ internal sealed class OperationRecoveryObservationScope : IAsyncDisposable
     internal VerifiedStableSource? ExactSource { get; }
 
     internal VerifiedStableSource? ExactDestination { get; }
+
+    internal ISourceAbsenceGuard? SourceAbsenceGuard { get; }
 
     public async ValueTask DisposeAsync()
     {
@@ -108,11 +120,285 @@ internal sealed class OperationRecoveryObservationScope : IAsyncDisposable
         }
         finally
         {
-            if (ExactDestination is not null)
+            try
             {
-                await ExactDestination.DisposeAsync().ConfigureAwait(false);
+                if (ExactDestination is not null)
+                {
+                    await ExactDestination
+                        .DisposeAsync()
+                        .ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                if (SourceAbsenceGuard is not null)
+                {
+                    await SourceAbsenceGuard
+                        .DisposeAsync()
+                        .ConfigureAwait(false);
+                }
             }
         }
+    }
+}
+
+internal sealed class NativeSourceAbsenceGuard : ISourceAbsenceGuard
+{
+    private const int BufferLength = 64 * 1024;
+    private const int MaximumUnrelatedChangeBatches = 64;
+    private readonly string _canonicalSource;
+    private readonly string _sourceFileName;
+    private readonly SafeFileHandle _parent;
+    private readonly SafeWaitHandle _event;
+    private readonly WindowsFileSystemNative.FILE_ID_INFO _parentIdentity;
+    private IntPtr _buffer;
+    private IntPtr _overlapped;
+    private bool _disposed;
+
+    private NativeSourceAbsenceGuard(
+        string canonicalSource,
+        SafeFileHandle parent,
+        SafeWaitHandle changeEvent,
+        WindowsFileSystemNative.FILE_ID_INFO parentIdentity,
+        IntPtr buffer,
+        IntPtr overlapped)
+    {
+        _canonicalSource = canonicalSource;
+        _sourceFileName = Path.GetFileName(canonicalSource);
+        _parent = parent;
+        _event = changeEvent;
+        _parentIdentity = parentIdentity;
+        _buffer = buffer;
+        _overlapped = overlapped;
+    }
+
+    internal static NativeSourceAbsenceGuard Create(
+        string approvedRoot,
+        string sourcePath)
+    {
+        var root = new ApprovedRootPathGuard(approvedRoot).ApprovedRoot;
+        var canonicalSource = Path.GetFullPath(sourcePath);
+        var prefix = Path.EndsInDirectorySeparator(root)
+            ? root
+            : root + Path.DirectorySeparatorChar;
+        if (!canonicalSource.StartsWith(
+                prefix,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new FileSystemBoundaryException(
+                "The source path is outside the approved root.");
+        }
+
+        var parentPath = Path.GetDirectoryName(canonicalSource);
+        if (string.IsNullOrEmpty(parentPath))
+        {
+            throw new FileSystemBoundaryException(
+                "The source parent path is invalid.");
+        }
+
+        _ = new ApprovedRootPathGuard(parentPath);
+        SafeFileHandle? parent = null;
+        SafeWaitHandle? changeEvent = null;
+        var buffer = IntPtr.Zero;
+        var overlapped = IntPtr.Zero;
+        var observationStarted = false;
+        try
+        {
+            parent = WindowsFileSystemNative.OpenDirectoryChangeHandle(
+                parentPath);
+            var volume = WindowsFileSystemNative.GetStableVolumeSnapshot(
+                parent);
+            _ = StableVolumeValidator.Validate(
+                volume.IsLocal,
+                volume.HasVolumeInformation,
+                volume.FileSystemName,
+                volume.FileId.VolumeSerialNumber);
+            var parentIdentity =
+                WindowsFileSystemNative.GetFileIdInfo(parent);
+            changeEvent =
+                WindowsFileSystemNative.CreateDirectoryChangeEvent();
+            buffer = Marshal.AllocHGlobal(BufferLength);
+            overlapped = Marshal.AllocHGlobal(
+                Marshal.SizeOf<NativeOverlappedData>());
+            StartDirectoryChangeObservation(
+                parent,
+                changeEvent,
+                buffer,
+                overlapped);
+            observationStarted = true;
+            return new NativeSourceAbsenceGuard(
+                canonicalSource,
+                parent,
+                changeEvent,
+                parentIdentity,
+                buffer,
+                overlapped);
+        }
+        catch
+        {
+            if (observationStarted
+                && parent is not null)
+            {
+                WindowsFileSystemNative.CancelDirectoryChangeObservation(
+                    parent,
+                    overlapped);
+            }
+
+            if (overlapped != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(overlapped);
+            }
+
+            if (buffer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+
+            changeEvent?.Dispose();
+            parent?.Dispose();
+            throw;
+        }
+    }
+
+    public bool IsStillSafelyAbsent()
+    {
+        if (_disposed)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!HasNoSourceNameChanges())
+            {
+                return false;
+            }
+
+            var currentParent =
+                WindowsFileSystemNative.GetFileIdInfo(_parent);
+            if (!ParentIdentitiesEqual(
+                    _parentIdentity,
+                    currentParent)
+                || WindowsFileSystemNative.TryGetPathComponentInfo(
+                        _canonicalSource,
+                        out _)
+                    != WindowsFileSystemNative
+                        .PathComponentOpenOutcome.Missing)
+            {
+                return false;
+            }
+
+            return HasNoSourceNameChanges();
+        }
+        catch (Exception exception) when (
+            exception is FileSystemBoundaryException
+                or UnauthorizedAccessException
+                or IOException)
+        {
+            return false;
+        }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        if (_disposed)
+            return ValueTask.CompletedTask;
+        _disposed = true;
+        try
+        {
+            WindowsFileSystemNative.CancelDirectoryChangeObservation(
+                _parent,
+                _overlapped);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(_overlapped);
+            Marshal.FreeHGlobal(_buffer);
+            _overlapped = IntPtr.Zero;
+            _buffer = IntPtr.Zero;
+            _event.Dispose();
+            _parent.Dispose();
+        }
+
+        return ValueTask.CompletedTask;
+    }
+
+    private bool HasNoSourceNameChanges()
+    {
+        for (var batch = 0;
+             batch < MaximumUnrelatedChangeBatches;
+             batch++)
+        {
+            var status =
+                WindowsFileSystemNative.GetDirectoryChangeObservationStatus(
+                    _parent,
+                    _buffer,
+                    BufferLength,
+                    _overlapped,
+                    _sourceFileName,
+                    out _,
+                    wait: false);
+            switch (status)
+            {
+                case WindowsFileSystemNative
+                    .DirectoryChangeObservationStatus.Pending:
+                    return true;
+                case WindowsFileSystemNative
+                    .DirectoryChangeObservationStatus.Unrelated:
+                    StartDirectoryChangeObservation(
+                        _parent,
+                        _event,
+                        _buffer,
+                        _overlapped);
+                    break;
+                case WindowsFileSystemNative
+                    .DirectoryChangeObservationStatus.Changed:
+                case WindowsFileSystemNative
+                    .DirectoryChangeObservationStatus.Unreliable:
+                default:
+                    return false;
+            }
+        }
+
+        return false;
+    }
+
+    private static void StartDirectoryChangeObservation(
+        SafeFileHandle parent,
+        SafeWaitHandle changeEvent,
+        IntPtr buffer,
+        IntPtr overlapped)
+    {
+        Marshal.StructureToPtr(
+            new NativeOverlappedData
+            {
+                EventHandle = changeEvent.DangerousGetHandle(),
+            },
+            overlapped,
+            fDeleteOld: false);
+        WindowsFileSystemNative.BeginDirectoryChangeObservation(
+            parent,
+            changeEvent,
+            buffer,
+            BufferLength,
+            overlapped);
+    }
+
+    private static bool ParentIdentitiesEqual(
+        WindowsFileSystemNative.FILE_ID_INFO left,
+        WindowsFileSystemNative.FILE_ID_INFO right) =>
+        left.VolumeSerialNumber == right.VolumeSerialNumber
+        && left.FileId.LowPart == right.FileId.LowPart
+        && left.FileId.HighPart == right.FileId.HighPart;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeOverlappedData
+    {
+        internal IntPtr Internal;
+        internal IntPtr InternalHigh;
+        internal uint Offset;
+        internal uint OffsetHigh;
+        internal IntPtr EventHandle;
     }
 }
 
@@ -173,11 +459,11 @@ public sealed class OperationRecoveryCoordinator
                      .OrderBy(candidate => candidate.CreatedAtUtc)
                      .ThenBy(candidate => candidate.OperationId.Value))
         {
-            var recovered = await RecoverWithinGateAsync(
+            var recovery = await RecoverWithinGateAsync(
                     entry,
                     CancellationToken.None)
                 .ConfigureAwait(false);
-            if (recovered)
+            if (recovery is FileOperationSucceeded)
             {
                 recoveredCount++;
             }
@@ -192,7 +478,7 @@ public sealed class OperationRecoveryCoordinator
             manualRecoveryCount);
     }
 
-    private async Task<bool> RecoverWithinGateAsync(
+    internal async Task<FileOperationExecutionResult> RecoverWithinGateAsync(
         OperationJournalEntry entry,
         CancellationToken cancellationToken)
     {
@@ -207,7 +493,9 @@ public sealed class OperationRecoveryCoordinator
                         .RestoreAuthenticatedRecipeOrEscalate,
                     cancellationToken)
                 .ConfigureAwait(false);
-            return false;
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.JournalConflict,
+                OperationJournalState.ManualRecovery);
         }
 
         if (entry.Kind != FileOperationKind.SameVolumeMove)
@@ -221,7 +509,9 @@ public sealed class OperationRecoveryCoordinator
                         .InspectBothPathsWithoutMutation,
                     cancellationToken)
                 .ConfigureAwait(false);
-            return false;
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.UnexpectedJournalState,
+                OperationJournalState.ManualRecovery);
         }
 
         await using var observation = await _observer
@@ -231,40 +521,74 @@ public sealed class OperationRecoveryCoordinator
             observation.Source,
             observation.Destination);
         FileOperationExecutionResult? result = null;
-        if (decision == OperationRecoveryDecision.ResumeRename
-            && entry.State is
-                OperationJournalState.IntentPersisted
-                or OperationJournalState.IdentityLocked
-                or OperationJournalState.Renaming)
+        Exception? recoverableFailure = null;
+        try
         {
-            result = await _executor.ResumeRenameWithinGateAsync(
-                    entry,
-                    entry.RecoveryRecipe,
-                    observation,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            if (decision == OperationRecoveryDecision.ResumeRename
+                && entry.State is
+                    OperationJournalState.IntentPersisted
+                    or OperationJournalState.IdentityLocked
+                    or OperationJournalState.Renaming)
+            {
+                result = await _executor.ResumeRenameWithinGateAsync(
+                        entry,
+                        entry.RecoveryRecipe,
+                        observation,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            else if (decision
+                    == OperationRecoveryDecision.FinalizeDatabaseCommit
+                && entry.State is
+                    OperationJournalState.Renaming
+                    or OperationJournalState.FileApplied
+                    or OperationJournalState.EventAndProjectionCommitted
+                    or OperationJournalState.SideEffectsPending)
+            {
+                result = await _executor.FinalizeCommitWithinGateAsync(
+                        entry,
+                        entry.RecoveryRecipe,
+                        observation,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
         }
-        else if (decision == OperationRecoveryDecision.FinalizeDatabaseCommit
-            && entry.State is
-                OperationJournalState.Renaming
-                or OperationJournalState.FileApplied
-                or OperationJournalState.EventAndProjectionCommitted
-                or OperationJournalState.SideEffectsPending)
+        catch (Exception exception) when (
+            exception is not OperationCanceledException)
         {
-            result = await _executor.FinalizeCommitWithinGateAsync(
-                    entry,
-                    entry.RecoveryRecipe,
-                    observation,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            recoverableFailure = exception;
         }
 
         if (result is FileOperationSucceeded)
         {
-            return true;
+            return result;
         }
 
-        var reason = result is FileOperationRecoveryRequired
+        var latest = await ReloadExactAsync(entry, cancellationToken)
+            .ConfigureAwait(false);
+        if (latest.State == OperationJournalState.Completed)
+        {
+            if (latest.Identity is null)
+            {
+                throw new OperationJournalRecoveryRequiredException();
+            }
+
+            return new FileOperationSucceeded(
+                new AlreadyCommitted(
+                    latest.Intent.ExpectedStreamVersion.Next()),
+                latest.Identity);
+        }
+
+        if (latest.State == OperationJournalState.ManualRecovery)
+        {
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.UnexpectedJournalState,
+                latest.State);
+        }
+
+        var reason = recoverableFailure is not null
+            ? OperationManualRecoveryReason.ObservationFailed
+            : result is FileOperationRecoveryRequired
             {
                 Failure: FileOperationFailure.CommitConflict,
             }
@@ -276,14 +600,40 @@ public sealed class OperationRecoveryCoordinator
             ? OperationManualRecoveryAction.InspectAtomicCommitContributions
             : OperationManualRecoveryAction.InspectBothPathsWithoutMutation;
         await EnterManualRecoveryAsync(
-                entry,
+                latest,
                 observation.Source,
                 observation.Destination,
                 reason,
                 action,
                 cancellationToken)
             .ConfigureAwait(false);
-        return false;
+        return new FileOperationRecoveryRequired(
+            result is FileOperationRecoveryRequired recoveryRequired
+                ? recoveryRequired.Failure
+                : FileOperationFailure.UnexpectedJournalState,
+            OperationJournalState.ManualRecovery);
+    }
+
+    private async Task<OperationJournalEntry> ReloadExactAsync(
+        OperationJournalEntry original,
+        CancellationToken cancellationToken)
+    {
+        var latest = await _journal.GetAsync(
+                original.OperationId,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (latest is null
+            || !SqliteOperationJournalStore.IntentsEqual(
+                original.Intent,
+                latest.Intent)
+            || original.RecoveryRecipe is null
+            || !original.RecoveryRecipe.ExactEquals(
+                latest.RecoveryRecipe))
+        {
+            throw new OperationJournalRecoveryRequiredException();
+        }
+
+        return latest;
     }
 
     private async Task EnterManualRecoveryAsync(
@@ -337,16 +687,52 @@ internal sealed class HandleSafeOperationRecoveryObserver
         OperationRecoveryRecipe recipe,
         CancellationToken cancellationToken)
     {
-        var source = await ObservePathAsync(
-                entry.Intent.SourceRoot,
-                entry.Intent.SourcePath,
-                entry,
-                recipe,
-                retainExact: true,
-                cancellationToken)
-            .ConfigureAwait(false);
+        NativeSourceAbsenceGuard? sourceAbsenceGuard = null;
+        PathObservation? source = null;
         try
         {
+            try
+            {
+                sourceAbsenceGuard = NativeSourceAbsenceGuard.Create(
+                    entry.Intent.SourceRoot,
+                    entry.Intent.SourcePath);
+            }
+            catch (Exception exception) when (
+                exception is FileSystemBoundaryException
+                    or StableSourceBoundaryException
+                    or UnauthorizedAccessException
+                    or IOException)
+            {
+            }
+
+            source = await ObservePathAsync(
+                    entry.Intent.SourceRoot,
+                    entry.Intent.SourcePath,
+                    entry,
+                    recipe,
+                    retainExact: true,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (source.Observation != RecoveryPathObservation.Missing)
+            {
+                if (sourceAbsenceGuard is not null)
+                {
+                    await sourceAbsenceGuard
+                        .DisposeAsync()
+                        .ConfigureAwait(false);
+                    sourceAbsenceGuard = null;
+                }
+            }
+            else if (sourceAbsenceGuard is null
+                || !sourceAbsenceGuard.IsStillSafelyAbsent())
+            {
+                source = source with
+                {
+                    Observation =
+                        RecoveryPathObservation.InaccessibleOrUnknown,
+                };
+            }
+
             var destination = await ObservePathAsync(
                     entry.Intent.DestinationRoot,
                     entry.Intent.DestinationPath,
@@ -360,13 +746,26 @@ internal sealed class HandleSafeOperationRecoveryObserver
                 source.Observation,
                 destination.Observation,
                 source.Source,
-                destination.Source);
+                destination.Source,
+                sourceAbsenceGuard);
         }
         catch
         {
-            if (source.Source is not null)
+            try
             {
-                await source.Source.DisposeAsync().ConfigureAwait(false);
+                if (source?.Source is not null)
+                {
+                    await source.Source.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                if (sourceAbsenceGuard is not null)
+                {
+                    await sourceAbsenceGuard
+                        .DisposeAsync()
+                        .ConfigureAwait(false);
+                }
             }
 
             throw;
