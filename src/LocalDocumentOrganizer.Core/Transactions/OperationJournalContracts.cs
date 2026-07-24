@@ -50,6 +50,14 @@ public enum OperationManualRecoveryReason
     JournalStateMismatch = 3,
     ExactCommitConflict = 4,
     UnspecifiedRecoveryBoundary = 5,
+    UndoSourceMissing = 6,
+    UndoSourceIdentityMismatch = 7,
+    UndoSourceInaccessible = 8,
+    UndoDestinationCollision = 9,
+    UndoDestinationUnavailable = 10,
+    UndoDifferentVolume = 11,
+    UndoNativeAmbiguity = 12,
+    UndoRaceDetected = 13,
 }
 
 public enum OperationManualRecoveryAction
@@ -57,6 +65,8 @@ public enum OperationManualRecoveryAction
     InspectBothPathsWithoutMutation = 0,
     RestoreAuthenticatedRecipeOrEscalate = 1,
     InspectAtomicCommitContributions = 2,
+    RestoreUndoPreconditionsOrEscalate = 3,
+    InspectUndoRaceWithoutMutation = 4,
 }
 
 public sealed record OperationManualRecoveryEvidence

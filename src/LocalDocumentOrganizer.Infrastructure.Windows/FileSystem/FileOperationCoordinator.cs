@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Security.Cryptography;
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
 using LocalDocumentOrganizer.Core.Transactions;
@@ -32,7 +31,8 @@ public sealed record FileOperationExecutionRequest
         DataKeyId dataKeyId,
         AppendEventsCommand appendEvents,
         IEnumerable<FileOperationSideEffect> sideEffects,
-        FileOperationUsage? usage)
+        FileOperationUsage? usage,
+        StableFileIdentity? expectedSourceIdentity = null)
     {
         ArgumentNullException.ThrowIfNull(intent);
         ArgumentNullException.ThrowIfNull(appendEvents);
@@ -48,6 +48,15 @@ public sealed record FileOperationExecutionRequest
             throw new ArgumentException(
                 "The event append must match the file operation intent.",
                 nameof(appendEvents));
+        }
+        var isUndo = intent.Kind is
+            FileOperationKind.UndoSameVolumeMove
+            or FileOperationKind.UndoCrossVolumeMove;
+        if (isUndo != (expectedSourceIdentity is not null))
+        {
+            throw new ArgumentException(
+                "Undo execution requires an expected source identity and ordinary execution forbids it.",
+                nameof(expectedSourceIdentity));
         }
 
         var snapshot = sideEffects.ToArray();
@@ -65,7 +74,8 @@ public sealed record FileOperationExecutionRequest
             dataKeyId,
             appendEvents,
             snapshot,
-            usage);
+            usage,
+            expectedSourceIdentity);
     }
 
     public FileOperationIntent Intent { get; }
@@ -173,7 +183,9 @@ public sealed class FileOperationCoordinator :
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
-        if (request.Intent.Kind != FileOperationKind.SameVolumeMove)
+        if (request.Intent.Kind is not (
+                FileOperationKind.SameVolumeMove
+                or FileOperationKind.UndoSameVolumeMove))
         {
             return new FileOperationNotApplied(
                 FileOperationFailure.UnsupportedOperation,
@@ -232,6 +244,14 @@ public sealed class FileOperationCoordinator :
                 return await FinalizeCommitWithinGateAsync(
                         current,
                         request.RecoveryRecipe,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+
+            if (current.Kind == FileOperationKind.UndoSameVolumeMove)
+            {
+                return await _liveRecovery.RecoverWithinGateAsync(
+                        current,
                         CancellationToken.None)
                     .ConfigureAwait(false);
             }
@@ -363,6 +383,13 @@ public sealed class FileOperationCoordinator :
                     observation.ExactSource,
                     CancellationToken.None)
                 .ConfigureAwait(false);
+            if (recipe.ExpectedSourceIdentity is { } expectedIdentity
+                && !IdentitiesEqual(expectedIdentity, lockedIdentity))
+            {
+                return new FileOperationRecoveryRequired(
+                    FileOperationFailure.IdentityMismatch,
+                    current.State);
+            }
             _faults.ThrowIfRequested(
                 FileOperationFaultPoint.AfterSourceIdentityCapture);
             current = await TransitionAsync(
@@ -666,17 +693,7 @@ public sealed class FileOperationCoordinator :
     private static bool IdentitiesEqual(
         StableFileIdentity left,
         StableFileIdentity right) =>
-        left.Length == right.Length
-        && left.LastWriteTimeUtc == right.LastWriteTimeUtc
-        && CryptographicOperations.FixedTimeEquals(
-            left.VolumeId,
-            right.VolumeId)
-        && CryptographicOperations.FixedTimeEquals(
-            left.FileId,
-            right.FileId)
-        && CryptographicOperations.FixedTimeEquals(
-            left.KeyedFingerprint,
-            right.KeyedFingerprint);
+        left.FixedTimeEquals(right);
 
     private static FileOperationFailure MapFailure(
         SameVolumeFileFailure failure) =>

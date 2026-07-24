@@ -127,6 +127,8 @@ public sealed class SameVolumeFileTransaction
                 SameVolumeFileFailure.SourceChanged);
         }
 
+        faultInjector.ThrowIfRequested(
+            FileOperationFaultPoint.BeforeDestinationAdmission);
         using var destination = DestinationMutationScope.Open(
             intent.DestinationRoot,
             intent.DestinationPath);

@@ -1,7 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using LocalDocumentOrganizer.Core.Transactions;
 using LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 using Microsoft.Win32.SafeHandles;
@@ -22,6 +21,7 @@ internal enum FileOperationFaultPoint
     AfterEventAndProjectionCommitted,
     AfterSideEffectsPending,
     BeforeFinalizeSourceAbsenceRevalidation,
+    BeforeDestinationAdmission,
 }
 
 internal interface IFileOperationFaultInjector
@@ -525,7 +525,9 @@ public sealed class OperationRecoveryCoordinator
                 OperationJournalState.ManualRecovery);
         }
 
-        if (entry.Kind != FileOperationKind.SameVolumeMove)
+        if (entry.Kind is not (
+                FileOperationKind.SameVolumeMove
+                or FileOperationKind.UndoSameVolumeMove))
         {
             await EnterManualRecoveryAsync(
                     entry,
@@ -541,9 +543,51 @@ public sealed class OperationRecoveryCoordinator
                 OperationJournalState.ManualRecovery);
         }
 
-        await using var observation = await _observer
-            .ObserveAsync(entry, entry.RecoveryRecipe, cancellationToken)
-            .ConfigureAwait(false);
+        OperationRecoveryObservationScope observation;
+        try
+        {
+            observation = await _observer
+                .ObserveAsync(entry, entry.RecoveryRecipe, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (
+            exception is not OperationCanceledException
+            && entry.Kind == FileOperationKind.UndoSameVolumeMove)
+        {
+            var observerLatest = await ReloadExactAsync(entry, cancellationToken)
+                .ConfigureAwait(false);
+            if (observerLatest.State == OperationJournalState.Completed)
+            {
+                if (observerLatest.Identity is null)
+                {
+                    throw new OperationJournalRecoveryRequiredException();
+                }
+
+                return new FileOperationSucceeded(
+                    new AlreadyCommitted(
+                        observerLatest.Intent.ExpectedStreamVersion.Next()),
+                    observerLatest.Identity);
+            }
+
+            if (observerLatest.State != OperationJournalState.ManualRecovery)
+            {
+                await EnterManualRecoveryAsync(
+                        observerLatest,
+                        RecoveryPathObservation.InaccessibleOrUnknown,
+                        RecoveryPathObservation.InaccessibleOrUnknown,
+                        OperationManualRecoveryReason.UndoNativeAmbiguity,
+                        OperationManualRecoveryAction
+                            .InspectUndoRaceWithoutMutation,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.NativeFailure,
+                OperationJournalState.ManualRecovery);
+        }
+
+        await using var observationScope = observation;
         var decision = OperationJournalStateMachine.DecideSameVolumeRecovery(
             observation.Source,
             observation.Destination);
@@ -613,19 +657,32 @@ public sealed class OperationRecoveryCoordinator
                 latest.State);
         }
 
-        var reason = recoverableFailure is not null
-            ? OperationManualRecoveryReason.ObservationFailed
-            : result is FileOperationRecoveryRequired
-            {
-                Failure: FileOperationFailure.CommitConflict,
-            }
-            ? OperationManualRecoveryReason.ExactCommitConflict
-            : decision == OperationRecoveryDecision.ManualRecovery
-                ? OperationManualRecoveryReason.AmbiguousPathObservations
-                : OperationManualRecoveryReason.JournalStateMismatch;
-        var action = reason == OperationManualRecoveryReason.ExactCommitConflict
-            ? OperationManualRecoveryAction.InspectAtomicCommitContributions
-            : OperationManualRecoveryAction.InspectBothPathsWithoutMutation;
+        var reason = ClassifyManualRecoveryReason(
+            latest.Kind,
+            observation,
+            result,
+            recoverableFailure,
+            decision);
+        var action = reason switch
+        {
+            OperationManualRecoveryReason.ExactCommitConflict =>
+                OperationManualRecoveryAction
+                    .InspectAtomicCommitContributions,
+            OperationManualRecoveryReason.UndoRaceDetected
+                or OperationManualRecoveryReason.UndoNativeAmbiguity =>
+                OperationManualRecoveryAction
+                    .InspectUndoRaceWithoutMutation,
+            OperationManualRecoveryReason.UndoSourceMissing
+                or OperationManualRecoveryReason.UndoSourceIdentityMismatch
+                or OperationManualRecoveryReason.UndoSourceInaccessible
+                or OperationManualRecoveryReason.UndoDestinationCollision
+                or OperationManualRecoveryReason.UndoDestinationUnavailable
+                or OperationManualRecoveryReason.UndoDifferentVolume =>
+                OperationManualRecoveryAction
+                    .RestoreUndoPreconditionsOrEscalate,
+            _ => OperationManualRecoveryAction
+                .InspectBothPathsWithoutMutation,
+        };
         await EnterManualRecoveryAsync(
                 latest,
                 observation.Source,
@@ -639,6 +696,101 @@ public sealed class OperationRecoveryCoordinator
                 ? recoveryRequired.Failure
                 : FileOperationFailure.UnexpectedJournalState,
             OperationJournalState.ManualRecovery);
+    }
+
+    private static OperationManualRecoveryReason ClassifyManualRecoveryReason(
+        FileOperationKind kind,
+        OperationRecoveryObservationScope observation,
+        FileOperationExecutionResult? result,
+        Exception? recoverableFailure,
+        OperationRecoveryDecision decision)
+    {
+        if (kind != FileOperationKind.UndoSameVolumeMove)
+        {
+            return recoverableFailure is not null
+                ? OperationManualRecoveryReason.ObservationFailed
+                : result is FileOperationRecoveryRequired
+                {
+                    Failure: FileOperationFailure.CommitConflict,
+                }
+                    ? OperationManualRecoveryReason.ExactCommitConflict
+                    : decision == OperationRecoveryDecision.ManualRecovery
+                        ? OperationManualRecoveryReason
+                            .AmbiguousPathObservations
+                        : OperationManualRecoveryReason
+                            .JournalStateMismatch;
+        }
+
+        if (recoverableFailure is not null)
+        {
+            return OperationManualRecoveryReason.UndoNativeAmbiguity;
+        }
+
+        if (observation.Source == RecoveryPathObservation.Missing)
+        {
+            return OperationManualRecoveryReason.UndoSourceMissing;
+        }
+
+        if (observation.Source == RecoveryPathObservation.Mismatch)
+        {
+            return OperationManualRecoveryReason.UndoSourceIdentityMismatch;
+        }
+
+        if (observation.Source
+            == RecoveryPathObservation.InaccessibleOrUnknown)
+        {
+            return OperationManualRecoveryReason.UndoSourceInaccessible;
+        }
+
+        if (observation.Destination == RecoveryPathObservation.Mismatch)
+        {
+            return OperationManualRecoveryReason.UndoDestinationCollision;
+        }
+
+        if (observation.Destination
+            == RecoveryPathObservation.InaccessibleOrUnknown)
+        {
+            return OperationManualRecoveryReason
+                .UndoDestinationUnavailable;
+        }
+
+        return result switch
+        {
+            FileOperationNotApplied
+            {
+                Failure: FileOperationFailure.DestinationExists,
+            } => OperationManualRecoveryReason.UndoDestinationCollision,
+            FileOperationNotApplied
+            {
+                Failure: FileOperationFailure.DifferentVolume,
+            } => OperationManualRecoveryReason.UndoDifferentVolume,
+            FileOperationNotApplied
+            {
+                Failure: FileOperationFailure.AccessDenied
+                    or FileOperationFailure.PathRejected,
+            } => OperationManualRecoveryReason.UndoDestinationUnavailable,
+            FileOperationNotApplied
+            {
+                Failure: FileOperationFailure.NativeFailure
+                    or FileOperationFailure.SharingViolation,
+            } => OperationManualRecoveryReason.UndoNativeAmbiguity,
+            FileOperationNotApplied
+            {
+                Failure: FileOperationFailure.SourceChanged
+                    or FileOperationFailure.IdentityMismatch,
+            } => OperationManualRecoveryReason.UndoRaceDetected,
+            FileOperationRecoveryRequired
+            {
+                Failure: FileOperationFailure.DifferentVolume,
+            } => OperationManualRecoveryReason.UndoDifferentVolume,
+            FileOperationRecoveryRequired
+            {
+                Failure: FileOperationFailure.CommitConflict,
+            } => OperationManualRecoveryReason.ExactCommitConflict,
+            FileOperationRecoveryRequired =>
+                OperationManualRecoveryReason.UndoRaceDetected,
+            _ => OperationManualRecoveryReason.UndoNativeAmbiguity,
+        };
     }
 
     private async Task<OperationJournalEntry> ReloadExactAsync(
@@ -737,6 +889,10 @@ internal sealed class HandleSafeOperationRecoveryObserver
                     entry.Intent.SourcePath,
                     entry,
                     recipe,
+                    entry.Identity ?? recipe.ExpectedSourceIdentity,
+                    allowUnmeasuredSource:
+                        entry.Kind == FileOperationKind.SameVolumeMove
+                        && entry.Identity is null,
                     retainExact: true,
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -765,6 +921,8 @@ internal sealed class HandleSafeOperationRecoveryObserver
                     entry.Intent.DestinationPath,
                     entry,
                     recipe,
+                    entry.Identity,
+                    allowUnmeasuredSource: false,
                     retainExact: true,
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -804,6 +962,8 @@ internal sealed class HandleSafeOperationRecoveryObserver
         string path,
         OperationJournalEntry entry,
         OperationRecoveryRecipe recipe,
+        StableFileIdentity? expectedIdentity,
+        bool allowUnmeasuredSource,
         bool retainExact,
         CancellationToken cancellationToken)
     {
@@ -813,9 +973,9 @@ internal sealed class HandleSafeOperationRecoveryObserver
             source = new NtfsFileIdentityProvider(
                     new ApprovedRootPathGuard(root))
                 .OpenVerifiedSource(path);
-            if (entry.Identity is null)
+            if (expectedIdentity is null)
             {
-                if (retainExact)
+                if (allowUnmeasuredSource && retainExact)
                 {
                     return new PathObservation(
                         RecoveryPathObservation.Exact,
@@ -834,7 +994,7 @@ internal sealed class HandleSafeOperationRecoveryObserver
                     source,
                     cancellationToken)
                 .ConfigureAwait(false);
-            var observation = IdentitiesEqual(entry.Identity, actual)
+            var observation = IdentitiesEqual(expectedIdentity, actual)
                 ? RecoveryPathObservation.Exact
                 : RecoveryPathObservation.Mismatch;
             if (retainExact
@@ -898,17 +1058,7 @@ internal sealed class HandleSafeOperationRecoveryObserver
     private static bool IdentitiesEqual(
         StableFileIdentity left,
         StableFileIdentity right) =>
-        left.Length == right.Length
-        && left.LastWriteTimeUtc == right.LastWriteTimeUtc
-        && CryptographicOperations.FixedTimeEquals(
-            left.VolumeId,
-            right.VolumeId)
-        && CryptographicOperations.FixedTimeEquals(
-            left.FileId,
-            right.FileId)
-        && CryptographicOperations.FixedTimeEquals(
-            left.KeyedFingerprint,
-            right.KeyedFingerprint);
+        left.FixedTimeEquals(right);
 
     private sealed record PathObservation(
         RecoveryPathObservation Observation,

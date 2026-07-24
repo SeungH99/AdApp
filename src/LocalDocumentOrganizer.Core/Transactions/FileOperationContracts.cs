@@ -1,5 +1,6 @@
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
+using System.Security.Cryptography;
 
 namespace LocalDocumentOrganizer.Core.Transactions;
 
@@ -51,6 +52,32 @@ public sealed record StableFileIdentity
 
     public byte[] KeyedFingerprint => _keyedFingerprint.ToArray();
 
+    public bool FixedTimeEquals(StableFileIdentity? other)
+    {
+        if (other is null)
+        {
+            return false;
+        }
+
+        var lengthEqual = Length == other.Length;
+        var timestampEqual =
+            LastWriteTimeUtc.UtcTicks == other.LastWriteTimeUtc.UtcTicks;
+        var volumeEqual = CryptographicOperations.FixedTimeEquals(
+            _volumeId,
+            other._volumeId);
+        var fileEqual = CryptographicOperations.FixedTimeEquals(
+            _fileId,
+            other._fileId);
+        var fingerprintEqual = CryptographicOperations.FixedTimeEquals(
+            _keyedFingerprint,
+            other._keyedFingerprint);
+        return lengthEqual
+            & timestampEqual
+            & volumeEqual
+            & fileEqual
+            & fingerprintEqual;
+    }
+
     private static byte[] SnapshotNonEmpty(byte[] value, string parameterName)
     {
         ArgumentNullException.ThrowIfNull(value);
@@ -77,7 +104,8 @@ public sealed record FileOperationIntent
         string destinationRoot,
         StreamId streamId,
         StreamVersion expectedStreamVersion,
-        ReadOnlyMemory<byte> approvedProposal)
+        ReadOnlyMemory<byte> approvedProposal,
+        OperationId? originalOperationId = null)
     {
         ValidateOperationId(operationId);
         ValidateOwner(owner);
@@ -101,6 +129,26 @@ public sealed record FileOperationIntent
             throw new ArgumentOutOfRangeException(nameof(expectedStreamVersion));
         }
 
+        var isUndo = kind is
+            FileOperationKind.UndoSameVolumeMove
+            or FileOperationKind.UndoCrossVolumeMove;
+        if (isUndo
+            && (originalOperationId is null
+                || originalOperationId.Value.Value == Guid.Empty
+                || originalOperationId.Value == operationId))
+        {
+            throw new ArgumentException(
+                "An Undo operation requires a distinct original operation ID.",
+                nameof(originalOperationId));
+        }
+
+        if (!isUndo && originalOperationId is not null)
+        {
+            throw new ArgumentException(
+                "Only an Undo operation can link an original operation ID.",
+                nameof(originalOperationId));
+        }
+
         OperationId = operationId;
         Owner = owner;
         Kind = kind;
@@ -111,6 +159,7 @@ public sealed record FileOperationIntent
         StreamId = streamId;
         ExpectedStreamVersion = expectedStreamVersion;
         _approvedProposal = approvedProposal.ToArray();
+        OriginalOperationId = originalOperationId;
     }
 
     public OperationId OperationId { get; }
@@ -132,6 +181,8 @@ public sealed record FileOperationIntent
     public StreamVersion ExpectedStreamVersion { get; }
 
     public ReadOnlyMemory<byte> ApprovedProposal => _approvedProposal.ToArray();
+
+    public OperationId? OriginalOperationId { get; }
 
     private static void ValidateOperationId(OperationId operationId)
     {

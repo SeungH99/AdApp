@@ -45,7 +45,8 @@ public sealed record OperationRecoveryRecipe
         DataKeyId dataKeyId,
         AppendEventsCommand appendEvents,
         IEnumerable<FileOperationSideEffect> sideEffects,
-        FileOperationUsage? usage)
+        FileOperationUsage? usage,
+        StableFileIdentity? expectedSourceIdentity = null)
     {
         if (dataKeyId.Value == Guid.Empty)
         {
@@ -68,6 +69,9 @@ public sealed record OperationRecoveryRecipe
         AppendEvents = appendEvents;
         SideEffects = Array.AsReadOnly(snapshot);
         Usage = usage;
+        ExpectedSourceIdentitySnapshot = expectedSourceIdentity is null
+            ? null
+            : SnapshotIdentity(expectedSourceIdentity);
     }
 
     public DataKeyId DataKeyId { get; }
@@ -78,6 +82,13 @@ public sealed record OperationRecoveryRecipe
 
     public FileOperationUsage? Usage { get; }
 
+    public StableFileIdentity? ExpectedSourceIdentity =>
+        ExpectedSourceIdentitySnapshot is null
+            ? null
+            : SnapshotIdentity(ExpectedSourceIdentitySnapshot);
+
+    private StableFileIdentity? ExpectedSourceIdentitySnapshot { get; }
+
     public bool ExactEquals(OperationRecoveryRecipe? other)
     {
         if (other is null
@@ -87,7 +98,10 @@ public sealed record OperationRecoveryRecipe
             || AppendEvents.OperationId != other.AppendEvents.OperationId
             || AppendEvents.Events.Count != other.AppendEvents.Events.Count
             || SideEffects.Count != other.SideEffects.Count
-            || Usage != other.Usage)
+            || Usage != other.Usage
+            || !IdentitiesEqual(
+                ExpectedSourceIdentitySnapshot,
+                other.ExpectedSourceIdentitySnapshot))
         {
             return false;
         }
@@ -126,6 +140,22 @@ public sealed record OperationRecoveryRecipe
 
         return true;
     }
+
+    private static StableFileIdentity SnapshotIdentity(
+        StableFileIdentity identity) =>
+        new(
+            identity.VolumeId,
+            identity.FileId,
+            identity.Length,
+            identity.LastWriteTimeUtc,
+            identity.KeyedFingerprint);
+
+    private static bool IdentitiesEqual(
+        StableFileIdentity? left,
+        StableFileIdentity? right) =>
+        ReferenceEquals(left, right)
+        || left is not null
+        && left.FixedTimeEquals(right);
 
     private static bool ProtectionsEqual(
         PayloadProtection left,
