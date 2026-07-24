@@ -148,26 +148,26 @@ internal sealed class NativeSourceAbsenceGuard : ISourceAbsenceGuard
     private const int MaximumUnrelatedChangeBatches = 64;
     private readonly string _canonicalSource;
     private readonly string _sourceFileName;
+    private readonly PinnedDirectoryPathScope _pinnedAncestors;
     private readonly SafeFileHandle _parent;
     private readonly SafeWaitHandle _event;
-    private readonly WindowsFileSystemNative.FILE_ID_INFO _parentIdentity;
     private IntPtr _buffer;
     private IntPtr _overlapped;
     private bool _disposed;
 
     private NativeSourceAbsenceGuard(
         string canonicalSource,
+        PinnedDirectoryPathScope pinnedAncestors,
         SafeFileHandle parent,
         SafeWaitHandle changeEvent,
-        WindowsFileSystemNative.FILE_ID_INFO parentIdentity,
         IntPtr buffer,
         IntPtr overlapped)
     {
         _canonicalSource = canonicalSource;
         _sourceFileName = Path.GetFileName(canonicalSource);
+        _pinnedAncestors = pinnedAncestors;
         _parent = parent;
         _event = changeEvent;
-        _parentIdentity = parentIdentity;
         _buffer = buffer;
         _overlapped = overlapped;
     }
@@ -176,19 +176,9 @@ internal sealed class NativeSourceAbsenceGuard : ISourceAbsenceGuard
         string approvedRoot,
         string sourcePath)
     {
-        var root = new ApprovedRootPathGuard(approvedRoot).ApprovedRoot;
-        var canonicalSource = Path.GetFullPath(sourcePath);
-        var prefix = Path.EndsInDirectorySeparator(root)
-            ? root
-            : root + Path.DirectorySeparatorChar;
-        if (!canonicalSource.StartsWith(
-                prefix,
-                StringComparison.OrdinalIgnoreCase))
-        {
-            throw new FileSystemBoundaryException(
-                "The source path is outside the approved root.");
-        }
-
+        var rootGuard = new ApprovedRootPathGuard(approvedRoot);
+        var canonicalSource =
+            rootGuard.CanonicalizeContainedPath(sourcePath);
         var parentPath = Path.GetDirectoryName(canonicalSource);
         if (string.IsNullOrEmpty(parentPath))
         {
@@ -196,7 +186,7 @@ internal sealed class NativeSourceAbsenceGuard : ISourceAbsenceGuard
                 "The source parent path is invalid.");
         }
 
-        _ = new ApprovedRootPathGuard(parentPath);
+        PinnedDirectoryPathScope? pinnedAncestors = null;
         SafeFileHandle? parent = null;
         SafeWaitHandle? changeEvent = null;
         var buffer = IntPtr.Zero;
@@ -204,6 +194,8 @@ internal sealed class NativeSourceAbsenceGuard : ISourceAbsenceGuard
         var observationStarted = false;
         try
         {
+            pinnedAncestors =
+                rootGuard.OpenPinnedDirectoryPath(parentPath);
             parent = WindowsFileSystemNative.OpenDirectoryChangeHandle(
                 parentPath);
             var volume = WindowsFileSystemNative.GetStableVolumeSnapshot(
@@ -215,6 +207,14 @@ internal sealed class NativeSourceAbsenceGuard : ISourceAbsenceGuard
                 volume.FileId.VolumeSerialNumber);
             var parentIdentity =
                 WindowsFileSystemNative.GetFileIdInfo(parent);
+            if (!ParentIdentitiesEqual(
+                    pinnedAncestors.FinalIdentity,
+                    parentIdentity))
+            {
+                throw new FileSystemBoundaryException(
+                    "The watched source parent did not match its retained path component.");
+            }
+
             changeEvent =
                 WindowsFileSystemNative.CreateDirectoryChangeEvent();
             buffer = Marshal.AllocHGlobal(BufferLength);
@@ -228,9 +228,9 @@ internal sealed class NativeSourceAbsenceGuard : ISourceAbsenceGuard
             observationStarted = true;
             return new NativeSourceAbsenceGuard(
                 canonicalSource,
+                pinnedAncestors,
                 parent,
                 changeEvent,
-                parentIdentity,
                 buffer,
                 overlapped);
         }
@@ -254,8 +254,22 @@ internal sealed class NativeSourceAbsenceGuard : ISourceAbsenceGuard
                 Marshal.FreeHGlobal(buffer);
             }
 
-            changeEvent?.Dispose();
-            parent?.Dispose();
+            try
+            {
+                changeEvent?.Dispose();
+            }
+            finally
+            {
+                try
+                {
+                    parent?.Dispose();
+                }
+                finally
+                {
+                    pinnedAncestors?.Dispose();
+                }
+            }
+
             throw;
         }
     }
@@ -277,7 +291,7 @@ internal sealed class NativeSourceAbsenceGuard : ISourceAbsenceGuard
             var currentParent =
                 WindowsFileSystemNative.GetFileIdInfo(_parent);
             if (!ParentIdentitiesEqual(
-                    _parentIdentity,
+                    _pinnedAncestors.FinalIdentity,
                     currentParent)
                 || WindowsFileSystemNative.TryGetPathComponentInfo(
                         _canonicalSource,
@@ -316,8 +330,21 @@ internal sealed class NativeSourceAbsenceGuard : ISourceAbsenceGuard
             Marshal.FreeHGlobal(_buffer);
             _overlapped = IntPtr.Zero;
             _buffer = IntPtr.Zero;
-            _event.Dispose();
-            _parent.Dispose();
+            try
+            {
+                _event.Dispose();
+            }
+            finally
+            {
+                try
+                {
+                    _parent.Dispose();
+                }
+                finally
+                {
+                    _pinnedAncestors.Dispose();
+                }
+            }
         }
 
         return ValueTask.CompletedTask;

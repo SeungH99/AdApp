@@ -136,12 +136,29 @@ internal static class WindowsFileSystemNative
 
     internal static PathComponentOpenOutcome OpenPinnedPathComponent(
         string canonicalPath,
+        out SafeFileHandle? handle) =>
+        OpenPinnedPathComponent(
+            canonicalPath,
+            desiredAccess: 0,
+            out handle);
+
+    internal static PathComponentOpenOutcome OpenPinnedDirectoryPathComponent(
+        string canonicalPath,
+        out SafeFileHandle? handle) =>
+        OpenPinnedPathComponent(
+            canonicalPath,
+            FileListDirectory,
+            out handle);
+
+    private static PathComponentOpenOutcome OpenPinnedPathComponent(
+        string canonicalPath,
+        uint desiredAccess,
         out SafeFileHandle? handle)
     {
         RequireWindows();
         var opened = CreateFile(
             ToExtendedPath(canonicalPath),
-            desiredAccess: 0,
+            desiredAccess,
             FileShareRead | FileShareWrite,
             IntPtr.Zero,
             OpenExisting,

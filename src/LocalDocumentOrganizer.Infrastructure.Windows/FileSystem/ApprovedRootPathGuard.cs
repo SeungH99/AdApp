@@ -25,6 +25,90 @@ public sealed class ApprovedRootPathGuard
 
     public string ApprovedRoot { get; }
 
+    internal string CanonicalizeContainedPath(string candidatePath) =>
+        RequireContainedCanonicalPath(candidatePath);
+
+    internal PinnedDirectoryPathScope OpenPinnedDirectoryPath(
+        string candidateDirectory)
+    {
+        var canonical = RequireContainedCanonicalPath(candidateDirectory);
+        var components = EnumerateComponents(
+                canonical,
+                ApprovedRoot)
+            .ToArray();
+        var pinned = new List<SafeFileHandle>(components.Length);
+        ulong? pinnedVolumeId = null;
+        try
+        {
+            foreach (var component in components)
+            {
+                var outcome = WindowsFileSystemNative
+                    .OpenPinnedDirectoryPathComponent(
+                        component,
+                        out var handle);
+                if (outcome
+                        == WindowsFileSystemNative
+                            .PathComponentOpenOutcome.Missing
+                    || handle is null)
+                {
+                    throw new FileSystemBoundaryException(
+                        "An approved directory-path component is unavailable.");
+                }
+
+                try
+                {
+                    var information =
+                        WindowsFileSystemNative.GetAttributeTagInfo(handle);
+                    if ((information.FileAttributes
+                            & WindowsFileSystemNative
+                                .FileAttributeReparsePoint) != 0
+                        || (information.FileAttributes
+                            & WindowsFileSystemNative
+                                .FileAttributeDirectory) == 0)
+                    {
+                        throw new FileSystemBoundaryException(
+                            "An approved path component is not a regular directory.");
+                    }
+
+                    var volume =
+                        WindowsFileSystemNative.GetStableVolumeSnapshot(
+                            handle);
+                    var volumeId = StableVolumeValidator.Validate(
+                        volume.IsLocal,
+                        volume.HasVolumeInformation,
+                        volume.FileSystemName,
+                        volume.FileId.VolumeSerialNumber);
+                    if (pinnedVolumeId is not null
+                        && pinnedVolumeId.Value != volumeId)
+                    {
+                        throw new FileSystemBoundaryException(
+                            "Approved directory-path components crossed volumes.");
+                    }
+
+                    pinnedVolumeId = volumeId;
+                    pinned.Add(handle);
+                }
+                catch
+                {
+                    handle.Dispose();
+                    throw;
+                }
+            }
+
+            var finalIdentity = WindowsFileSystemNative.GetFileIdInfo(
+                pinned[^1]);
+            return new PinnedDirectoryPathScope(
+                canonical,
+                finalIdentity,
+                pinned);
+        }
+        catch
+        {
+            PinnedDirectoryPathScope.DisposeHandles(pinned);
+            throw;
+        }
+    }
+
     public VerifiedStableSource OpenVerifiedSource(string candidatePath)
     {
         var canonical = RequireContainedCanonicalPath(candidatePath);
@@ -211,4 +295,35 @@ public sealed class ApprovedRootPathGuard
     private readonly record struct ComponentInspection(
         bool TargetExists,
         uint TargetAttributes);
+}
+
+internal sealed class PinnedDirectoryPathScope : IDisposable
+{
+    private readonly List<SafeFileHandle> _handles;
+
+    internal PinnedDirectoryPathScope(
+        string canonicalPath,
+        WindowsFileSystemNative.FILE_ID_INFO finalIdentity,
+        List<SafeFileHandle> handles)
+    {
+        CanonicalPath = canonicalPath;
+        FinalIdentity = finalIdentity;
+        _handles = handles;
+    }
+
+    internal string CanonicalPath { get; }
+
+    internal WindowsFileSystemNative.FILE_ID_INFO FinalIdentity { get; }
+
+    public void Dispose() => DisposeHandles(_handles);
+
+    internal static void DisposeHandles(List<SafeFileHandle> handles)
+    {
+        for (var index = handles.Count - 1; index >= 0; index--)
+        {
+            handles[index].Dispose();
+        }
+
+        handles.Clear();
+    }
 }
