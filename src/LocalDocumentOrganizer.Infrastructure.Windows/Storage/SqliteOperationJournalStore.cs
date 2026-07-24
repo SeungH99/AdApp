@@ -523,7 +523,10 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 command.NextState == OperationJournalState.IdentityLocked
                     ? command.Identity
                     : current.Identity;
-            RequireCanonicalIdentity(command.NextState, nextIdentity);
+            RequireCanonicalIdentity(
+                command.NextState,
+                nextRevision,
+                nextIdentity);
             RequireCanonicalCommitFingerprint(
                 row.Kind,
                 command.NextState,
@@ -888,7 +891,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         StableFileIdentity? identity,
         ReadOnlySpan<byte> commitFingerprint = default)
     {
-        RequireCanonicalIdentity(state, identity);
+        RequireCanonicalIdentity(state, revision, identity);
         var plaintext = SerializeIntent(
             intent,
             identity,
@@ -954,6 +957,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         payload.CommitFingerprint);
                     RequireCanonicalIdentity(
                         row.State,
+                        row.Revision,
                         payload.Identity);
                     return ValueTask.FromResult(
                         new DecryptedOperationJournalPayload(
@@ -998,6 +1002,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
 
     private static void RequireCanonicalIdentity(
         OperationJournalState state,
+        long revision,
         StableFileIdentity? identity)
     {
         if (state == OperationJournalState.IntentPersisted)
@@ -1008,7 +1013,14 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         }
 
         if (state == OperationJournalState.ManualRecovery)
+        {
+            if (revision < 2
+                || (revision == 2) != (identity is null))
+            {
+                throw new OperationJournalRecoveryRequiredException();
+            }
             return;
+        }
         if (identity is null)
             throw new OperationJournalRecoveryRequiredException();
     }

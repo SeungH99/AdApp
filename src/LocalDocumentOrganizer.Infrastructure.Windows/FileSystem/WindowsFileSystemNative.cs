@@ -193,8 +193,8 @@ internal static class WindowsFileSystemNative
         SafeFileHandle handle)
     {
         RequireUsableHandle(handle);
-        var isLocal = IsLocalFileHandle(handle);
-        if (!isLocal)
+        var volume = GetStableVolumeSnapshot(handle);
+        if (!volume.IsLocal)
         {
             return new StableSourceSnapshot(
                 IsLocal: false,
@@ -205,11 +205,10 @@ internal static class WindowsFileSystemNative
                 DateTimeOffset.UnixEpoch);
         }
 
-        var fileSystemName = GetVolumeFileSystemName(handle);
-        if (fileSystemName is null)
+        if (!volume.HasVolumeInformation)
         {
             return new StableSourceSnapshot(
-                isLocal,
+                volume.IsLocal,
                 HasVolumeInformation: false,
                 string.Empty,
                 default,
@@ -217,7 +216,6 @@ internal static class WindowsFileSystemNative
                 DateTimeOffset.UnixEpoch);
         }
 
-        var fileId = GetFileIdInfo(handle);
         var standard = GetStandardInfo(handle);
         if (standard.EndOfFile < 0)
         {
@@ -241,12 +239,40 @@ internal static class WindowsFileSystemNative
         }
 
         return new StableSourceSnapshot(
-            isLocal,
+            volume.IsLocal,
             HasVolumeInformation: true,
-            fileSystemName,
-            fileId,
+            volume.FileSystemName,
+            volume.FileId,
             standard.EndOfFile,
             lastWriteTimeUtc);
+    }
+
+    internal static StableVolumeSnapshot GetStableVolumeSnapshot(
+        SafeFileHandle handle)
+    {
+        RequireUsableHandle(handle);
+        var isLocal = IsLocalFileHandle(handle);
+        if (!isLocal)
+        {
+            return new StableVolumeSnapshot(
+                IsLocal: false,
+                HasVolumeInformation: false,
+                string.Empty,
+                default);
+        }
+
+        var fileSystemName = GetVolumeFileSystemName(handle);
+        return fileSystemName is null
+            ? new StableVolumeSnapshot(
+                isLocal,
+                HasVolumeInformation: false,
+                string.Empty,
+                default)
+            : new StableVolumeSnapshot(
+                isLocal,
+                HasVolumeInformation: true,
+                fileSystemName,
+                GetFileIdInfo(handle));
     }
 
     private static bool IsLocalFileHandle(SafeFileHandle handle)
@@ -574,6 +600,12 @@ internal static class WindowsFileSystemNative
         FILE_ID_INFO FileId,
         long Length,
         DateTimeOffset LastWriteTimeUtc);
+
+    internal readonly record struct StableVolumeSnapshot(
+        bool IsLocal,
+        bool HasVolumeInformation,
+        string FileSystemName,
+        FILE_ID_INFO FileId);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct FILE_RENAME_INFO_EX

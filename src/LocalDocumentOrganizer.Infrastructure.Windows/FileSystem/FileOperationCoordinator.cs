@@ -163,19 +163,35 @@ public sealed class FileOperationCoordinator : IFileOperationExecutor
                 DurableState: null);
         }
 
-        if (current.State != OperationJournalState.IntentPersisted)
-        {
-            return new FileOperationRecoveryRequired(
-                FileOperationFailure.UnexpectedJournalState,
-                current.State);
-        }
-
         await using var writer = await _mutationGate
             .AcquireAsync(CancellationToken.None)
             .ConfigureAwait(false);
         var durableState = current.State;
         try
         {
+            current = await _journal
+                .GetAsync(
+                    request.Intent.OperationId,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            if (current is null
+                || !SqliteOperationJournalStore.IntentsEqual(
+                    current.Intent,
+                    request.Intent))
+            {
+                return new FileOperationRecoveryRequired(
+                    FileOperationFailure.JournalConflict,
+                    durableState);
+            }
+
+            durableState = current.State;
+            var reconciled = await ReconcileAdvancedStateAsync(
+                    request,
+                    current)
+                .ConfigureAwait(false);
+            if (reconciled is not null)
+                return reconciled;
+
             var guard = new ApprovedRootPathGuard(request.Intent.SourceRoot);
             var identityProvider = new NtfsFileIdentityProvider(guard);
             await using var source = identityProvider.OpenVerifiedSource(
@@ -260,38 +276,17 @@ public sealed class FileOperationCoordinator : IFileOperationExecutor
             }
             durableState = current.State;
 
-            var commit = new CommitFileOperationCommand(
-                request.Intent.OperationId,
-                current.Revision,
-                request.AppendEvents,
-                request.SideEffects,
-                request.Usage);
-            var committed = await _commitStore
-                .CommitAppliedAsync(commit, CancellationToken.None)
+            return await CommitExactAsync(
+                    request,
+                    current.Revision,
+                    verifiedIdentity,
+                    OperationJournalState.FileApplied)
                 .ConfigureAwait(false);
-            return committed switch
-            {
-                OperationCommitted or AlreadyCommitted =>
-                    new FileOperationSucceeded(
-                        committed,
-                        verifiedIdentity),
-                OperationCommitConflict =>
-                    new FileOperationRecoveryRequired(
-                        FileOperationFailure.CommitConflict,
-                        OperationJournalState.FileApplied),
-                OperationCommitStorageBusy =>
-                    new FileOperationRecoveryRequired(
-                        FileOperationFailure.CommitStorageBusy,
-                        OperationJournalState.FileApplied),
-                _ => new FileOperationRecoveryRequired(
-                    FileOperationFailure.NativeFailure,
-                    OperationJournalState.FileApplied),
-            };
         }
-        catch (StableSourceBoundaryException)
+        catch (StableSourceBoundaryException exception)
         {
             return CreateFileSystemFailureResult(
-                FileOperationFailure.PathRejected,
+                MapSourceFailure(exception),
                 durableState);
         }
         catch (FileSystemBoundaryException exception)
@@ -318,6 +313,81 @@ public sealed class FileOperationCoordinator : IFileOperationExecutor
                 MapBoundaryFailure(exception),
                 durableState);
         }
+    }
+
+    private async Task<FileOperationExecutionResult?> ReconcileAdvancedStateAsync(
+        FileOperationExecutionRequest request,
+        OperationJournalEntry current)
+    {
+        if (current.State == OperationJournalState.IntentPersisted)
+            return null;
+
+        if (current.State is OperationJournalState.IdentityLocked
+            or OperationJournalState.Renaming
+            or OperationJournalState.ManualRecovery)
+        {
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.UnexpectedJournalState,
+                current.State);
+        }
+
+        if (current.State is not (
+                OperationJournalState.FileApplied
+                or OperationJournalState.EventAndProjectionCommitted
+                or OperationJournalState.SideEffectsPending
+                or OperationJournalState.Completed))
+        {
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.UnexpectedJournalState,
+                current.State);
+        }
+
+        if (current.Identity is null)
+        {
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.JournalConflict,
+                current.State);
+        }
+
+        return await CommitExactAsync(
+                request,
+                expectedFileAppliedRevision: 4,
+                current.Identity,
+                current.State)
+            .ConfigureAwait(false);
+    }
+
+    private async Task<FileOperationExecutionResult> CommitExactAsync(
+        FileOperationExecutionRequest request,
+        long expectedFileAppliedRevision,
+        StableFileIdentity identity,
+        OperationJournalState durableState)
+    {
+        var commit = new CommitFileOperationCommand(
+            request.Intent.OperationId,
+            expectedFileAppliedRevision,
+            request.AppendEvents,
+            request.SideEffects,
+            request.Usage);
+        var committed = await _commitStore
+            .CommitAppliedAsync(commit, CancellationToken.None)
+            .ConfigureAwait(false);
+        return committed switch
+        {
+            OperationCommitted or AlreadyCommitted =>
+                new FileOperationSucceeded(committed, identity),
+            OperationCommitConflict =>
+                new FileOperationRecoveryRequired(
+                    FileOperationFailure.CommitConflict,
+                    durableState),
+            OperationCommitStorageBusy =>
+                new FileOperationRecoveryRequired(
+                    FileOperationFailure.CommitStorageBusy,
+                    durableState),
+            _ => new FileOperationRecoveryRequired(
+                FileOperationFailure.NativeFailure,
+                durableState),
+        };
     }
 
     private async Task<OperationJournalEntry?> TransitionAsync(
@@ -394,7 +464,31 @@ public sealed class FileOperationCoordinator : IFileOperationExecutor
             };
         }
 
-        return FileOperationFailure.NativeFailure;
+        return FileOperationFailure.PathRejected;
+    }
+
+    private static FileOperationFailure MapSourceFailure(
+        StableSourceBoundaryException exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        for (Exception? current = exception.InnerException;
+             current is not null;
+             current = current.InnerException)
+        {
+            if (current is not Win32Exception native)
+                continue;
+            return native.NativeErrorCode switch
+            {
+                5 => FileOperationFailure.AccessDenied,
+                32 or 33 => FileOperationFailure.SharingViolation,
+                50 when exception.Failure
+                    == StableSourceBoundaryFailure.UnsupportedVolume =>
+                    FileOperationFailure.PathRejected,
+                _ => FileOperationFailure.NativeFailure,
+            };
+        }
+
+        return FileOperationFailure.PathRejected;
     }
 
     private static FileOperationExecutionResult CreateFileSystemFailureResult(

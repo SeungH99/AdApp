@@ -77,6 +77,11 @@ public sealed class SameVolumeFileTransaction
         {
             result = new SameVolumeFileNotApplied(MapFailure(exception));
         }
+        catch (StableSourceBoundaryException)
+        {
+            result = new SameVolumeFileNotApplied(
+                SameVolumeFileFailure.PathRejected);
+        }
         catch (UnauthorizedAccessException)
         {
             result = new SameVolumeFileNotApplied(
@@ -604,12 +609,18 @@ public sealed class SameVolumeFileTransaction
                     return Failed(canonicalDestination, failure, pinned);
                 }
 
-                var parentIdentity =
-                    WindowsFileSystemNative.GetFileIdInfo(pinned[^1]);
+                var parentVolume =
+                    WindowsFileSystemNative.GetStableVolumeSnapshot(
+                        pinned[^1]);
+                var parentVolumeId = StableVolumeValidator.Validate(
+                    parentVolume.IsLocal,
+                    parentVolume.HasVolumeInformation,
+                    parentVolume.FileSystemName,
+                    parentVolume.FileId.VolumeSerialNumber);
                 return new DestinationMutationScope(
                     canonicalDestination,
                     parent,
-                    parentIdentity.VolumeSerialNumber,
+                    parentVolumeId,
                     failure: null,
                     pinned);
             }

@@ -149,6 +149,33 @@ internal static class StableSourceValidator
         ulong fileIdLow,
         ulong fileIdHigh)
     {
+        var validatedVolumeId = StableVolumeValidator.Validate(
+            isLocal,
+            hasVolumeInformation,
+            fileSystemName,
+            volumeId);
+
+        if (fileIdLow == 0 && fileIdHigh == 0)
+        {
+            throw new StableSourceBoundaryException(
+                StableSourceBoundaryFailure.MissingFileId);
+        }
+
+        return new ValidatedStableSourceIdentifiers(
+            validatedVolumeId,
+            fileIdLow,
+            fileIdHigh);
+    }
+}
+
+internal static class StableVolumeValidator
+{
+    internal static ulong Validate(
+        bool isLocal,
+        bool hasVolumeInformation,
+        string fileSystemName,
+        ulong volumeId)
+    {
         if (!isLocal)
         {
             throw new StableSourceBoundaryException(
@@ -176,16 +203,7 @@ internal static class StableSourceValidator
                 StableSourceBoundaryFailure.MissingVolumeId);
         }
 
-        if (fileIdLow == 0 && fileIdHigh == 0)
-        {
-            throw new StableSourceBoundaryException(
-                StableSourceBoundaryFailure.MissingFileId);
-        }
-
-        return new ValidatedStableSourceIdentifiers(
-            volumeId,
-            fileIdLow,
-            fileIdHigh);
+        return volumeId;
     }
 }
 
