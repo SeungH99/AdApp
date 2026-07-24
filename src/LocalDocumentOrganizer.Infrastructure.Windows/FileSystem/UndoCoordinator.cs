@@ -75,6 +75,7 @@ public sealed class UndoCoordinator
 {
     private readonly IOperationJournalStore _journal;
     private readonly IFileOperationExecutor _executor;
+    private readonly OperationRecoveryReadiness _readiness;
 
     public UndoCoordinator(
         IOperationJournalStore journal,
@@ -91,6 +92,7 @@ public sealed class UndoCoordinator
         ArgumentNullException.ThrowIfNull(executor);
         _journal = journal;
         _executor = executor;
+        _readiness = executor.Readiness;
     }
 
     public async Task<FileOperationExecutionResult> ExecuteAsync(
@@ -98,6 +100,8 @@ public sealed class UndoCoordinator
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
+        await _readiness.WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
         var original = await _journal.GetAsync(
                 request.OriginalOperationId,
                 cancellationToken)

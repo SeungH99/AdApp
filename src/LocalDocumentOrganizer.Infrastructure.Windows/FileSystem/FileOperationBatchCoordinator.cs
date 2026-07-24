@@ -32,11 +32,13 @@ public sealed record FileOperationBatchExecutionResult
 public sealed class FileOperationBatchCoordinator
 {
     private readonly IFileOperationExecutor _executor;
+    private readonly OperationRecoveryReadiness _readiness;
 
     public FileOperationBatchCoordinator(IFileOperationExecutor executor)
     {
         ArgumentNullException.ThrowIfNull(executor);
         _executor = executor;
+        _readiness = executor.Readiness;
     }
 
     public async Task<FileOperationBatchExecutionResult> ExecuteAsync(
@@ -64,6 +66,19 @@ public sealed class FileOperationBatchCoordinator
             throw new ArgumentException(
                 "A batch must contain independent operation IDs.",
                 nameof(requests));
+        }
+
+        try
+        {
+            await _readiness.WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            return new FileOperationBatchExecutionResult(
+                [],
+                stoppedByCancellation: true);
         }
 
         var results = new List<FileOperationBatchItemResult>(snapshot.Length);

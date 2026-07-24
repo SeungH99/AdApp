@@ -779,6 +779,13 @@ internal sealed class NativeCrossVolumeFileSystemSession
 
 }
 
+internal delegate bool NativeCrossVolumeSetDisposition(
+    SafeFileHandle handle,
+    WindowsFileSystemNative.FileInfoByHandleClass informationClass,
+    IntPtr buffer,
+    uint bufferSize,
+    out int error);
+
 internal static class NativeCrossVolumeHandleDeletion
 {
     private const int ErrorInvalidFunction = 1;
@@ -824,9 +831,26 @@ internal static class NativeCrossVolumeHandleDeletion
                     cleanupFailure));
     }
 
+    private static void RequireSingleLink(SafeFileHandle handle)
+    {
+        if (WindowsFileSystemNative.GetLinkCount(handle) != 1)
+        {
+            throw new StableSourceBoundaryException(
+                StableSourceBoundaryFailure.MultipleHardLinks);
+        }
+    }
+
     internal static void SetDeleteDisposition(SafeFileHandle handle)
     {
+        SetDeleteDisposition(handle, SetNativeDisposition);
+    }
+
+    internal static void SetDeleteDisposition(
+        SafeFileHandle handle,
+        NativeCrossVolumeSetDisposition setDisposition)
+    {
         ArgumentNullException.ThrowIfNull(handle);
+        ArgumentNullException.ThrowIfNull(setDisposition);
         var information =
             new WindowsFileSystemNative.FILE_DISPOSITION_INFO_EX
             {
@@ -843,23 +867,24 @@ internal static class NativeCrossVolumeHandleDeletion
         try
         {
             Marshal.StructureToPtr(information, buffer, fDeleteOld: false);
-            if (WindowsFileSystemNative.SetFileInformationByHandle(
+            RequireSingleLink(handle);
+            if (setDisposition(
                     handle,
                     WindowsFileSystemNative.FileInfoByHandleClass
                         .FileDispositionInfoEx,
                     buffer,
-                    size))
+                    size,
+                    out var error))
             {
                 return;
             }
 
-            var error = Marshal.GetLastPInvokeError();
             if (error is
                 ErrorInvalidFunction
                 or ErrorNotSupported
                 or ErrorInvalidParameter)
             {
-                SetLegacyDeleteDisposition(handle);
+                SetLegacyDeleteDisposition(handle, setDisposition);
                 return;
             }
 
@@ -874,7 +899,8 @@ internal static class NativeCrossVolumeHandleDeletion
     }
 
     private static void SetLegacyDeleteDisposition(
-        SafeFileHandle handle)
+        SafeFileHandle handle,
+        NativeCrossVolumeSetDisposition setDisposition)
     {
         var information =
             new WindowsFileSystemNative.FILE_DISPOSITION_INFO
@@ -891,17 +917,18 @@ internal static class NativeCrossVolumeHandleDeletion
                 information,
                 buffer,
                 fDeleteOld: false);
-            if (WindowsFileSystemNative.SetFileInformationByHandle(
+            RequireSingleLink(handle);
+            if (setDisposition(
                     handle,
                     WindowsFileSystemNative.FileInfoByHandleClass
                         .FileDispositionInfo,
                     buffer,
-                    size))
+                    size,
+                    out var error))
             {
                 return;
             }
 
-            var error = Marshal.GetLastPInvokeError();
             throw error is
                     ErrorInvalidFunction
                     or ErrorNotSupported
@@ -917,6 +944,23 @@ internal static class NativeCrossVolumeHandleDeletion
         {
             Marshal.FreeHGlobal(buffer);
         }
+    }
+
+    private static bool SetNativeDisposition(
+        SafeFileHandle handle,
+        WindowsFileSystemNative.FileInfoByHandleClass informationClass,
+        IntPtr buffer,
+        uint bufferSize,
+        out int error)
+    {
+        var succeeded =
+            WindowsFileSystemNative.SetFileInformationByHandle(
+                handle,
+                informationClass,
+                buffer,
+                bufferSize);
+        error = succeeded ? 0 : Marshal.GetLastPInvokeError();
+        return succeeded;
     }
 }
 

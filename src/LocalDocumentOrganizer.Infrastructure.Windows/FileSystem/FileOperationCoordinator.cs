@@ -119,6 +119,8 @@ public sealed record FileOperationUnexpectedFailure
 
 public interface IFileOperationExecutor
 {
+    OperationRecoveryReadiness Readiness { get; }
+
     Task<FileOperationExecutionResult> ExecuteAsync(
         FileOperationExecutionRequest request,
         CancellationToken cancellationToken);
@@ -138,13 +140,15 @@ public sealed class FileOperationCoordinator :
         _sideEffectDispatcher;
     private readonly IFileOperationFaultInjector _faults;
     private readonly OperationRecoveryCoordinator _liveRecovery;
+    private readonly OperationRecoveryReadiness _readiness;
 
     public FileOperationCoordinator(
         IOperationJournalStore journal,
         FileMutationGate mutationGate,
         VaultFileFingerprintService fingerprints,
         SameVolumeFileTransaction sameVolume,
-        IOperationCommitStore commitStore)
+        IOperationCommitStore commitStore,
+        OperationRecoveryReadiness readiness)
         : this(
             journal,
             mutationGate,
@@ -153,7 +157,8 @@ public sealed class FileOperationCoordinator :
             new CrossVolumeFileTransaction(),
             commitStore,
             sideEffectDispatcher: null,
-            NoOpFileOperationFaultInjector.Instance)
+            NoOpFileOperationFaultInjector.Instance,
+            readiness)
     {
     }
 
@@ -163,7 +168,8 @@ public sealed class FileOperationCoordinator :
         VaultFileFingerprintService fingerprints,
         SameVolumeFileTransaction sameVolume,
         IOperationCommitStore commitStore,
-        IOperationSideEffectDispatcher sideEffectDispatcher)
+        IOperationSideEffectDispatcher sideEffectDispatcher,
+        OperationRecoveryReadiness readiness)
         : this(
             journal,
             mutationGate,
@@ -172,7 +178,8 @@ public sealed class FileOperationCoordinator :
             new CrossVolumeFileTransaction(),
             commitStore,
             sideEffectDispatcher,
-            NoOpFileOperationFaultInjector.Instance)
+            NoOpFileOperationFaultInjector.Instance,
+            readiness)
     {
     }
 
@@ -182,7 +189,8 @@ public sealed class FileOperationCoordinator :
         VaultFileFingerprintService fingerprints,
         SameVolumeFileTransaction sameVolume,
         IOperationCommitStore commitStore,
-        IFileOperationFaultInjector faultInjector)
+        IFileOperationFaultInjector faultInjector,
+        OperationRecoveryReadiness readiness)
         : this(
             journal,
             mutationGate,
@@ -191,7 +199,8 @@ public sealed class FileOperationCoordinator :
             new CrossVolumeFileTransaction(),
             commitStore,
             sideEffectDispatcher: null,
-            faultInjector)
+            faultInjector,
+            readiness)
     {
     }
 
@@ -202,7 +211,8 @@ public sealed class FileOperationCoordinator :
         SameVolumeFileTransaction sameVolume,
         IOperationCommitStore commitStore,
         IOperationSideEffectDispatcher sideEffectDispatcher,
-        IFileOperationFaultInjector faultInjector)
+        IFileOperationFaultInjector faultInjector,
+        OperationRecoveryReadiness readiness)
         : this(
             journal,
             mutationGate,
@@ -211,7 +221,8 @@ public sealed class FileOperationCoordinator :
             new CrossVolumeFileTransaction(),
             commitStore,
             sideEffectDispatcher,
-            faultInjector)
+            faultInjector,
+            readiness)
     {
     }
 
@@ -222,7 +233,8 @@ public sealed class FileOperationCoordinator :
         SameVolumeFileTransaction sameVolume,
         CrossVolumeFileTransaction crossVolume,
         IOperationCommitStore commitStore,
-        IFileOperationFaultInjector faultInjector)
+        IFileOperationFaultInjector faultInjector,
+        OperationRecoveryReadiness readiness)
         : this(
             journal,
             mutationGate,
@@ -231,7 +243,8 @@ public sealed class FileOperationCoordinator :
             crossVolume,
             commitStore,
             sideEffectDispatcher: null,
-            faultInjector)
+            faultInjector,
+            readiness)
     {
     }
 
@@ -243,7 +256,8 @@ public sealed class FileOperationCoordinator :
         CrossVolumeFileTransaction crossVolume,
         IOperationCommitStore commitStore,
         IOperationSideEffectDispatcher? sideEffectDispatcher,
-        IFileOperationFaultInjector faultInjector)
+        IFileOperationFaultInjector faultInjector,
+        OperationRecoveryReadiness readiness)
     {
         ArgumentNullException.ThrowIfNull(journal);
         ArgumentNullException.ThrowIfNull(mutationGate);
@@ -252,6 +266,7 @@ public sealed class FileOperationCoordinator :
         ArgumentNullException.ThrowIfNull(crossVolume);
         ArgumentNullException.ThrowIfNull(commitStore);
         ArgumentNullException.ThrowIfNull(faultInjector);
+        ArgumentNullException.ThrowIfNull(readiness);
         _journal = journal;
         _mutationGate = mutationGate;
         _fingerprints = fingerprints;
@@ -260,18 +275,24 @@ public sealed class FileOperationCoordinator :
         _commitStore = commitStore;
         _sideEffectDispatcher = sideEffectDispatcher;
         _faults = faultInjector;
+        _readiness = readiness;
         _liveRecovery = new OperationRecoveryCoordinator(
             journal,
             mutationGate,
             new HandleSafeOperationRecoveryObserver(fingerprints),
-            this);
+            this,
+            readiness);
     }
+
+    public OperationRecoveryReadiness Readiness => _readiness;
 
     public async Task<FileOperationExecutionResult> ExecuteAsync(
         FileOperationExecutionRequest request,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
+        await _readiness.WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
         if (request.Intent.Kind is not (
                 FileOperationKind.SameVolumeMove
                 or FileOperationKind.UndoSameVolumeMove

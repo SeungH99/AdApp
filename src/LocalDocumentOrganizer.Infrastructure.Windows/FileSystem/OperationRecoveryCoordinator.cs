@@ -65,6 +65,20 @@ public interface IOperationRecoveryStartupPrerequisites
     Task ValidateExactSchemaAsync(CancellationToken cancellationToken);
 }
 
+public sealed class OperationRecoveryReadiness
+{
+    private readonly TaskCompletionSource _ready =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public bool IsReady => _ready.Task.IsCompletedSuccessfully;
+
+    public Task WaitAsync(CancellationToken cancellationToken) =>
+        _ready.Task.WaitAsync(cancellationToken);
+
+    internal void SignalReady() =>
+        _ready.TrySetResult();
+}
+
 public sealed record OperationRecoveryStartupResult(
     int RecoveredCount,
     int ManualRecoveryCount);
@@ -459,17 +473,20 @@ public sealed class OperationRecoveryCoordinator
     private readonly FileMutationGate _mutationGate;
     private readonly IOperationRecoveryObserver _observer;
     private readonly IOperationRecoveryExecutor _executor;
+    private readonly OperationRecoveryReadiness _readiness;
 
     public OperationRecoveryCoordinator(
         IOperationJournalStore journal,
         FileMutationGate mutationGate,
         FileOperationCoordinator executor,
-        VaultFileFingerprintService fingerprints)
+        VaultFileFingerprintService fingerprints,
+        OperationRecoveryReadiness readiness)
         : this(
             journal,
             mutationGate,
             new HandleSafeOperationRecoveryObserver(fingerprints),
-            executor)
+            executor,
+            RequireSharedReadiness(executor, readiness))
     {
     }
 
@@ -477,16 +494,19 @@ public sealed class OperationRecoveryCoordinator
         IOperationJournalStore journal,
         FileMutationGate mutationGate,
         IOperationRecoveryObserver observer,
-        IOperationRecoveryExecutor executor)
+        IOperationRecoveryExecutor executor,
+        OperationRecoveryReadiness readiness)
     {
         ArgumentNullException.ThrowIfNull(journal);
         ArgumentNullException.ThrowIfNull(mutationGate);
         ArgumentNullException.ThrowIfNull(observer);
         ArgumentNullException.ThrowIfNull(executor);
+        ArgumentNullException.ThrowIfNull(readiness);
         _journal = journal;
         _mutationGate = mutationGate;
         _observer = observer;
         _executor = executor;
+        _readiness = readiness;
     }
 
     public async Task<OperationRecoveryStartupResult> RecoverStartupAsync(
@@ -498,39 +518,66 @@ public sealed class OperationRecoveryCoordinator
             .ConfigureAwait(false);
         await prerequisites.ValidateExactSchemaAsync(cancellationToken)
             .ConfigureAwait(false);
-        await using var startupGate = await _mutationGate
-            .AcquireAsync(cancellationToken)
-            .ConfigureAwait(false);
-        var entries = await _journal
-            .GetNonTerminalAsync(CancellationToken.None)
-            .ConfigureAwait(false);
-        var recoveredCount = 0;
-        var manualRecoveryCount = 0;
-        foreach (var entry in entries
-                     .OrderBy(candidate => candidate.CreatedAtUtc)
-                     .ThenBy(candidate => candidate.OperationId.Value))
+        OperationRecoveryStartupResult result;
+        await using (await _mutationGate
+                         .AcquireAsync(cancellationToken)
+                         .ConfigureAwait(false))
         {
-            var recovery = await RecoverWithinGateAsync(
-                    entry,
-                    CancellationToken.None)
+            var entries = await _journal
+                .GetNonTerminalAsync(CancellationToken.None)
                 .ConfigureAwait(false);
-            if (recovery is FileOperationSucceeded)
+            var recoveredCount = 0;
+            var manualRecoveryCount = 0;
+            foreach (var entry in entries
+                         .OrderBy(candidate => candidate.CreatedAtUtc)
+                         .ThenBy(candidate => candidate.OperationId.Value))
             {
-                recoveredCount++;
-            }
-            else if (recovery is FileOperationRecoveryRequired
+                var recovery = await RecoverWithinGateAsync(
+                        entry,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+                if (recovery is FileOperationSucceeded)
                 {
-                    DurableState:
-                        OperationJournalState.ManualRecovery,
-                })
-            {
-                manualRecoveryCount++;
+                    recoveredCount++;
+                }
+                else if (recovery is FileOperationRecoveryRequired
+                {
+                        DurableState:
+                            OperationJournalState.ManualRecovery,
+                    })
+                {
+                    manualRecoveryCount++;
+                }
+                else
+                {
+                    throw new OperationJournalRecoveryRequiredException();
+                }
             }
+
+            result = new OperationRecoveryStartupResult(
+                recoveredCount,
+                manualRecoveryCount);
         }
 
-        return new OperationRecoveryStartupResult(
-            recoveredCount,
-            manualRecoveryCount);
+        cancellationToken.ThrowIfCancellationRequested();
+        _readiness.SignalReady();
+        return result;
+    }
+
+    private static OperationRecoveryReadiness RequireSharedReadiness(
+        FileOperationCoordinator executor,
+        OperationRecoveryReadiness readiness)
+    {
+        ArgumentNullException.ThrowIfNull(executor);
+        ArgumentNullException.ThrowIfNull(readiness);
+        if (!ReferenceEquals(executor.Readiness, readiness))
+        {
+            throw new ArgumentException(
+                "Startup recovery and mutation must share one readiness capability.",
+                nameof(readiness));
+        }
+
+        return readiness;
     }
 
     internal async Task<FileOperationExecutionResult> RecoverWithinGateAsync(
