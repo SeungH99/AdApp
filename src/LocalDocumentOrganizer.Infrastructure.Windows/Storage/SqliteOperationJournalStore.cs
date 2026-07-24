@@ -83,7 +83,8 @@ public sealed record TransitionOperationCommand
         OperationId operationId,
         long expectedRevision,
         OperationJournalState nextState,
-        OperationSourceHealth sourceHealth)
+        OperationSourceHealth sourceHealth,
+        StableFileIdentity? identity = null)
     {
         if (operationId.Value == Guid.Empty)
         {
@@ -113,11 +114,26 @@ public sealed record TransitionOperationCommand
                 nameof(sourceHealth),
                 "The source-health state is not defined.");
         }
+        if (nextState == OperationJournalState.IdentityLocked
+            && identity is null)
+        {
+            throw new ArgumentException(
+                "The identity-lock transition requires stable file identity.",
+                nameof(identity));
+        }
+        if (nextState != OperationJournalState.IdentityLocked
+            && identity is not null)
+        {
+            throw new ArgumentException(
+                "Stable file identity is accepted only at the identity-lock transition.",
+                nameof(identity));
+        }
 
         OperationId = operationId;
         ExpectedRevision = expectedRevision;
         NextState = nextState;
         SourceHealth = sourceHealth;
+        Identity = identity is null ? null : SnapshotIdentity(identity);
     }
 
     public OperationId OperationId { get; }
@@ -127,6 +143,17 @@ public sealed record TransitionOperationCommand
     public OperationJournalState NextState { get; }
 
     public OperationSourceHealth SourceHealth { get; }
+
+    public StableFileIdentity? Identity { get; }
+
+    private static StableFileIdentity SnapshotIdentity(
+        StableFileIdentity identity) =>
+        new(
+            identity.VolumeId,
+            identity.FileId,
+            identity.Length,
+            identity.LastWriteTimeUtc,
+            identity.KeyedFingerprint);
 }
 
 public sealed class OperationJournalEntry : IEquatable<OperationJournalEntry>
@@ -136,6 +163,7 @@ public sealed class OperationJournalEntry : IEquatable<OperationJournalEntry>
         OperationJournalState state,
         long revision,
         OperationSourceHealth sourceHealth,
+        StableFileIdentity? identity,
         DateTimeOffset createdAtUtc,
         DateTimeOffset updatedAtUtc)
     {
@@ -143,6 +171,14 @@ public sealed class OperationJournalEntry : IEquatable<OperationJournalEntry>
         State = state;
         Revision = revision;
         SourceHealth = sourceHealth;
+        Identity = identity is null
+            ? null
+            : new StableFileIdentity(
+                identity.VolumeId,
+                identity.FileId,
+                identity.Length,
+                identity.LastWriteTimeUtc,
+                identity.KeyedFingerprint);
         CreatedAtUtc = createdAtUtc;
         UpdatedAtUtc = updatedAtUtc;
     }
@@ -161,6 +197,8 @@ public sealed class OperationJournalEntry : IEquatable<OperationJournalEntry>
 
     public OperationSourceHealth SourceHealth { get; }
 
+    public StableFileIdentity? Identity { get; }
+
     public DateTimeOffset CreatedAtUtc { get; }
 
     public DateTimeOffset UpdatedAtUtc { get; }
@@ -171,6 +209,7 @@ public sealed class OperationJournalEntry : IEquatable<OperationJournalEntry>
         && State == other.State
         && Revision == other.Revision
         && SourceHealth == other.SourceHealth
+        && IdentitiesEqual(Identity, other.Identity)
         && CreatedAtUtc == other.CreatedAtUtc
         && UpdatedAtUtc == other.UpdatedAtUtc;
 
@@ -187,6 +226,24 @@ public sealed class OperationJournalEntry : IEquatable<OperationJournalEntry>
             SourceHealth,
             CreatedAtUtc,
             UpdatedAtUtc);
+
+    private static bool IdentitiesEqual(
+        StableFileIdentity? left,
+        StableFileIdentity? right) =>
+        ReferenceEquals(left, right)
+        || left is not null
+        && right is not null
+        && left.Length == right.Length
+        && left.LastWriteTimeUtc == right.LastWriteTimeUtc
+        && CryptographicOperations.FixedTimeEquals(
+            left.VolumeId,
+            right.VolumeId)
+        && CryptographicOperations.FixedTimeEquals(
+            left.FileId,
+            right.FileId)
+        && CryptographicOperations.FixedTimeEquals(
+            left.KeyedFingerprint,
+            right.KeyedFingerprint);
 }
 
 public sealed class OperationJournalRecoveryRequiredException : InvalidOperationException
@@ -310,7 +367,8 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         keyId,
                         dataKey.Span,
                         OperationJournalState.IntentPersisted,
-                        revision: 1);
+                        revision: 1,
+                        identity: null);
                     await InsertAsync(
                         connection,
                         transaction,
@@ -324,6 +382,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         OperationJournalState.IntentPersisted,
                         revision: 1,
                         OperationSourceHealth.Healthy,
+                        identity: null,
                         now,
                         now);
                 },
@@ -432,6 +491,12 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 && row.SourceHealth == command.SourceHealth;
             if (isExactReplay)
             {
+                if (command.NextState == OperationJournalState.IdentityLocked
+                    && !IdentitiesEqual(current.Identity, command.Identity))
+                {
+                    throw new OperationJournalRecoveryRequiredException();
+                }
+
                 await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
                 return new TransitionOperationResult(
                     TransitionOperationStatus.AlreadyApplied,
@@ -454,6 +519,11 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
             }
 
             var nextRevision = checked(row.Revision + 1);
+            var nextIdentity =
+                command.NextState == OperationJournalState.IdentityLocked
+                    ? command.Identity
+                    : current.Identity;
+            RequireCanonicalIdentity(command.NextState, nextIdentity);
             RequireCanonicalCommitFingerprint(
                 row.Kind,
                 command.NextState,
@@ -478,6 +548,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         dataKey.Span,
                         command.NextState,
                         nextRevision,
+                        nextIdentity,
                         currentPayload.CommitFingerprint));
                 },
                 cancellationToken).ConfigureAwait(false);
@@ -510,6 +581,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 command.NextState,
                 nextRevision,
                 command.SourceHealth,
+                nextIdentity,
                 row.CreatedAtUtc,
                 updatedAtUtc);
             return new TransitionOperationResult(
@@ -751,6 +823,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                     dataKey.Span,
                     OperationJournalState.EventAndProjectionCommitted,
                     nextRevision,
+                    current.Identity,
                     commitFingerprint.Span));
             },
             cancellationToken).ConfigureAwait(false);
@@ -801,6 +874,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
             OperationJournalState.EventAndProjectionCommitted,
             nextRevision,
             current.SourceHealth,
+            current.Identity,
             current.CreatedAtUtc,
             updatedAtUtc);
     }
@@ -811,9 +885,14 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         ReadOnlySpan<byte> dataKey,
         OperationJournalState state,
         long revision,
+        StableFileIdentity? identity,
         ReadOnlySpan<byte> commitFingerprint = default)
     {
-        var plaintext = SerializeIntent(intent, commitFingerprint);
+        RequireCanonicalIdentity(state, identity);
+        var plaintext = SerializeIntent(
+            intent,
+            identity,
+            commitFingerprint);
         try
         {
             return _protector.Protect(
@@ -873,6 +952,9 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         row.State,
                         row.Revision,
                         payload.CommitFingerprint);
+                    RequireCanonicalIdentity(
+                        row.State,
+                        payload.Identity);
                     return ValueTask.FromResult(
                         new DecryptedOperationJournalPayload(
                             new OperationJournalEntry(
@@ -880,6 +962,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                                 row.State,
                                 row.Revision,
                                 row.SourceHealth,
+                                payload.Identity,
                                 row.CreatedAtUtc,
                                 row.UpdatedAtUtc),
                             payload.CommitFingerprint));
@@ -912,6 +995,41 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
             throw new OperationJournalRecoveryRequiredException();
         }
     }
+
+    private static void RequireCanonicalIdentity(
+        OperationJournalState state,
+        StableFileIdentity? identity)
+    {
+        if (state == OperationJournalState.IntentPersisted)
+        {
+            if (identity is not null)
+                throw new OperationJournalRecoveryRequiredException();
+            return;
+        }
+
+        if (state == OperationJournalState.ManualRecovery)
+            return;
+        if (identity is null)
+            throw new OperationJournalRecoveryRequiredException();
+    }
+
+    private static bool IdentitiesEqual(
+        StableFileIdentity? left,
+        StableFileIdentity? right) =>
+        ReferenceEquals(left, right)
+        || left is not null
+        && right is not null
+        && left.Length == right.Length
+        && left.LastWriteTimeUtc == right.LastWriteTimeUtc
+        && CryptographicOperations.FixedTimeEquals(
+            left.VolumeId,
+            right.VolumeId)
+        && CryptographicOperations.FixedTimeEquals(
+            left.FileId,
+            right.FileId)
+        && CryptographicOperations.FixedTimeEquals(
+            left.KeyedFingerprint,
+            right.KeyedFingerprint);
 
     private static long CommittedRevision(FileOperationKind kind) =>
         kind switch
@@ -1207,6 +1325,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
 
     private static byte[] SerializeIntent(
         FileOperationIntent intent,
+        StableFileIdentity? identity,
         ReadOnlySpan<byte> commitFingerprint = default)
     {
         if (!commitFingerprint.IsEmpty
@@ -1237,6 +1356,25 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
             writer.WriteBase64String(
                 "approvedProposal",
                 intent.ApprovedProposal.Span);
+            if (identity is not null)
+            {
+                writer.WriteStartObject("identity");
+                writer.WriteBase64String(
+                    "volumeId",
+                    identity.VolumeId);
+                writer.WriteBase64String(
+                    "fileId",
+                    identity.FileId);
+                writer.WriteNumber("length", identity.Length);
+                writer.WriteString(
+                    "lastWriteTimeUtc",
+                    FormatTimestamp(identity.LastWriteTimeUtc));
+                writer.WriteBase64String(
+                    "keyedFingerprint",
+                    identity.KeyedFingerprint);
+                writer.WriteEndObject();
+            }
+
             if (!commitFingerprint.IsEmpty)
             {
                 writer.WriteBase64String(
@@ -1292,8 +1430,32 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 }
             }
 
+            StableFileIdentity? identity = null;
+            if (root.TryGetProperty("identity", out var identityElement))
+            {
+                if (identityElement.ValueKind != JsonValueKind.Object)
+                    throw new OperationJournalRecoveryRequiredException();
+                identity = new StableFileIdentity(
+                    identityElement
+                        .GetProperty("volumeId")
+                        .GetBytesFromBase64(),
+                    identityElement
+                        .GetProperty("fileId")
+                        .GetBytesFromBase64(),
+                    identityElement.GetProperty("length").GetInt64(),
+                    ParseTimestamp(
+                        identityElement
+                            .GetProperty("lastWriteTimeUtc")
+                            .GetString()
+                        ?? throw new OperationJournalRecoveryRequiredException()),
+                    identityElement
+                        .GetProperty("keyedFingerprint")
+                        .GetBytesFromBase64());
+            }
+
             return new DeserializedOperationJournalPayload(
                 intent,
+                identity,
                 commitFingerprint);
         }
         catch (OperationJournalRecoveryRequiredException)
@@ -1435,5 +1597,6 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
 
     private sealed record DeserializedOperationJournalPayload(
         FileOperationIntent Intent,
+        StableFileIdentity? Identity,
         byte[]? CommitFingerprint);
 }
