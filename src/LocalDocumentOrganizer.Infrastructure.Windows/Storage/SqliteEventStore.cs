@@ -283,9 +283,9 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore,
             var commitFingerprint = CreateContributionFingerprint(command);
             var expectedCommittedRevision =
                 checked(command.ExpectedJournalRevision + 1);
-            if (candidate.Entry.State
-                    == OperationJournalState.EventAndProjectionCommitted
-                && candidate.Entry.Revision == expectedCommittedRevision)
+            if (IsAuthenticatedPostCommitProgression(
+                    candidate.Entry,
+                    command.ExpectedJournalRevision))
             {
                 var retry = await AppendInTransactionAsync(
                     connection,
@@ -435,6 +435,45 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore,
         && entry.Intent.StreamId == command.AppendEvents.StreamId
         && entry.Intent.ExpectedStreamVersion == command.AppendEvents.ExpectedVersion;
 
+    private static bool IsAuthenticatedPostCommitProgression(
+        OperationJournalEntry entry,
+        long expectedFileAppliedRevision) =>
+        entry.State switch
+        {
+            OperationJournalState.EventAndProjectionCommitted =>
+                RevisionIsOffset(
+                    entry.Revision,
+                    expectedFileAppliedRevision,
+                    1),
+            OperationJournalState.SideEffectsPending =>
+                RevisionIsOffset(
+                    entry.Revision,
+                    expectedFileAppliedRevision,
+                    2),
+            OperationJournalState.Completed =>
+                RevisionIsOffset(
+                    entry.Revision,
+                    expectedFileAppliedRevision,
+                    3),
+            OperationJournalState.ManualRecovery =>
+                RevisionIsOffset(
+                    entry.Revision,
+                    expectedFileAppliedRevision,
+                    2)
+                || RevisionIsOffset(
+                    entry.Revision,
+                    expectedFileAppliedRevision,
+                    3),
+            _ => false,
+        };
+
+    private static bool RevisionIsOffset(
+        long actualRevision,
+        long expectedRevision,
+        long offset) =>
+        expectedRevision <= long.MaxValue - offset
+        && actualRevision == expectedRevision + offset;
+
     private static byte[] CreateContributionFingerprint(
         CommitFileOperationCommand command)
     {
@@ -545,7 +584,7 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore,
         {
             effects.Transaction = transaction;
             effects.CommandText = """
-                SELECT effect_index, effect_code, state
+                SELECT effect_index, effect_code
                 FROM main.operation_side_effects
                 WHERE operation_id=$operation_id
                 ORDER BY effect_index;
@@ -564,9 +603,7 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore,
                     || !string.Equals(
                         code,
                         command.SideEffects[index].Code,
-                        StringComparison.Ordinal)
-                    || reader.GetValue(2) is not long state
-                    || state != 0)
+                        StringComparison.Ordinal))
                 {
                     return false;
                 }

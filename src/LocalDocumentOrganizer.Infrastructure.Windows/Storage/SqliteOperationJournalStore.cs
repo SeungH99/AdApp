@@ -422,10 +422,11 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 transaction,
                 keySession.Identity,
                 cancellationToken).ConfigureAwait(false);
-            var current = await DecryptAsync(
+            var currentPayload = await DecryptPayloadAsync(
                 row,
                 keySession,
                 cancellationToken).ConfigureAwait(false);
+            var current = currentPayload.Entry;
             var isExactReplay = row.State == command.NextState
                 && row.Revision == checked(command.ExpectedRevision + 1)
                 && row.SourceHealth == command.SourceHealth;
@@ -453,6 +454,11 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
             }
 
             var nextRevision = checked(row.Revision + 1);
+            RequireCanonicalCommitFingerprint(
+                row.Kind,
+                command.NextState,
+                nextRevision,
+                currentPayload.CommitFingerprint);
             var updatedAtUtc = NextTimestamp(row.UpdatedAtUtc);
             var nextEnvelope = await keySession.ResolveDataKeyAsync(
                 row.Owner,
@@ -471,7 +477,8 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         keyId,
                         dataKey.Span,
                         command.NextState,
-                        nextRevision));
+                        nextRevision,
+                        currentPayload.CommitFingerprint));
                 },
                 cancellationToken).ConfigureAwait(false);
 
@@ -861,6 +868,11 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         throw new OperationJournalRecoveryRequiredException();
                     }
 
+                    RequireCanonicalCommitFingerprint(
+                        row.Kind,
+                        row.State,
+                        row.Revision,
+                        payload.CommitFingerprint);
                     return ValueTask.FromResult(
                         new DecryptedOperationJournalPayload(
                             new OperationJournalEntry(
@@ -882,6 +894,34 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
             },
             cancellationToken).ConfigureAwait(false);
     }
+
+    private static void RequireCanonicalCommitFingerprint(
+        FileOperationKind kind,
+        OperationJournalState state,
+        long revision,
+        byte[]? commitFingerprint)
+    {
+        var requiresFingerprint = state is
+                OperationJournalState.EventAndProjectionCommitted
+                or OperationJournalState.SideEffectsPending
+                or OperationJournalState.Completed
+            || state == OperationJournalState.ManualRecovery
+                && revision > CommittedRevision(kind);
+        if (requiresFingerprint != (commitFingerprint is not null))
+        {
+            throw new OperationJournalRecoveryRequiredException();
+        }
+    }
+
+    private static long CommittedRevision(FileOperationKind kind) =>
+        kind switch
+        {
+            FileOperationKind.SameVolumeMove
+                or FileOperationKind.UndoSameVolumeMove => 5,
+            FileOperationKind.CrossVolumeMove
+                or FileOperationKind.UndoCrossVolumeMove => 8,
+            _ => throw new OperationJournalRecoveryRequiredException(),
+        };
 
     private static OperationJournalEncryptionContext CreateContext(
         FileOperationIntent intent,
