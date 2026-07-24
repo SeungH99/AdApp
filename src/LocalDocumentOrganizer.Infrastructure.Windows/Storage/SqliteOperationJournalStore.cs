@@ -16,6 +16,12 @@ public interface IOperationJournalStore
         FileOperationIntent intent,
         CancellationToken cancellationToken);
 
+    Task<PersistOperationIntentResult> PersistIntentAsync(
+        FileOperationIntent intent,
+        OperationRecoveryRecipe recoveryRecipe,
+        CancellationToken cancellationToken) =>
+        PersistIntentAsync(intent, cancellationToken);
+
     Task<TransitionOperationResult> TransitionAsync(
         TransitionOperationCommand command,
         CancellationToken cancellationToken);
@@ -84,7 +90,8 @@ public sealed record TransitionOperationCommand
         long expectedRevision,
         OperationJournalState nextState,
         OperationSourceHealth sourceHealth,
-        StableFileIdentity? identity = null)
+        StableFileIdentity? identity = null,
+        OperationManualRecoveryEvidence? manualRecoveryEvidence = null)
     {
         if (operationId.Value == Guid.Empty)
         {
@@ -128,12 +135,26 @@ public sealed record TransitionOperationCommand
                 "Stable file identity is accepted only at the identity-lock transition.",
                 nameof(identity));
         }
+        if (nextState != OperationJournalState.ManualRecovery
+            && manualRecoveryEvidence is not null)
+        {
+            throw new ArgumentException(
+                "Manual-recovery evidence is accepted only for a manual-recovery transition.",
+                nameof(manualRecoveryEvidence));
+        }
 
         OperationId = operationId;
         ExpectedRevision = expectedRevision;
         NextState = nextState;
         SourceHealth = sourceHealth;
         Identity = identity is null ? null : SnapshotIdentity(identity);
+        HasExplicitManualRecoveryEvidence =
+            manualRecoveryEvidence is not null;
+        ManualRecoveryEvidence = nextState == OperationJournalState.ManualRecovery
+            ? manualRecoveryEvidence
+                ?? CreateUnspecifiedEvidence(
+                    OperationJournalState.IntentPersisted)
+            : null;
     }
 
     public OperationId OperationId { get; }
@@ -146,6 +167,10 @@ public sealed record TransitionOperationCommand
 
     public StableFileIdentity? Identity { get; }
 
+    public OperationManualRecoveryEvidence? ManualRecoveryEvidence { get; }
+
+    internal bool HasExplicitManualRecoveryEvidence { get; }
+
     private static StableFileIdentity SnapshotIdentity(
         StableFileIdentity identity) =>
         new(
@@ -154,6 +179,15 @@ public sealed record TransitionOperationCommand
             identity.Length,
             identity.LastWriteTimeUtc,
             identity.KeyedFingerprint);
+
+    internal static OperationManualRecoveryEvidence CreateUnspecifiedEvidence(
+        OperationJournalState observedState) =>
+        new(
+            observedState,
+            RecoveryPathObservation.InaccessibleOrUnknown,
+            RecoveryPathObservation.InaccessibleOrUnknown,
+            OperationManualRecoveryReason.UnspecifiedRecoveryBoundary,
+            OperationManualRecoveryAction.InspectBothPathsWithoutMutation);
 }
 
 public sealed class OperationJournalEntry : IEquatable<OperationJournalEntry>
@@ -166,6 +200,50 @@ public sealed class OperationJournalEntry : IEquatable<OperationJournalEntry>
         StableFileIdentity? identity,
         DateTimeOffset createdAtUtc,
         DateTimeOffset updatedAtUtc)
+        : this(
+            intent,
+            state,
+            revision,
+            sourceHealth,
+            identity,
+            createdAtUtc,
+            updatedAtUtc,
+            recoveryRecipe: null)
+    {
+    }
+
+    internal OperationJournalEntry(
+        FileOperationIntent intent,
+        OperationJournalState state,
+        long revision,
+        OperationSourceHealth sourceHealth,
+        StableFileIdentity? identity,
+        DateTimeOffset createdAtUtc,
+        DateTimeOffset updatedAtUtc,
+        OperationRecoveryRecipe? recoveryRecipe)
+        : this(
+            intent,
+            state,
+            revision,
+            sourceHealth,
+            identity,
+            createdAtUtc,
+            updatedAtUtc,
+            recoveryRecipe,
+            manualRecoveryEvidence: null)
+    {
+    }
+
+    internal OperationJournalEntry(
+        FileOperationIntent intent,
+        OperationJournalState state,
+        long revision,
+        OperationSourceHealth sourceHealth,
+        StableFileIdentity? identity,
+        DateTimeOffset createdAtUtc,
+        DateTimeOffset updatedAtUtc,
+        OperationRecoveryRecipe? recoveryRecipe,
+        OperationManualRecoveryEvidence? manualRecoveryEvidence)
     {
         Intent = intent;
         State = state;
@@ -181,6 +259,8 @@ public sealed class OperationJournalEntry : IEquatable<OperationJournalEntry>
                 identity.KeyedFingerprint);
         CreatedAtUtc = createdAtUtc;
         UpdatedAtUtc = updatedAtUtc;
+        RecoveryRecipe = recoveryRecipe;
+        ManualRecoveryEvidence = manualRecoveryEvidence;
     }
 
     public FileOperationIntent Intent { get; }
@@ -203,6 +283,10 @@ public sealed class OperationJournalEntry : IEquatable<OperationJournalEntry>
 
     public DateTimeOffset UpdatedAtUtc { get; }
 
+    public OperationRecoveryRecipe? RecoveryRecipe { get; }
+
+    public OperationManualRecoveryEvidence? ManualRecoveryEvidence { get; }
+
     public bool Equals(OperationJournalEntry? other) =>
         other is not null
         && SqliteOperationJournalStore.IntentsEqual(Intent, other.Intent)
@@ -210,6 +294,8 @@ public sealed class OperationJournalEntry : IEquatable<OperationJournalEntry>
         && Revision == other.Revision
         && SourceHealth == other.SourceHealth
         && IdentitiesEqual(Identity, other.Identity)
+        && RecipesEqual(RecoveryRecipe, other.RecoveryRecipe)
+        && ManualRecoveryEvidence == other.ManualRecoveryEvidence
         && CreatedAtUtc == other.CreatedAtUtc
         && UpdatedAtUtc == other.UpdatedAtUtc;
 
@@ -244,6 +330,13 @@ public sealed class OperationJournalEntry : IEquatable<OperationJournalEntry>
         && CryptographicOperations.FixedTimeEquals(
             left.KeyedFingerprint,
             right.KeyedFingerprint);
+
+    private static bool RecipesEqual(
+        OperationRecoveryRecipe? left,
+        OperationRecoveryRecipe? right) =>
+        ReferenceEquals(left, right)
+        || left is not null
+        && left.ExactEquals(right);
 }
 
 public sealed class OperationJournalRecoveryRequiredException : InvalidOperationException
@@ -295,9 +388,44 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
 
     public async Task<PersistOperationIntentResult> PersistIntentAsync(
         FileOperationIntent intent,
+        CancellationToken cancellationToken) =>
+        await PersistIntentCoreAsync(
+            intent,
+            recoveryRecipe: null,
+            requireExactRecipe: false,
+            cancellationToken).ConfigureAwait(false);
+
+    public async Task<PersistOperationIntentResult> PersistIntentAsync(
+        FileOperationIntent intent,
+        OperationRecoveryRecipe recoveryRecipe,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(recoveryRecipe);
+        return await PersistIntentCoreAsync(
+            intent,
+            recoveryRecipe,
+            requireExactRecipe: true,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<PersistOperationIntentResult> PersistIntentCoreAsync(
+        FileOperationIntent intent,
+        OperationRecoveryRecipe? recoveryRecipe,
+        bool requireExactRecipe,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(intent);
+        if (recoveryRecipe is not null
+            && (recoveryRecipe.AppendEvents.OperationId != intent.OperationId
+                || recoveryRecipe.AppendEvents.StreamId != intent.StreamId
+                || recoveryRecipe.AppendEvents.ExpectedVersion
+                    != intent.ExpectedStreamVersion))
+        {
+            throw new ArgumentException(
+                "The recovery recipe must match the operation intent.",
+                nameof(recoveryRecipe));
+        }
+
         SqliteEventStoreSchema.ValidateVaultPath(
             _connectionString,
             _keyRing.MaintenanceGate);
@@ -349,6 +477,9 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                     cancellationToken).ConfigureAwait(false);
                 await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
                 return IntentsEqual(existingEntry.Intent, intent)
+                    && (!requireExactRecipe
+                        || recoveryRecipe!.ExactEquals(
+                            existingEntry.RecoveryRecipe))
                     ? new PersistOperationIntentResult(
                         PersistOperationIntentStatus.AlreadyPersisted,
                         existingEntry)
@@ -368,7 +499,9 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         dataKey.Span,
                         OperationJournalState.IntentPersisted,
                         revision: 1,
-                        identity: null);
+                        identity: null,
+                        recoveryRecipe: recoveryRecipe,
+                        manualRecoveryEvidence: null);
                     await InsertAsync(
                         connection,
                         transaction,
@@ -384,7 +517,8 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         OperationSourceHealth.Healthy,
                         identity: null,
                         now,
-                        now);
+                        now,
+                        recoveryRecipe);
                 },
                 cancellationToken).ConfigureAwait(false);
 
@@ -496,6 +630,13 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 {
                     throw new OperationJournalRecoveryRequiredException();
                 }
+                if (command.NextState == OperationJournalState.ManualRecovery
+                    && command.HasExplicitManualRecoveryEvidence
+                    && current.ManualRecoveryEvidence
+                        != command.ManualRecoveryEvidence)
+                {
+                    throw new OperationJournalRecoveryRequiredException();
+                }
 
                 await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
                 return new TransitionOperationResult(
@@ -523,10 +664,20 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 command.NextState == OperationJournalState.IdentityLocked
                     ? command.Identity
                     : current.Identity;
+            var nextManualRecoveryEvidence =
+                command.NextState == OperationJournalState.ManualRecovery
+                    ? command.HasExplicitManualRecoveryEvidence
+                        ? command.ManualRecoveryEvidence
+                        : TransitionOperationCommand
+                            .CreateUnspecifiedEvidence(current.State)
+                    : current.ManualRecoveryEvidence;
             RequireCanonicalIdentity(
                 command.NextState,
                 nextRevision,
                 nextIdentity);
+            RequireCanonicalManualRecoveryEvidence(
+                command.NextState,
+                nextManualRecoveryEvidence);
             RequireCanonicalCommitFingerprint(
                 row.Kind,
                 command.NextState,
@@ -552,6 +703,8 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         command.NextState,
                         nextRevision,
                         nextIdentity,
+                        current.RecoveryRecipe,
+                        nextManualRecoveryEvidence,
                         currentPayload.CommitFingerprint));
                 },
                 cancellationToken).ConfigureAwait(false);
@@ -586,7 +739,9 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 command.SourceHealth,
                 nextIdentity,
                 row.CreatedAtUtc,
-                updatedAtUtc);
+                updatedAtUtc,
+                current.RecoveryRecipe,
+                nextManualRecoveryEvidence);
             return new TransitionOperationResult(
                 TransitionOperationStatus.Transitioned,
                 next,
@@ -827,6 +982,8 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                     OperationJournalState.EventAndProjectionCommitted,
                     nextRevision,
                     current.Identity,
+                    current.RecoveryRecipe,
+                    current.ManualRecoveryEvidence,
                     commitFingerprint.Span));
             },
             cancellationToken).ConfigureAwait(false);
@@ -879,7 +1036,9 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
             current.SourceHealth,
             current.Identity,
             current.CreatedAtUtc,
-            updatedAtUtc);
+            updatedAtUtc,
+            current.RecoveryRecipe,
+            current.ManualRecoveryEvidence);
     }
 
     private EncryptedOperationJournalPayload Protect(
@@ -889,12 +1048,19 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         OperationJournalState state,
         long revision,
         StableFileIdentity? identity,
+        OperationRecoveryRecipe? recoveryRecipe,
+        OperationManualRecoveryEvidence? manualRecoveryEvidence,
         ReadOnlySpan<byte> commitFingerprint = default)
     {
         RequireCanonicalIdentity(state, revision, identity);
+        RequireCanonicalManualRecoveryEvidence(
+            state,
+            manualRecoveryEvidence);
         var plaintext = SerializeIntent(
             intent,
             identity,
+            recoveryRecipe,
+            manualRecoveryEvidence,
             commitFingerprint);
         try
         {
@@ -959,6 +1125,9 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         row.State,
                         row.Revision,
                         payload.Identity);
+                    RequireCanonicalManualRecoveryEvidence(
+                        row.State,
+                        payload.ManualRecoveryEvidence);
                     return ValueTask.FromResult(
                         new DecryptedOperationJournalPayload(
                             new OperationJournalEntry(
@@ -968,7 +1137,9 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                                 row.SourceHealth,
                                 payload.Identity,
                                 row.CreatedAtUtc,
-                                row.UpdatedAtUtc),
+                                row.UpdatedAtUtc,
+                                payload.RecoveryRecipe,
+                                payload.ManualRecoveryEvidence),
                             payload.CommitFingerprint));
                 }
                 finally
@@ -1023,6 +1194,17 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         }
         if (identity is null)
             throw new OperationJournalRecoveryRequiredException();
+    }
+
+    private static void RequireCanonicalManualRecoveryEvidence(
+        OperationJournalState state,
+        OperationManualRecoveryEvidence? evidence)
+    {
+        if ((state == OperationJournalState.ManualRecovery)
+            != (evidence is not null))
+        {
+            throw new OperationJournalRecoveryRequiredException();
+        }
     }
 
     private static bool IdentitiesEqual(
@@ -1338,6 +1520,8 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
     private static byte[] SerializeIntent(
         FileOperationIntent intent,
         StableFileIdentity? identity,
+        OperationRecoveryRecipe? recoveryRecipe,
+        OperationManualRecoveryEvidence? manualRecoveryEvidence,
         ReadOnlySpan<byte> commitFingerprint = default)
     {
         if (!commitFingerprint.IsEmpty
@@ -1368,6 +1552,11 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
             writer.WriteBase64String(
                 "approvedProposal",
                 intent.ApprovedProposal.Span);
+            if (recoveryRecipe is not null)
+            {
+                WriteRecoveryRecipe(writer, recoveryRecipe);
+            }
+
             if (identity is not null)
             {
                 writer.WriteStartObject("identity");
@@ -1387,6 +1576,27 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 writer.WriteEndObject();
             }
 
+            if (manualRecoveryEvidence is not null)
+            {
+                writer.WriteStartObject("manualRecoveryEvidence");
+                writer.WriteNumber(
+                    "observedState",
+                    (int)manualRecoveryEvidence.ObservedState);
+                writer.WriteNumber(
+                    "sourceObservation",
+                    (int)manualRecoveryEvidence.SourceObservation);
+                writer.WriteNumber(
+                    "destinationObservation",
+                    (int)manualRecoveryEvidence.DestinationObservation);
+                writer.WriteNumber(
+                    "reason",
+                    (int)manualRecoveryEvidence.Reason);
+                writer.WriteNumber(
+                    "recommendedAction",
+                    (int)manualRecoveryEvidence.RecommendedAction);
+                writer.WriteEndObject();
+            }
+
             if (!commitFingerprint.IsEmpty)
             {
                 writer.WriteBase64String(
@@ -1398,6 +1608,72 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         }
 
         return buffer.WrittenSpan.ToArray();
+    }
+
+    private static void WriteRecoveryRecipe(
+        Utf8JsonWriter writer,
+        OperationRecoveryRecipe recipe)
+    {
+        writer.WriteStartObject("recoveryRecipe");
+        writer.WriteString("dataKeyId", recipe.DataKeyId.Value);
+        writer.WriteStartObject("appendEvents");
+        writer.WriteString("streamId", recipe.AppendEvents.StreamId.Value);
+        writer.WriteNumber(
+            "expectedVersion",
+            recipe.AppendEvents.ExpectedVersion.Value);
+        writer.WriteString(
+            "operationId",
+            recipe.AppendEvents.OperationId.Value);
+        writer.WriteStartArray("events");
+        foreach (var eventToAppend in recipe.AppendEvents.Events)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("eventId", eventToAppend.EventId.Value);
+            writer.WriteString("eventType", eventToAppend.EventType);
+            writer.WriteNumber("schemaVersion", eventToAppend.SchemaVersion);
+            writer.WriteBase64String("payload", eventToAppend.Payload.Span);
+            switch (eventToAppend.Protection)
+            {
+                case PayloadProtection.DurableStructural:
+                    writer.WriteNumber("protectionKind", 0);
+                    break;
+                case PayloadProtection.Shreddable shreddable:
+                    writer.WriteNumber("protectionKind", 1);
+                    writer.WriteNumber(
+                        "protectionOwnerKind",
+                        (int)shreddable.Owner.Kind);
+                    writer.WriteString(
+                        "protectionOwnerId",
+                        shreddable.Owner.Id.Value);
+                    break;
+                default:
+                    throw new OperationJournalRecoveryRequiredException();
+            }
+
+            writer.WriteEndObject();
+        }
+
+        writer.WriteEndArray();
+        writer.WriteEndObject();
+        writer.WriteStartArray("sideEffects");
+        foreach (var sideEffect in recipe.SideEffects)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("code", sideEffect.Code);
+            writer.WriteBase64String("data", sideEffect.Data.Span);
+            writer.WriteEndObject();
+        }
+
+        writer.WriteEndArray();
+        if (recipe.Usage is not null)
+        {
+            writer.WriteStartObject("usage");
+            writer.WriteString("code", recipe.Usage.Code);
+            writer.WriteNumber("units", recipe.Usage.Units);
+            writer.WriteEndObject();
+        }
+
+        writer.WriteEndObject();
     }
 
     private static DeserializedOperationJournalPayload DeserializePayload(
@@ -1432,6 +1708,47 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 new StreamVersion(
                     root.GetProperty("expectedStreamVersion").GetInt64()),
                 root.GetProperty("approvedProposal").GetBytesFromBase64());
+            OperationRecoveryRecipe? recoveryRecipe = null;
+            if (root.TryGetProperty(
+                    "recoveryRecipe",
+                    out var recoveryRecipeElement))
+            {
+                try
+                {
+                    if (root.EnumerateObject().Count(
+                            property => property.NameEquals(
+                                "recoveryRecipe")) != 1)
+                    {
+                        throw new OperationJournalRecoveryRequiredException();
+                    }
+
+                    recoveryRecipe = DeserializeRecoveryRecipe(
+                        recoveryRecipeElement);
+                    if (recoveryRecipe.AppendEvents.OperationId
+                            != intent.OperationId
+                        || recoveryRecipe.AppendEvents.StreamId
+                            != intent.StreamId
+                        || recoveryRecipe.AppendEvents.ExpectedVersion
+                            != intent.ExpectedStreamVersion)
+                    {
+                        throw new OperationJournalRecoveryRequiredException();
+                    }
+                }
+                catch (OperationJournalRecoveryRequiredException)
+                {
+                    recoveryRecipe = null;
+                }
+                catch (Exception exception) when (
+                    exception is ArgumentException
+                        or FormatException
+                        or InvalidOperationException
+                        or KeyNotFoundException
+                        or OverflowException)
+                {
+                    recoveryRecipe = null;
+                }
+            }
+
             byte[]? commitFingerprint = null;
             if (root.TryGetProperty("commitFingerprint", out var fingerprintElement))
             {
@@ -1465,9 +1782,42 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         .GetBytesFromBase64());
             }
 
+            OperationManualRecoveryEvidence? manualRecoveryEvidence = null;
+            if (root.TryGetProperty(
+                    "manualRecoveryEvidence",
+                    out var manualRecoveryElement))
+            {
+                RequireCanonicalObject(
+                    manualRecoveryElement,
+                    "observedState",
+                    "sourceObservation",
+                    "destinationObservation",
+                    "reason",
+                    "recommendedAction");
+
+                manualRecoveryEvidence = new OperationManualRecoveryEvidence(
+                    (OperationJournalState)manualRecoveryElement
+                        .GetProperty("observedState")
+                        .GetInt32(),
+                    (RecoveryPathObservation)manualRecoveryElement
+                        .GetProperty("sourceObservation")
+                        .GetInt32(),
+                    (RecoveryPathObservation)manualRecoveryElement
+                        .GetProperty("destinationObservation")
+                        .GetInt32(),
+                    (OperationManualRecoveryReason)manualRecoveryElement
+                        .GetProperty("reason")
+                        .GetInt32(),
+                    (OperationManualRecoveryAction)manualRecoveryElement
+                        .GetProperty("recommendedAction")
+                        .GetInt32());
+            }
+
             return new DeserializedOperationJournalPayload(
                 intent,
                 identity,
+                recoveryRecipe,
+                manualRecoveryEvidence,
                 commitFingerprint);
         }
         catch (OperationJournalRecoveryRequiredException)
@@ -1483,6 +1833,139 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 or OverflowException)
         {
             throw new OperationJournalRecoveryRequiredException(exception);
+        }
+    }
+
+    private static OperationRecoveryRecipe DeserializeRecoveryRecipe(
+        JsonElement element)
+    {
+        RequireCanonicalObject(
+            element,
+            "dataKeyId",
+            "appendEvents",
+            "sideEffects",
+            element.TryGetProperty("usage", out _)
+                ? "usage"
+                : null);
+
+        var appendElement = element.GetProperty("appendEvents");
+        RequireCanonicalObject(
+            appendElement,
+            "streamId",
+            "expectedVersion",
+            "operationId",
+            "events");
+        var eventsElement = appendElement.GetProperty("events");
+        if (eventsElement.ValueKind != JsonValueKind.Array)
+        {
+            throw new OperationJournalRecoveryRequiredException();
+        }
+
+        var events = new List<EventToAppend>();
+        foreach (var eventElement in eventsElement.EnumerateArray())
+        {
+            var protectionKind = eventElement
+                .GetProperty("protectionKind")
+                .GetInt32();
+            RequireCanonicalObject(
+                eventElement,
+                "eventId",
+                "eventType",
+                "schemaVersion",
+                "payload",
+                "protectionKind",
+                protectionKind == 1 ? "protectionOwnerKind" : null,
+                protectionKind == 1 ? "protectionOwnerId" : null);
+            PayloadProtection protection = protectionKind switch
+            {
+                0 => new PayloadProtection.DurableStructural(),
+                1 => new PayloadProtection.Shreddable(
+                    new SensitiveObjectRef(
+                        (SensitiveObjectKind)eventElement
+                            .GetProperty("protectionOwnerKind")
+                            .GetInt32(),
+                        new SensitiveObjectId(eventElement
+                            .GetProperty("protectionOwnerId")
+                            .GetGuid()))),
+                _ => throw new OperationJournalRecoveryRequiredException(),
+            };
+            events.Add(new EventToAppend(
+                new EventId(eventElement.GetProperty("eventId").GetGuid()),
+                eventElement.GetProperty("eventType").GetString()
+                    ?? throw new OperationJournalRecoveryRequiredException(),
+                eventElement.GetProperty("schemaVersion").GetInt32(),
+                eventElement.GetProperty("payload").GetBytesFromBase64(),
+                protection));
+        }
+
+        var sideEffectsElement = element.GetProperty("sideEffects");
+        if (sideEffectsElement.ValueKind != JsonValueKind.Array)
+        {
+            throw new OperationJournalRecoveryRequiredException();
+        }
+
+        var sideEffects = sideEffectsElement
+            .EnumerateArray()
+            .Select(sideEffect =>
+            {
+                RequireCanonicalObject(sideEffect, "code", "data");
+                return new FileOperationSideEffect(
+                    sideEffect.GetProperty("code").GetString()
+                        ?? throw new OperationJournalRecoveryRequiredException(),
+                    sideEffect.GetProperty("data").GetBytesFromBase64());
+            })
+            .ToArray();
+        FileOperationUsage? usage = null;
+        if (element.TryGetProperty("usage", out var usageElement))
+        {
+            RequireCanonicalObject(usageElement, "code", "units");
+
+            usage = new FileOperationUsage(
+                usageElement.GetProperty("code").GetString()
+                    ?? throw new OperationJournalRecoveryRequiredException(),
+                usageElement.GetProperty("units").GetInt64());
+        }
+
+        return new OperationRecoveryRecipe(
+            new DataKeyId(element.GetProperty("dataKeyId").GetGuid()),
+            new AppendEventsCommand(
+                new StreamId(appendElement.GetProperty("streamId").GetGuid()),
+                new StreamVersion(
+                    appendElement.GetProperty("expectedVersion").GetInt64()),
+                new OperationId(
+                    appendElement.GetProperty("operationId").GetGuid()),
+                events),
+            sideEffects,
+            usage);
+    }
+
+    private static void RequireCanonicalObject(
+        JsonElement element,
+        params string?[] expectedPropertyNames)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            throw new OperationJournalRecoveryRequiredException();
+        }
+
+        var expected = expectedPropertyNames
+            .Where(name => name is not null)
+            .ToArray();
+        var properties = element.EnumerateObject().ToArray();
+        if (properties.Length != expected.Length)
+        {
+            throw new OperationJournalRecoveryRequiredException();
+        }
+
+        for (var index = 0; index < expected.Length; index++)
+        {
+            if (!string.Equals(
+                    properties[index].Name,
+                    expected[index],
+                    StringComparison.Ordinal))
+            {
+                throw new OperationJournalRecoveryRequiredException();
+            }
         }
     }
 
@@ -1610,5 +2093,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
     private sealed record DeserializedOperationJournalPayload(
         FileOperationIntent Intent,
         StableFileIdentity? Identity,
+        OperationRecoveryRecipe? RecoveryRecipe,
+        OperationManualRecoveryEvidence? ManualRecoveryEvidence,
         byte[]? CommitFingerprint);
 }

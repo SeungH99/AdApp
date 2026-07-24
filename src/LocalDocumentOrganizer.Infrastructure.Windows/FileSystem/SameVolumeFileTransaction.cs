@@ -53,11 +53,25 @@ public sealed class SameVolumeFileTransaction
         VerifiedStableSource source,
         StableFileIdentity originalIdentity,
         FileOperationIntent intent,
+        CancellationToken cancellationToken) =>
+        RenameNoReplaceAsync(
+            source,
+            originalIdentity,
+            intent,
+            NoOpFileOperationFaultInjector.Instance,
+            cancellationToken);
+
+    internal Task<SameVolumeFileTransactionResult> RenameNoReplaceAsync(
+        VerifiedStableSource source,
+        StableFileIdentity originalIdentity,
+        FileOperationIntent intent,
+        IFileOperationFaultInjector faultInjector,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(originalIdentity);
         ArgumentNullException.ThrowIfNull(intent);
+        ArgumentNullException.ThrowIfNull(faultInjector);
         cancellationToken.ThrowIfCancellationRequested();
         if (intent.Kind is not (
                 FileOperationKind.SameVolumeMove
@@ -71,7 +85,11 @@ public sealed class SameVolumeFileTransaction
         SameVolumeFileTransactionResult result;
         try
         {
-            result = RenameNoReplace(source, originalIdentity, intent);
+            result = RenameNoReplace(
+                source,
+                originalIdentity,
+                intent,
+                faultInjector);
         }
         catch (FileSystemBoundaryException exception)
         {
@@ -98,7 +116,8 @@ public sealed class SameVolumeFileTransaction
     private static SameVolumeFileTransactionResult RenameNoReplace(
         VerifiedStableSource source,
         StableFileIdentity originalIdentity,
-        FileOperationIntent intent)
+        FileOperationIntent intent,
+        IFileOperationFaultInjector faultInjector)
     {
         var canonicalSource = Canonicalize(intent.SourcePath);
         if (!PathMatchesHandle(source.Handle, canonicalSource)
@@ -126,6 +145,8 @@ public sealed class SameVolumeFileTransaction
             destination.CanonicalPath);
         if (renameFailure is { } failure)
             return new SameVolumeFileNotApplied(failure);
+        faultInjector.ThrowIfRequested(
+            FileOperationFaultPoint.AfterNativeRename);
 
         try
         {
@@ -144,6 +165,8 @@ public sealed class SameVolumeFileTransaction
                             ? SameVolumeFileFailure.DestinationIdentityMismatch
                             : SameVolumeFileFailure.DestinationEntryMissing);
             }
+            faultInjector.ThrowIfRequested(
+                FileOperationFaultPoint.AfterDestinationIdentityVerification);
         }
         catch (Exception exception) when (
             exception is FileSystemBoundaryException

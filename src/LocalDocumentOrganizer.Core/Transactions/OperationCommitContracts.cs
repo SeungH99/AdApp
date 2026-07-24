@@ -1,5 +1,6 @@
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
+using System.Security.Cryptography;
 
 namespace LocalDocumentOrganizer.Core.Transactions;
 
@@ -36,6 +37,108 @@ public sealed record FileOperationUsage
     public string Code { get; }
 
     public long Units { get; }
+}
+
+public sealed record OperationRecoveryRecipe
+{
+    public OperationRecoveryRecipe(
+        DataKeyId dataKeyId,
+        AppendEventsCommand appendEvents,
+        IEnumerable<FileOperationSideEffect> sideEffects,
+        FileOperationUsage? usage)
+    {
+        if (dataKeyId.Value == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "A data-key ID is required.",
+                nameof(dataKeyId));
+        }
+
+        ArgumentNullException.ThrowIfNull(appendEvents);
+        ArgumentNullException.ThrowIfNull(sideEffects);
+        var snapshot = sideEffects.ToArray();
+        if (snapshot.Any(sideEffect => sideEffect is null))
+        {
+            throw new ArgumentException(
+                "Side effects cannot contain null entries.",
+                nameof(sideEffects));
+        }
+
+        DataKeyId = dataKeyId;
+        AppendEvents = appendEvents;
+        SideEffects = Array.AsReadOnly(snapshot);
+        Usage = usage;
+    }
+
+    public DataKeyId DataKeyId { get; }
+
+    public AppendEventsCommand AppendEvents { get; }
+
+    public IReadOnlyList<FileOperationSideEffect> SideEffects { get; }
+
+    public FileOperationUsage? Usage { get; }
+
+    public bool ExactEquals(OperationRecoveryRecipe? other)
+    {
+        if (other is null
+            || DataKeyId != other.DataKeyId
+            || AppendEvents.StreamId != other.AppendEvents.StreamId
+            || AppendEvents.ExpectedVersion != other.AppendEvents.ExpectedVersion
+            || AppendEvents.OperationId != other.AppendEvents.OperationId
+            || AppendEvents.Events.Count != other.AppendEvents.Events.Count
+            || SideEffects.Count != other.SideEffects.Count
+            || Usage != other.Usage)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < AppendEvents.Events.Count; index++)
+        {
+            var left = AppendEvents.Events[index];
+            var right = other.AppendEvents.Events[index];
+            if (left.EventId != right.EventId
+                || !string.Equals(
+                    left.EventType,
+                    right.EventType,
+                    StringComparison.Ordinal)
+                || left.SchemaVersion != right.SchemaVersion
+                || !CryptographicOperations.FixedTimeEquals(
+                    left.Payload.Span,
+                    right.Payload.Span)
+                || !ProtectionsEqual(left.Protection, right.Protection))
+            {
+                return false;
+            }
+        }
+
+        for (var index = 0; index < SideEffects.Count; index++)
+        {
+            var left = SideEffects[index];
+            var right = other.SideEffects[index];
+            if (!string.Equals(left.Code, right.Code, StringComparison.Ordinal)
+                || !CryptographicOperations.FixedTimeEquals(
+                    left.Data.Span,
+                    right.Data.Span))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool ProtectionsEqual(
+        PayloadProtection left,
+        PayloadProtection right) =>
+        (left, right) switch
+        {
+            (PayloadProtection.DurableStructural,
+                PayloadProtection.DurableStructural) => true,
+            (PayloadProtection.Shreddable leftShreddable,
+                PayloadProtection.Shreddable rightShreddable) =>
+                leftShreddable.Owner == rightShreddable.Owner,
+            _ => false,
+        };
 }
 
 public sealed record CommitFileOperationCommand

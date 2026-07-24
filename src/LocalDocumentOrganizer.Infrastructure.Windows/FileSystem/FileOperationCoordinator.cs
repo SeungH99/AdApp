@@ -61,6 +61,11 @@ public sealed record FileOperationExecutionRequest
         AppendEvents = appendEvents;
         SideEffects = Array.AsReadOnly(snapshot);
         Usage = usage;
+        RecoveryRecipe = new OperationRecoveryRecipe(
+            dataKeyId,
+            appendEvents,
+            snapshot,
+            usage);
     }
 
     public FileOperationIntent Intent { get; }
@@ -72,6 +77,8 @@ public sealed record FileOperationExecutionRequest
     public IReadOnlyList<FileOperationSideEffect> SideEffects { get; }
 
     public FileOperationUsage? Usage { get; }
+
+    public OperationRecoveryRecipe RecoveryRecipe { get; }
 }
 
 public abstract record FileOperationExecutionResult
@@ -106,13 +113,16 @@ public interface IFileOperationExecutor
         CancellationToken cancellationToken);
 }
 
-public sealed class FileOperationCoordinator : IFileOperationExecutor
+public sealed class FileOperationCoordinator :
+    IFileOperationExecutor,
+    IOperationRecoveryExecutor
 {
     private readonly IOperationJournalStore _journal;
     private readonly FileMutationGate _mutationGate;
     private readonly VaultFileFingerprintService _fingerprints;
     private readonly SameVolumeFileTransaction _sameVolume;
     private readonly IOperationCommitStore _commitStore;
+    private readonly IFileOperationFaultInjector _faults;
 
     public FileOperationCoordinator(
         IOperationJournalStore journal,
@@ -120,17 +130,36 @@ public sealed class FileOperationCoordinator : IFileOperationExecutor
         VaultFileFingerprintService fingerprints,
         SameVolumeFileTransaction sameVolume,
         IOperationCommitStore commitStore)
+        : this(
+            journal,
+            mutationGate,
+            fingerprints,
+            sameVolume,
+            commitStore,
+            NoOpFileOperationFaultInjector.Instance)
+    {
+    }
+
+    internal FileOperationCoordinator(
+        IOperationJournalStore journal,
+        FileMutationGate mutationGate,
+        VaultFileFingerprintService fingerprints,
+        SameVolumeFileTransaction sameVolume,
+        IOperationCommitStore commitStore,
+        IFileOperationFaultInjector faultInjector)
     {
         ArgumentNullException.ThrowIfNull(journal);
         ArgumentNullException.ThrowIfNull(mutationGate);
         ArgumentNullException.ThrowIfNull(fingerprints);
         ArgumentNullException.ThrowIfNull(sameVolume);
         ArgumentNullException.ThrowIfNull(commitStore);
+        ArgumentNullException.ThrowIfNull(faultInjector);
         _journal = journal;
         _mutationGate = mutationGate;
         _fingerprints = fingerprints;
         _sameVolume = sameVolume;
         _commitStore = commitStore;
+        _faults = faultInjector;
     }
 
     public async Task<FileOperationExecutionResult> ExecuteAsync(
@@ -146,8 +175,13 @@ public sealed class FileOperationCoordinator : IFileOperationExecutor
         }
 
         var persisted = await _journal
-            .PersistIntentAsync(request.Intent, cancellationToken)
+            .PersistIntentAsync(
+                request.Intent,
+                request.RecoveryRecipe,
+                cancellationToken)
             .ConfigureAwait(false);
+        _faults.ThrowIfRequested(
+            FileOperationFaultPoint.AfterIntentPersist);
         if (persisted.Status == PersistOperationIntentStatus.Conflict)
         {
             return new FileOperationNotApplied(
@@ -177,7 +211,9 @@ public sealed class FileOperationCoordinator : IFileOperationExecutor
             if (current is null
                 || !SqliteOperationJournalStore.IntentsEqual(
                     current.Intent,
-                    request.Intent))
+                    request.Intent)
+                || !request.RecoveryRecipe.ExactEquals(
+                    current.RecoveryRecipe))
             {
                 return new FileOperationRecoveryRequired(
                     FileOperationFailure.JournalConflict,
@@ -185,112 +221,58 @@ public sealed class FileOperationCoordinator : IFileOperationExecutor
             }
 
             durableState = current.State;
-            var reconciled = await ReconcileAdvancedStateAsync(
-                    request,
-                    current)
-                .ConfigureAwait(false);
-            if (reconciled is not null)
-                return reconciled;
+            if (current.State is
+                OperationJournalState.FileApplied
+                or OperationJournalState.EventAndProjectionCommitted
+                or OperationJournalState.SideEffectsPending
+                or OperationJournalState.Completed)
+            {
+                return await FinalizeCommitWithinGateAsync(
+                        current,
+                        request.RecoveryRecipe,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
 
-            var guard = new ApprovedRootPathGuard(request.Intent.SourceRoot);
-            var identityProvider = new NtfsFileIdentityProvider(guard);
-            await using var source = identityProvider.OpenVerifiedSource(
+            if (current.State != OperationJournalState.IntentPersisted)
+            {
+                return new FileOperationRecoveryRequired(
+                    FileOperationFailure.UnexpectedJournalState,
+                    current.State);
+            }
+
+            var identityProvider = new NtfsFileIdentityProvider(
+                new ApprovedRootPathGuard(request.Intent.SourceRoot));
+            var source = identityProvider.OpenVerifiedSource(
                 request.Intent.SourcePath);
-            var lockedIdentity = await _fingerprints
-                .CaptureAsync(
-                    request.Intent.Owner,
-                    request.DataKeyId,
-                    source,
-                    CancellationToken.None)
-                .ConfigureAwait(false);
-
-            current = await TransitionAsync(
+            await using var observation =
+                new OperationRecoveryObservationScope(
+                    RecoveryPathObservation.Exact,
+                    RecoveryPathObservation.Missing,
+                    source);
+            return await ResumeRenameWithinGateAsync(
                     current,
-                    OperationJournalState.IdentityLocked,
-                    lockedIdentity)
-                .ConfigureAwait(false);
-            if (current is null)
-            {
-                return new FileOperationRecoveryRequired(
-                    FileOperationFailure.JournalConflict,
-                    OperationJournalState.IntentPersisted);
-            }
-            durableState = current.State;
-
-            current = await TransitionAsync(
-                    current,
-                    OperationJournalState.Renaming)
-                .ConfigureAwait(false);
-            if (current is null)
-            {
-                return new FileOperationRecoveryRequired(
-                    FileOperationFailure.JournalConflict,
-                    OperationJournalState.IdentityLocked);
-            }
-            durableState = current.State;
-
-            var renamed = await _sameVolume
-                .RenameNoReplaceAsync(
-                    source,
-                    lockedIdentity,
-                    request.Intent,
+                    request.RecoveryRecipe,
+                    observation,
                     CancellationToken.None)
-                .ConfigureAwait(false);
-            if (renamed is SameVolumeFileNotApplied notApplied)
-            {
-                return new FileOperationNotApplied(
-                    MapFailure(notApplied.Failure),
-                    OperationJournalState.Renaming);
-            }
-
-            if (renamed is SameVolumeFileVerificationRequired verification)
-            {
-                return new FileOperationRecoveryRequired(
-                    MapFailure(verification.Failure),
-                    OperationJournalState.Renaming);
-            }
-
-            var verifiedIdentity = await _fingerprints
-                .CaptureAsync(
-                    request.Intent.Owner,
-                    request.DataKeyId,
-                    source,
-                    CancellationToken.None)
-                .ConfigureAwait(false);
-            if (!IdentitiesEqual(lockedIdentity, verifiedIdentity))
-            {
-                return new FileOperationRecoveryRequired(
-                    FileOperationFailure.IdentityMismatch,
-                    OperationJournalState.Renaming);
-            }
-
-            current = await TransitionAsync(
-                    current,
-                    OperationJournalState.FileApplied)
-                .ConfigureAwait(false);
-            if (current is null)
-            {
-                return new FileOperationRecoveryRequired(
-                    FileOperationFailure.JournalConflict,
-                    OperationJournalState.Renaming);
-            }
-            durableState = current.State;
-
-            return await CommitExactAsync(
-                    request,
-                    current.Revision,
-                    verifiedIdentity,
-                    OperationJournalState.FileApplied)
                 .ConfigureAwait(false);
         }
         catch (StableSourceBoundaryException exception)
         {
+            durableState = await ReloadDurableStateAsync(
+                    request.Intent.OperationId,
+                    durableState)
+                .ConfigureAwait(false);
             return CreateFileSystemFailureResult(
                 MapSourceFailure(exception),
                 durableState);
         }
         catch (FileSystemBoundaryException exception)
         {
+            durableState = await ReloadDurableStateAsync(
+                    request.Intent.OperationId,
+                    durableState)
+                .ConfigureAwait(false);
             return CreateFileSystemFailureResult(
                 MapBoundaryFailure(exception),
                 durableState);
@@ -303,32 +285,205 @@ public sealed class FileOperationCoordinator : IFileOperationExecutor
         }
         catch (UnauthorizedAccessException)
         {
+            durableState = await ReloadDurableStateAsync(
+                    request.Intent.OperationId,
+                    durableState)
+                .ConfigureAwait(false);
             return CreateFileSystemFailureResult(
                 FileOperationFailure.AccessDenied,
                 durableState);
         }
         catch (IOException exception)
         {
+            durableState = await ReloadDurableStateAsync(
+                    request.Intent.OperationId,
+                    durableState)
+                .ConfigureAwait(false);
             return CreateFileSystemFailureResult(
                 MapBoundaryFailure(exception),
                 durableState);
         }
     }
 
-    private async Task<FileOperationExecutionResult?> ReconcileAdvancedStateAsync(
-        FileOperationExecutionRequest request,
-        OperationJournalEntry current)
-    {
-        if (current.State == OperationJournalState.IntentPersisted)
-            return null;
+    async Task<FileOperationExecutionResult>
+        IOperationRecoveryExecutor.ResumeRenameWithinGateAsync(
+            OperationJournalEntry entry,
+            OperationRecoveryRecipe recipe,
+            OperationRecoveryObservationScope observation,
+            CancellationToken cancellationToken) =>
+        await ResumeRenameWithinGateAsync(
+            entry,
+            recipe,
+            observation,
+            cancellationToken).ConfigureAwait(false);
 
-        if (current.State is OperationJournalState.IdentityLocked
-            or OperationJournalState.Renaming
-            or OperationJournalState.ManualRecovery)
+    internal async Task<FileOperationExecutionResult> ResumeRenameWithinGateAsync(
+        OperationJournalEntry entry,
+        OperationRecoveryRecipe recipe,
+        OperationRecoveryObservationScope observation,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(recipe);
+        ArgumentNullException.ThrowIfNull(observation);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!RecipeMatches(entry, recipe)
+            || observation.Source != RecoveryPathObservation.Exact
+            || observation.ExactSource is null
+            || entry.State is not (
+                OperationJournalState.IntentPersisted
+                or OperationJournalState.IdentityLocked
+                or OperationJournalState.Renaming))
         {
             return new FileOperationRecoveryRequired(
-                FileOperationFailure.UnexpectedJournalState,
+                FileOperationFailure.JournalConflict,
+                entry.State);
+        }
+
+        var current = entry;
+        var lockedIdentity = current.Identity;
+        if (current.State == OperationJournalState.IntentPersisted)
+        {
+            lockedIdentity = await _fingerprints.CaptureAsync(
+                    current.Owner,
+                    recipe.DataKeyId,
+                    observation.ExactSource,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            _faults.ThrowIfRequested(
+                FileOperationFaultPoint.AfterSourceIdentityCapture);
+            current = await TransitionAsync(
+                    current,
+                    OperationJournalState.IdentityLocked,
+                    lockedIdentity)
+                .ConfigureAwait(false)
+                ?? throw new OperationJournalRecoveryRequiredException();
+            _faults.ThrowIfRequested(
+                FileOperationFaultPoint.AfterIdentityLocked);
+        }
+
+        if (lockedIdentity is null)
+        {
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.JournalConflict,
                 current.State);
+        }
+
+        if (current.State == OperationJournalState.IdentityLocked)
+        {
+            current = await TransitionAsync(
+                    current,
+                    OperationJournalState.Renaming)
+                .ConfigureAwait(false)
+                ?? throw new OperationJournalRecoveryRequiredException();
+            _faults.ThrowIfRequested(
+                FileOperationFaultPoint.AfterRenaming);
+        }
+
+        var renamed = await _sameVolume.RenameNoReplaceAsync(
+                observation.ExactSource,
+                lockedIdentity,
+                current.Intent,
+                _faults,
+                CancellationToken.None)
+            .ConfigureAwait(false);
+        if (renamed is SameVolumeFileNotApplied notApplied)
+        {
+            return new FileOperationNotApplied(
+                MapFailure(notApplied.Failure),
+                OperationJournalState.Renaming);
+        }
+
+        if (renamed is SameVolumeFileVerificationRequired verification)
+        {
+            return new FileOperationRecoveryRequired(
+                MapFailure(verification.Failure),
+                OperationJournalState.Renaming);
+        }
+
+        var verifiedIdentity = await _fingerprints.CaptureAsync(
+                current.Owner,
+                recipe.DataKeyId,
+                observation.ExactSource,
+                CancellationToken.None)
+            .ConfigureAwait(false);
+        if (!IdentitiesEqual(lockedIdentity, verifiedIdentity))
+        {
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.IdentityMismatch,
+                OperationJournalState.Renaming);
+        }
+
+        current = await TransitionAsync(
+                current,
+                OperationJournalState.FileApplied)
+            .ConfigureAwait(false)
+            ?? throw new OperationJournalRecoveryRequiredException();
+        _faults.ThrowIfRequested(
+            FileOperationFaultPoint.AfterFileApplied);
+        return await CommitExactAsync(
+                current,
+                recipe,
+                verifiedIdentity,
+                OperationJournalState.FileApplied)
+            .ConfigureAwait(false);
+    }
+
+    async Task<FileOperationExecutionResult>
+        IOperationRecoveryExecutor.FinalizeCommitWithinGateAsync(
+            OperationJournalEntry entry,
+            OperationRecoveryRecipe recipe,
+            OperationRecoveryObservationScope observation,
+            CancellationToken cancellationToken) =>
+        await FinalizeCommitWithinGateCoreAsync(
+            entry,
+            recipe,
+            observation,
+            cancellationToken).ConfigureAwait(false);
+
+    internal async Task<FileOperationExecutionResult> FinalizeCommitWithinGateAsync(
+        OperationJournalEntry entry,
+        OperationRecoveryRecipe recipe,
+        CancellationToken cancellationToken) =>
+        await FinalizeCommitWithinGateCoreAsync(
+                entry,
+                recipe,
+                observation: null,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    private async Task<FileOperationExecutionResult>
+        FinalizeCommitWithinGateCoreAsync(
+            OperationJournalEntry entry,
+            OperationRecoveryRecipe recipe,
+            OperationRecoveryObservationScope? observation,
+            CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(recipe);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!RecipeMatches(entry, recipe)
+            || entry.Identity is null
+            || observation is not null
+                && (observation.Destination
+                        != RecoveryPathObservation.Exact
+                    || observation.ExactDestination is null))
+        {
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.JournalConflict,
+                entry.State);
+        }
+
+        var identity = entry.Identity
+            ?? throw new OperationJournalRecoveryRequiredException();
+        var current = entry;
+        if (current.State == OperationJournalState.Renaming)
+        {
+            current = await TransitionAsync(
+                    current,
+                    OperationJournalState.FileApplied)
+                .ConfigureAwait(false)
+                ?? throw new OperationJournalRecoveryRequiredException();
         }
 
         if (current.State is not (
@@ -342,53 +497,99 @@ public sealed class FileOperationCoordinator : IFileOperationExecutor
                 current.State);
         }
 
-        if (current.Identity is null)
-        {
-            return new FileOperationRecoveryRequired(
-                FileOperationFailure.JournalConflict,
-                current.State);
-        }
-
         return await CommitExactAsync(
-                request,
-                expectedFileAppliedRevision: 4,
-                current.Identity,
+                current,
+                recipe,
+                identity,
                 current.State)
             .ConfigureAwait(false);
     }
 
     private async Task<FileOperationExecutionResult> CommitExactAsync(
-        FileOperationExecutionRequest request,
-        long expectedFileAppliedRevision,
+        OperationJournalEntry entry,
+        OperationRecoveryRecipe recipe,
         StableFileIdentity identity,
         OperationJournalState durableState)
     {
         var commit = new CommitFileOperationCommand(
-            request.Intent.OperationId,
-            expectedFileAppliedRevision,
-            request.AppendEvents,
-            request.SideEffects,
-            request.Usage);
+            entry.OperationId,
+            expectedJournalRevision: 4,
+            recipe.AppendEvents,
+            recipe.SideEffects,
+            recipe.Usage);
         var committed = await _commitStore
             .CommitAppliedAsync(commit, CancellationToken.None)
             .ConfigureAwait(false);
-        return committed switch
+        if (committed is not (OperationCommitted or AlreadyCommitted))
         {
-            OperationCommitted or AlreadyCommitted =>
-                new FileOperationSucceeded(committed, identity),
-            OperationCommitConflict =>
+            return committed switch
+            {
+                OperationCommitConflict =>
                 new FileOperationRecoveryRequired(
                     FileOperationFailure.CommitConflict,
                     durableState),
-            OperationCommitStorageBusy =>
+                OperationCommitStorageBusy =>
                 new FileOperationRecoveryRequired(
                     FileOperationFailure.CommitStorageBusy,
                     durableState),
-            _ => new FileOperationRecoveryRequired(
-                FileOperationFailure.NativeFailure,
-                durableState),
-        };
+                _ => new FileOperationRecoveryRequired(
+                    FileOperationFailure.NativeFailure,
+                    durableState),
+            };
+        }
+
+        var current = await _journal.GetAsync(
+                entry.OperationId,
+                CancellationToken.None)
+            .ConfigureAwait(false);
+        if (current is null
+            || !RecipeMatches(current, recipe)
+            || current.Identity is null)
+        {
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.JournalConflict,
+                durableState);
+        }
+
+        if (current.State == OperationJournalState.EventAndProjectionCommitted)
+        {
+            _faults.ThrowIfRequested(
+                FileOperationFaultPoint.AfterEventAndProjectionCommitted);
+            current = await TransitionAsync(
+                    current,
+                    OperationJournalState.SideEffectsPending)
+                .ConfigureAwait(false);
+            if (current?.State
+                == OperationJournalState.SideEffectsPending)
+            {
+                _faults.ThrowIfRequested(
+                    FileOperationFaultPoint.AfterSideEffectsPending);
+            }
+        }
+
+        if (current?.State == OperationJournalState.SideEffectsPending)
+        {
+            current = await TransitionAsync(
+                    current,
+                    OperationJournalState.Completed)
+                .ConfigureAwait(false);
+        }
+
+        return current?.State == OperationJournalState.Completed
+            ? new FileOperationSucceeded(committed, identity)
+            : new FileOperationRecoveryRequired(
+                FileOperationFailure.JournalConflict,
+                current?.State ?? durableState);
     }
+
+    private static bool RecipeMatches(
+        OperationJournalEntry entry,
+        OperationRecoveryRecipe recipe) =>
+        recipe.ExactEquals(entry.RecoveryRecipe)
+        && recipe.AppendEvents.OperationId == entry.OperationId
+        && recipe.AppendEvents.StreamId == entry.Intent.StreamId
+        && recipe.AppendEvents.ExpectedVersion
+            == entry.Intent.ExpectedStreamVersion;
 
     private async Task<OperationJournalEntry?> TransitionAsync(
         OperationJournalEntry current,
@@ -496,6 +697,27 @@ public sealed class FileOperationCoordinator : IFileOperationExecutor
         OperationJournalState durableState) =>
         durableState is OperationJournalState.Renaming
             or OperationJournalState.FileApplied
+            or OperationJournalState.EventAndProjectionCommitted
+            or OperationJournalState.SideEffectsPending
             ? new FileOperationRecoveryRequired(failure, durableState)
             : new FileOperationNotApplied(failure, durableState);
+
+    private async Task<OperationJournalState> ReloadDurableStateAsync(
+        OperationId operationId,
+        OperationJournalState fallback)
+    {
+        try
+        {
+            return (await _journal.GetAsync(
+                        operationId,
+                        CancellationToken.None)
+                    .ConfigureAwait(false))
+                ?.State
+                ?? fallback;
+        }
+        catch
+        {
+            return fallback;
+        }
+    }
 }

@@ -83,6 +83,34 @@ public static class OperationJournalStateMachine
         new(FileOperationKind.UndoCrossVolumeMove, OperationJournalState.SideEffectsPending, OperationJournalState.ManualRecovery),
     ];
 
+    public static OperationRecoveryDecision DecideSameVolumeRecovery(
+        RecoveryPathObservation source,
+        RecoveryPathObservation destination)
+    {
+        if (!Enum.IsDefined(source))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(source),
+                "The source observation is not defined.");
+        }
+
+        if (!Enum.IsDefined(destination))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(destination),
+                "The destination observation is not defined.");
+        }
+
+        return (source, destination) switch
+        {
+            (RecoveryPathObservation.Exact, RecoveryPathObservation.Missing) =>
+                OperationRecoveryDecision.ResumeRename,
+            (RecoveryPathObservation.Missing, RecoveryPathObservation.Exact) =>
+                OperationRecoveryDecision.FinalizeDatabaseCommit,
+            _ => OperationRecoveryDecision.ManualRecovery,
+        };
+    }
+
     public static bool CanTransition(
         FileOperationKind kind,
         OperationJournalState current,
