@@ -78,6 +78,47 @@ internal static class WindowsFileSystemNative
         }
     }
 
+    internal static SafeFileHandle OpenIdentityProbeHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            GenericRead,
+            FileShareRead | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint
+                | FileFlagSequentialScan
+                | FileFlagOverlapped,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        try
+        {
+            var information = GetAttributeTagInfo(handle);
+            if ((information.FileAttributes
+                    & (FileAttributeDirectory
+                        | FileAttributeReparsePoint)) != 0)
+            {
+                throw new FileSystemBoundaryException(
+                    "The identity-probe entry is not an approved regular file.");
+            }
+
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
     internal static PathComponentOpenOutcome TryGetPathComponentInfo(
         string canonicalPath,
         out FILE_ATTRIBUTE_TAG_INFO information)
@@ -588,7 +629,7 @@ internal static class WindowsFileSystemNative
         return information;
     }
 
-    private static FILE_BASIC_INFO GetBasicInfo(SafeFileHandle handle)
+    internal static FILE_BASIC_INFO GetBasicInfo(SafeFileHandle handle)
     {
         if (!GetFileInformationByHandleEx(
                 handle,
@@ -600,6 +641,15 @@ internal static class WindowsFileSystemNative
         }
 
         return information;
+    }
+
+    internal static void FlushFileData(SafeFileHandle handle)
+    {
+        RequireUsableHandle(handle);
+        if (!FlushFileBuffers(handle))
+        {
+            throw CreateNativeException(Marshal.GetLastPInvokeError());
+        }
     }
 
     internal static string ToExtendedPath(string canonicalPath)
@@ -642,6 +692,13 @@ internal static class WindowsFileSystemNative
         uint creationDisposition,
         uint flagsAndAttributes,
         IntPtr templateFile);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "FlushFileBuffers",
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool FlushFileBuffers(SafeFileHandle file);
 
     [DllImport(
         "kernel32.dll",

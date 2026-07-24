@@ -104,11 +104,15 @@ public sealed class UndoCoordinator
             .ConfigureAwait(false);
         if (original is not
             {
-                Kind: FileOperationKind.SameVolumeMove,
                 State: OperationJournalState.Completed,
                 Identity: not null,
                 RecoveryRecipe: not null,
-            })
+            }
+            || original.Kind is not (
+                FileOperationKind.SameVolumeMove
+                or FileOperationKind.CrossVolumeMove)
+            || original.Kind == FileOperationKind.CrossVolumeMove
+                && original.AppliedIdentity is null)
         {
             return new FileOperationNotApplied(
                 FileOperationFailure.UnexpectedJournalState,
@@ -118,7 +122,9 @@ public sealed class UndoCoordinator
         var intent = new FileOperationIntent(
             request.OperationId,
             original.Owner,
-            FileOperationKind.UndoSameVolumeMove,
+            original.Kind == FileOperationKind.CrossVolumeMove
+                ? FileOperationKind.UndoCrossVolumeMove
+                : FileOperationKind.UndoSameVolumeMove,
             original.Intent.DestinationPath,
             original.Intent.SourcePath,
             original.Intent.DestinationRoot,
@@ -133,7 +139,9 @@ public sealed class UndoCoordinator
             request.AppendEvents,
             request.SideEffects,
             request.Usage,
-            original.Identity);
+            original.Kind == FileOperationKind.CrossVolumeMove
+                ? original.AppliedIdentity!
+                : original.Identity);
         return await _executor.ExecuteAsync(execution, cancellationToken)
             .ConfigureAwait(false);
     }

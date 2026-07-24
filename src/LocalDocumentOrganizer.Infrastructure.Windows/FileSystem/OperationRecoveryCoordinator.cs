@@ -22,6 +22,19 @@ internal enum FileOperationFaultPoint
     AfterSideEffectsPending,
     BeforeFinalizeSourceAbsenceRevalidation,
     BeforeDestinationAdmission,
+    AfterCrossVolumeCopying,
+    AfterCrossVolumeCopy,
+    AfterCrossVolumeFlush,
+    AfterCrossVolumeMetadata,
+    AfterCrossVolumeCopied,
+    BeforeCrossVolumeFingerprint,
+    AfterCrossVolumeFingerprint,
+    AfterCrossVolumeVerified,
+    BeforeCrossVolumeSourceRevalidation,
+    AfterCrossVolumeSourceRevalidation,
+    AfterCrossVolumeDeletingSource,
+    BeforeCrossVolumeSourceDeletion,
+    AfterCrossVolumeSourceDeletion,
 }
 
 internal interface IFileOperationFaultInjector
@@ -76,6 +89,16 @@ internal interface IOperationRecoveryExecutor
         OperationRecoveryRecipe recipe,
         OperationRecoveryObservationScope observation,
         CancellationToken cancellationToken);
+
+    Task<FileOperationExecutionResult> ResumeCrossVolumeWithinGateAsync(
+        OperationJournalEntry entry,
+        OperationRecoveryRecipe recipe,
+        OperationRecoveryObservationScope observation,
+        CancellationToken cancellationToken) =>
+        Task.FromResult<FileOperationExecutionResult>(
+            new FileOperationNotApplied(
+                FileOperationFailure.UnsupportedOperation,
+                entry.State));
 }
 
 internal interface ISourceAbsenceGuard : IAsyncDisposable
@@ -494,7 +517,11 @@ public sealed class OperationRecoveryCoordinator
             {
                 recoveredCount++;
             }
-            else
+            else if (recovery is FileOperationRecoveryRequired
+                {
+                    DurableState:
+                        OperationJournalState.ManualRecovery,
+                })
             {
                 manualRecoveryCount++;
             }
@@ -527,7 +554,9 @@ public sealed class OperationRecoveryCoordinator
 
         if (entry.Kind is not (
                 FileOperationKind.SameVolumeMove
-                or FileOperationKind.UndoSameVolumeMove))
+                or FileOperationKind.UndoSameVolumeMove
+                or FileOperationKind.CrossVolumeMove
+                or FileOperationKind.UndoCrossVolumeMove))
         {
             await EnterManualRecoveryAsync(
                     entry,
@@ -552,13 +581,15 @@ public sealed class OperationRecoveryCoordinator
         }
         catch (Exception exception) when (
             exception is not OperationCanceledException
-            && entry.Kind == FileOperationKind.UndoSameVolumeMove)
+            && IsUndo(entry.Kind))
         {
             var observerLatest = await ReloadExactAsync(entry, cancellationToken)
                 .ConfigureAwait(false);
             if (observerLatest.State == OperationJournalState.Completed)
             {
-                if (observerLatest.Identity is null)
+                var completedIdentity =
+                    AppliedIdentity(observerLatest);
+                if (completedIdentity is null)
                 {
                     throw new OperationJournalRecoveryRequiredException();
                 }
@@ -566,7 +597,7 @@ public sealed class OperationRecoveryCoordinator
                 return new FileOperationSucceeded(
                     new AlreadyCommitted(
                         observerLatest.Intent.ExpectedStreamVersion.Next()),
-                    observerLatest.Identity);
+                    completedIdentity);
             }
 
             if (observerLatest.State != OperationJournalState.ManualRecovery)
@@ -588,14 +619,23 @@ public sealed class OperationRecoveryCoordinator
         }
 
         await using var observationScope = observation;
-        var decision = OperationJournalStateMachine.DecideSameVolumeRecovery(
-            observation.Source,
-            observation.Destination);
+        var decision = DecideRecovery(entry, observation);
         FileOperationExecutionResult? result = null;
         Exception? recoverableFailure = null;
         try
         {
             if (decision == OperationRecoveryDecision.ResumeRename
+                && IsCrossVolume(entry.Kind))
+            {
+                result = await _executor
+                    .ResumeCrossVolumeWithinGateAsync(
+                        entry,
+                        entry.RecoveryRecipe,
+                        observation,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            else if (decision == OperationRecoveryDecision.ResumeRename
                 && entry.State is
                     OperationJournalState.IntentPersisted
                     or OperationJournalState.IdentityLocked
@@ -612,6 +652,7 @@ public sealed class OperationRecoveryCoordinator
                     == OperationRecoveryDecision.FinalizeDatabaseCommit
                 && entry.State is
                     OperationJournalState.Renaming
+                    or OperationJournalState.DeletingSource
                     or OperationJournalState.FileApplied
                     or OperationJournalState.EventAndProjectionCommitted
                     or OperationJournalState.SideEffectsPending)
@@ -639,7 +680,8 @@ public sealed class OperationRecoveryCoordinator
             .ConfigureAwait(false);
         if (latest.State == OperationJournalState.Completed)
         {
-            if (latest.Identity is null)
+            var completedIdentity = AppliedIdentity(latest);
+            if (completedIdentity is null)
             {
                 throw new OperationJournalRecoveryRequiredException();
             }
@@ -647,7 +689,7 @@ public sealed class OperationRecoveryCoordinator
             return new FileOperationSucceeded(
                 new AlreadyCommitted(
                     latest.Intent.ExpectedStreamVersion.Next()),
-                latest.Identity);
+                completedIdentity);
         }
 
         if (latest.State == OperationJournalState.ManualRecovery)
@@ -655,6 +697,16 @@ public sealed class OperationRecoveryCoordinator
             return new FileOperationRecoveryRequired(
                 FileOperationFailure.UnexpectedJournalState,
                 latest.State);
+        }
+
+        if (IsCrossVolume(latest.Kind)
+            && latest.State < OperationJournalState.Verified
+            && result is FileOperationNotApplied
+            {
+                Failure: not FileOperationFailure.DestinationExists,
+            })
+        {
+            return result;
         }
 
         var reason = ClassifyManualRecoveryReason(
@@ -705,7 +757,7 @@ public sealed class OperationRecoveryCoordinator
         Exception? recoverableFailure,
         OperationRecoveryDecision decision)
     {
-        if (kind != FileOperationKind.UndoSameVolumeMove)
+        if (!IsUndo(kind))
         {
             return recoverableFailure is not null
                 ? OperationManualRecoveryReason.ObservationFailed
@@ -792,6 +844,75 @@ public sealed class OperationRecoveryCoordinator
             _ => OperationManualRecoveryReason.UndoNativeAmbiguity,
         };
     }
+
+    private static OperationRecoveryDecision DecideRecovery(
+        OperationJournalEntry entry,
+        OperationRecoveryObservationScope observation)
+    {
+        if (!IsCrossVolume(entry.Kind))
+        {
+            return OperationJournalStateMachine.DecideSameVolumeRecovery(
+                observation.Source,
+                observation.Destination);
+        }
+
+        if (observation.Source == RecoveryPathObservation.Exact)
+        {
+            if (entry.State is
+                    OperationJournalState.IntentPersisted
+                    or OperationJournalState.IdentityLocked
+                    or OperationJournalState.Copying
+                && observation.Destination
+                    == RecoveryPathObservation.Missing)
+            {
+                return OperationRecoveryDecision.ResumeRename;
+            }
+
+            if (entry.State == OperationJournalState.Copied
+                && observation.Destination is
+                    RecoveryPathObservation.Missing
+                    or RecoveryPathObservation.Exact)
+            {
+                return OperationRecoveryDecision.ResumeRename;
+            }
+
+            if (entry.State == OperationJournalState.Verified
+                && observation.Destination
+                    == RecoveryPathObservation.Exact)
+            {
+                return OperationRecoveryDecision.ResumeRename;
+            }
+        }
+
+        if (entry.State is
+                OperationJournalState.DeletingSource
+                or OperationJournalState.FileApplied
+                or OperationJournalState.EventAndProjectionCommitted
+                or OperationJournalState.SideEffectsPending
+            && observation.Source == RecoveryPathObservation.Missing
+            && observation.Destination == RecoveryPathObservation.Exact)
+        {
+            return OperationRecoveryDecision.FinalizeDatabaseCommit;
+        }
+
+        return OperationRecoveryDecision.ManualRecovery;
+    }
+
+    private static bool IsCrossVolume(FileOperationKind kind) =>
+        kind is
+            FileOperationKind.CrossVolumeMove
+            or FileOperationKind.UndoCrossVolumeMove;
+
+    private static bool IsUndo(FileOperationKind kind) =>
+        kind is
+            FileOperationKind.UndoSameVolumeMove
+            or FileOperationKind.UndoCrossVolumeMove;
+
+    private static StableFileIdentity? AppliedIdentity(
+        OperationJournalEntry entry) =>
+        IsCrossVolume(entry.Kind)
+            ? entry.AppliedIdentity
+            : entry.Identity;
 
     private async Task<OperationJournalEntry> ReloadExactAsync(
         OperationJournalEntry original,
@@ -891,7 +1012,9 @@ internal sealed class HandleSafeOperationRecoveryObserver
                     recipe,
                     entry.Identity ?? recipe.ExpectedSourceIdentity,
                     allowUnmeasuredSource:
-                        entry.Kind == FileOperationKind.SameVolumeMove
+                        entry.Kind is not (
+                            FileOperationKind.UndoSameVolumeMove
+                            or FileOperationKind.UndoCrossVolumeMove)
                         && entry.Identity is null,
                     retainExact: true,
                     cancellationToken)
@@ -921,8 +1044,14 @@ internal sealed class HandleSafeOperationRecoveryObserver
                     entry.Intent.DestinationPath,
                     entry,
                     recipe,
-                    entry.Identity,
-                    allowUnmeasuredSource: false,
+                    IsCrossVolume(entry.Kind)
+                        ? entry.AppliedIdentity
+                        : entry.Identity,
+                    allowUnmeasuredSource:
+                        IsCrossVolume(entry.Kind)
+                        && entry.State
+                            == OperationJournalState.Copied
+                        && entry.AppliedIdentity is null,
                     retainExact: true,
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -1059,6 +1188,11 @@ internal sealed class HandleSafeOperationRecoveryObserver
         StableFileIdentity left,
         StableFileIdentity right) =>
         left.FixedTimeEquals(right);
+
+    private static bool IsCrossVolume(FileOperationKind kind) =>
+        kind is
+            FileOperationKind.CrossVolumeMove
+            or FileOperationKind.UndoCrossVolumeMove;
 
     private sealed record PathObservation(
         RecoveryPathObservation Observation,

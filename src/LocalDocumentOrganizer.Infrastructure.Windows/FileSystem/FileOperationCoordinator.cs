@@ -131,6 +131,7 @@ public sealed class FileOperationCoordinator :
     private readonly FileMutationGate _mutationGate;
     private readonly VaultFileFingerprintService _fingerprints;
     private readonly SameVolumeFileTransaction _sameVolume;
+    private readonly CrossVolumeFileTransaction _crossVolume;
     private readonly IOperationCommitStore _commitStore;
     private readonly IFileOperationFaultInjector _faults;
     private readonly OperationRecoveryCoordinator _liveRecovery;
@@ -146,6 +147,7 @@ public sealed class FileOperationCoordinator :
             mutationGate,
             fingerprints,
             sameVolume,
+            new CrossVolumeFileTransaction(),
             commitStore,
             NoOpFileOperationFaultInjector.Instance)
     {
@@ -158,17 +160,38 @@ public sealed class FileOperationCoordinator :
         SameVolumeFileTransaction sameVolume,
         IOperationCommitStore commitStore,
         IFileOperationFaultInjector faultInjector)
+        : this(
+            journal,
+            mutationGate,
+            fingerprints,
+            sameVolume,
+            new CrossVolumeFileTransaction(),
+            commitStore,
+            faultInjector)
+    {
+    }
+
+    internal FileOperationCoordinator(
+        IOperationJournalStore journal,
+        FileMutationGate mutationGate,
+        VaultFileFingerprintService fingerprints,
+        SameVolumeFileTransaction sameVolume,
+        CrossVolumeFileTransaction crossVolume,
+        IOperationCommitStore commitStore,
+        IFileOperationFaultInjector faultInjector)
     {
         ArgumentNullException.ThrowIfNull(journal);
         ArgumentNullException.ThrowIfNull(mutationGate);
         ArgumentNullException.ThrowIfNull(fingerprints);
         ArgumentNullException.ThrowIfNull(sameVolume);
+        ArgumentNullException.ThrowIfNull(crossVolume);
         ArgumentNullException.ThrowIfNull(commitStore);
         ArgumentNullException.ThrowIfNull(faultInjector);
         _journal = journal;
         _mutationGate = mutationGate;
         _fingerprints = fingerprints;
         _sameVolume = sameVolume;
+        _crossVolume = crossVolume;
         _commitStore = commitStore;
         _faults = faultInjector;
         _liveRecovery = new OperationRecoveryCoordinator(
@@ -185,7 +208,9 @@ public sealed class FileOperationCoordinator :
         ArgumentNullException.ThrowIfNull(request);
         if (request.Intent.Kind is not (
                 FileOperationKind.SameVolumeMove
-                or FileOperationKind.UndoSameVolumeMove))
+                or FileOperationKind.UndoSameVolumeMove
+                or FileOperationKind.CrossVolumeMove
+                or FileOperationKind.UndoCrossVolumeMove))
         {
             return new FileOperationNotApplied(
                 FileOperationFailure.UnsupportedOperation,
@@ -248,7 +273,34 @@ public sealed class FileOperationCoordinator :
                     .ConfigureAwait(false);
             }
 
-            if (current.Kind == FileOperationKind.UndoSameVolumeMove)
+            if (IsCrossVolume(current.Kind)
+                && current.State
+                    == OperationJournalState.IntentPersisted)
+            {
+                var crossIdentityProvider =
+                    new NtfsFileIdentityProvider(
+                    new ApprovedRootPathGuard(
+                        request.Intent.SourceRoot));
+                var crossSource =
+                    crossIdentityProvider.OpenVerifiedSource(
+                    request.Intent.SourcePath);
+                await using var crossObservation =
+                    new OperationRecoveryObservationScope(
+                        RecoveryPathObservation.Exact,
+                        RecoveryPathObservation.Missing,
+                        crossSource);
+                return await ResumeCrossVolumeWithinGateAsync(
+                        current,
+                        request.RecoveryRecipe,
+                        crossObservation,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+
+            if (current.Kind is
+                    FileOperationKind.UndoSameVolumeMove
+                    or FileOperationKind.CrossVolumeMove
+                    or FileOperationKind.UndoCrossVolumeMove)
             {
                 return await _liveRecovery.RecoverWithinGateAsync(
                         current,
@@ -471,6 +523,289 @@ public sealed class FileOperationCoordinator :
     }
 
     async Task<FileOperationExecutionResult>
+        IOperationRecoveryExecutor.ResumeCrossVolumeWithinGateAsync(
+            OperationJournalEntry entry,
+            OperationRecoveryRecipe recipe,
+            OperationRecoveryObservationScope observation,
+            CancellationToken cancellationToken) =>
+        await ResumeCrossVolumeWithinGateAsync(
+            entry,
+            recipe,
+            observation,
+            cancellationToken).ConfigureAwait(false);
+
+    internal async Task<FileOperationExecutionResult>
+        ResumeCrossVolumeWithinGateAsync(
+            OperationJournalEntry entry,
+            OperationRecoveryRecipe recipe,
+            OperationRecoveryObservationScope observation,
+            CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(recipe);
+        ArgumentNullException.ThrowIfNull(observation);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!RecipeMatches(entry, recipe)
+            || entry.Kind is not (
+                FileOperationKind.CrossVolumeMove
+                or FileOperationKind.UndoCrossVolumeMove)
+            || observation.Source != RecoveryPathObservation.Exact
+            || observation.ExactSource is null
+            || entry.State is not (
+                OperationJournalState.IntentPersisted
+                or OperationJournalState.IdentityLocked
+                or OperationJournalState.Copying
+                or OperationJournalState.Copied
+                or OperationJournalState.Verified))
+        {
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.JournalConflict,
+                entry.State);
+        }
+
+        var current = entry;
+        var lockedIdentity = current.Identity;
+        if (current.State == OperationJournalState.IntentPersisted)
+        {
+            lockedIdentity = await _fingerprints.CaptureAsync(
+                    current.Owner,
+                    recipe.DataKeyId,
+                    observation.ExactSource,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            if (recipe.ExpectedSourceIdentity is { } expectedIdentity
+                && !IdentitiesEqual(expectedIdentity, lockedIdentity))
+            {
+                return new FileOperationRecoveryRequired(
+                    FileOperationFailure.IdentityMismatch,
+                    current.State);
+            }
+
+            _faults.ThrowIfRequested(
+                FileOperationFaultPoint.AfterSourceIdentityCapture);
+            current = await TransitionAsync(
+                    current,
+                    OperationJournalState.IdentityLocked,
+                    lockedIdentity)
+                .ConfigureAwait(false)
+                ?? throw new OperationJournalRecoveryRequiredException();
+            _faults.ThrowIfRequested(
+                FileOperationFaultPoint.AfterIdentityLocked);
+        }
+
+        if (lockedIdentity is null)
+        {
+            return new FileOperationRecoveryRequired(
+                FileOperationFailure.JournalConflict,
+                current.State);
+        }
+
+        CrossVolumeFileSession? session = null;
+        try
+        {
+            if (current.State == OperationJournalState.IdentityLocked)
+            {
+                current = await TransitionAsync(
+                        current,
+                        OperationJournalState.Copying)
+                    .ConfigureAwait(false)
+                    ?? throw new OperationJournalRecoveryRequiredException();
+                _faults.ThrowIfRequested(
+                    FileOperationFaultPoint.AfterCrossVolumeCopying);
+            }
+
+            if (current.State == OperationJournalState.Copying)
+            {
+                if (observation.Destination
+                    != RecoveryPathObservation.Missing)
+                {
+                    return new FileOperationRecoveryRequired(
+                        FileOperationFailure.DestinationExists,
+                        current.State);
+                }
+
+                session = await _crossVolume.CreateNewAsync(
+                        observation.ExactSource,
+                        lockedIdentity,
+                        current.Intent,
+                        _faults,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+                await session.CopyFlushAndMetadataAsync(
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+                current = await TransitionAsync(
+                        current,
+                        OperationJournalState.Copied)
+                    .ConfigureAwait(false)
+                    ?? throw new OperationJournalRecoveryRequiredException();
+                _faults.ThrowIfRequested(
+                    FileOperationFaultPoint.AfterCrossVolumeCopied);
+            }
+
+            if (current.State == OperationJournalState.Copied)
+            {
+                if (session is null)
+                {
+                    if (observation.Destination
+                        == RecoveryPathObservation.Missing)
+                    {
+                        session = await _crossVolume.CreateNewAsync(
+                                observation.ExactSource,
+                                lockedIdentity,
+                                current.Intent,
+                                _faults,
+                                CancellationToken.None)
+                            .ConfigureAwait(false);
+                        await session.CopyFlushAndMetadataAsync(
+                                CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    else if (observation is
+                        {
+                            Destination: RecoveryPathObservation.Exact,
+                            ExactDestination: not null,
+                        })
+                    {
+                        session = await _crossVolume.OpenExistingAsync(
+                                observation.ExactSource,
+                                observation.ExactDestination,
+                                lockedIdentity,
+                                current.Intent,
+                                _faults,
+                                CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        return new FileOperationRecoveryRequired(
+                            FileOperationFailure.DestinationExists,
+                            current.State);
+                    }
+                }
+
+                var appliedIdentity =
+                    await session.VerifyDestinationAsync(
+                            (source, token) => _fingerprints.CaptureAsync(
+                                current.Owner,
+                                recipe.DataKeyId,
+                                source,
+                                token),
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+                current = await TransitionAsync(
+                        current,
+                        OperationJournalState.Verified,
+                        appliedIdentity: appliedIdentity)
+                    .ConfigureAwait(false)
+                    ?? throw new OperationJournalRecoveryRequiredException();
+                _faults.ThrowIfRequested(
+                    FileOperationFaultPoint.AfterCrossVolumeVerified);
+            }
+
+            if (current.State != OperationJournalState.Verified
+                || current.AppliedIdentity is null)
+            {
+                return new FileOperationRecoveryRequired(
+                    FileOperationFailure.JournalConflict,
+                    current.State);
+            }
+
+            if (session is null)
+            {
+                if (observation is not
+                    {
+                        Destination: RecoveryPathObservation.Exact,
+                        ExactDestination: not null,
+                    })
+                {
+                    return new FileOperationRecoveryRequired(
+                        FileOperationFailure.IdentityMismatch,
+                        current.State);
+                }
+
+                session = await _crossVolume.OpenExistingAsync(
+                        observation.ExactSource,
+                        observation.ExactDestination,
+                        lockedIdentity,
+                        current.Intent,
+                        _faults,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+
+            current = await TransitionAsync(
+                    current,
+                    OperationJournalState.DeletingSource)
+                .ConfigureAwait(false)
+                ?? throw new OperationJournalRecoveryRequiredException();
+            _faults.ThrowIfRequested(
+                FileOperationFaultPoint.AfterCrossVolumeDeletingSource);
+            await session.RevalidateAndDeleteSourceAsync(
+                    lockedIdentity,
+                    (source, token) => _fingerprints.CaptureAsync(
+                        current.Owner,
+                        recipe.DataKeyId,
+                        source,
+                        token),
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+            var verifiedAppliedIdentity = current.AppliedIdentity
+                ?? throw new OperationJournalRecoveryRequiredException();
+            current = await TransitionAsync(
+                    current,
+                    OperationJournalState.FileApplied)
+                .ConfigureAwait(false)
+                ?? throw new OperationJournalRecoveryRequiredException();
+            _faults.ThrowIfRequested(
+                FileOperationFaultPoint.AfterFileApplied);
+            return await CommitExactAsync(
+                    current,
+                    recipe,
+                    verifiedAppliedIdentity,
+                    current.State,
+                    sourceAbsenceGuard: null)
+                .ConfigureAwait(false);
+        }
+        catch (CrossVolumeFileTransactionException exception)
+        {
+            return await HandleCrossVolumeFailureAsync(
+                    current,
+                    session,
+                    exception)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            if (session is not null
+                && current.State < OperationJournalState.Verified)
+            {
+                var cleanup =
+                    await session.CleanupIncompleteDestinationAsync()
+                        .ConfigureAwait(false);
+                if (cleanup == CrossVolumeCleanupResult.Uncertain)
+                {
+                    await EnterCrossVolumeManualRecoveryAsync(
+                            current,
+                            RecoveryPathObservation.Exact,
+                            RecoveryPathObservation
+                                .InaccessibleOrUnknown)
+                        .ConfigureAwait(false);
+                }
+            }
+
+            throw;
+        }
+        finally
+        {
+            if (session is not null)
+            {
+                await session.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    async Task<FileOperationExecutionResult>
         IOperationRecoveryExecutor.FinalizeCommitWithinGateAsync(
             OperationJournalEntry entry,
             OperationRecoveryRecipe recipe,
@@ -505,6 +840,8 @@ public sealed class FileOperationCoordinator :
         cancellationToken.ThrowIfCancellationRequested();
         if (!RecipeMatches(entry, recipe)
             || entry.Identity is null
+            || IsCrossVolume(entry.Kind)
+                && entry.AppliedIdentity is null
             || observation is not null
                 && (observation.Source
                         != RecoveryPathObservation.Missing
@@ -518,7 +855,7 @@ public sealed class FileOperationCoordinator :
                 entry.State);
         }
 
-        var identity = entry.Identity
+        var identity = AppliedIdentity(entry)
             ?? throw new OperationJournalRecoveryRequiredException();
         var current = entry;
         if (observation is not null
@@ -530,7 +867,9 @@ public sealed class FileOperationCoordinator :
                 current.State);
         }
 
-        if (current.State == OperationJournalState.Renaming)
+        if (current.State is
+                OperationJournalState.Renaming
+                or OperationJournalState.DeletingSource)
         {
             current = await TransitionAsync(
                     current,
@@ -581,7 +920,7 @@ public sealed class FileOperationCoordinator :
 
         var commit = new CommitFileOperationCommand(
             entry.OperationId,
-            expectedJournalRevision: 4,
+            expectedJournalRevision: FileAppliedRevision(entry.Kind),
             recipe.AppendEvents,
             recipe.SideEffects,
             recipe.Usage);
@@ -612,7 +951,9 @@ public sealed class FileOperationCoordinator :
             .ConfigureAwait(false);
         if (current is null
             || !RecipeMatches(current, recipe)
-            || current.Identity is null)
+            || current.Identity is null
+            || IsCrossVolume(current.Kind)
+                && current.AppliedIdentity is null)
         {
             return new FileOperationRecoveryRequired(
                 FileOperationFailure.JournalConflict,
@@ -670,7 +1011,8 @@ public sealed class FileOperationCoordinator :
     private async Task<OperationJournalEntry?> TransitionAsync(
         OperationJournalEntry current,
         OperationJournalState next,
-        StableFileIdentity? identity = null)
+        StableFileIdentity? identity = null,
+        StableFileIdentity? appliedIdentity = null)
     {
         var result = await _journal
             .TransitionAsync(
@@ -679,7 +1021,8 @@ public sealed class FileOperationCoordinator :
                     current.Revision,
                     next,
                     OperationSourceHealth.Healthy,
-                    identity),
+                    identity: identity,
+                    appliedIdentity: appliedIdentity),
                 CancellationToken.None)
             .ConfigureAwait(false);
         return result.Status is (
@@ -694,6 +1037,95 @@ public sealed class FileOperationCoordinator :
         StableFileIdentity left,
         StableFileIdentity right) =>
         left.FixedTimeEquals(right);
+
+    private async Task<FileOperationExecutionResult>
+        HandleCrossVolumeFailureAsync(
+            OperationJournalEntry current,
+            CrossVolumeFileSession? session,
+            CrossVolumeFileTransactionException exception)
+    {
+        if (current.State < OperationJournalState.Verified)
+        {
+            var cleanup = session is null
+                ? CrossVolumeCleanupResult.NoCreatedDestination
+                : await session.CleanupIncompleteDestinationAsync()
+                    .ConfigureAwait(false);
+            if (session is not null
+                && cleanup
+                    != CrossVolumeCleanupResult
+                        .DeletedCreatedDestination)
+            {
+                await EnterCrossVolumeManualRecoveryAsync(
+                        current,
+                        RecoveryPathObservation.Exact,
+                        RecoveryPathObservation
+                            .InaccessibleOrUnknown)
+                    .ConfigureAwait(false);
+                return new FileOperationRecoveryRequired(
+                    MapFailure(exception.Failure),
+                    OperationJournalState.ManualRecovery);
+            }
+
+            return new FileOperationNotApplied(
+                MapFailure(exception.Failure),
+                current.State);
+        }
+
+        await EnterCrossVolumeManualRecoveryAsync(
+                current,
+                RecoveryPathObservation.Exact,
+                RecoveryPathObservation.Exact)
+            .ConfigureAwait(false);
+        return new FileOperationRecoveryRequired(
+            MapFailure(exception.Failure),
+            OperationJournalState.ManualRecovery);
+    }
+
+    private async Task EnterCrossVolumeManualRecoveryAsync(
+        OperationJournalEntry current,
+        RecoveryPathObservation source,
+        RecoveryPathObservation destination)
+    {
+        var transition = await _journal.TransitionAsync(
+                new TransitionOperationCommand(
+                    current.OperationId,
+                    current.Revision,
+                    OperationJournalState.ManualRecovery,
+                    OperationSourceHealth.ManualRecovery,
+                    manualRecoveryEvidence:
+                        new OperationManualRecoveryEvidence(
+                            current.State,
+                            source,
+                            destination,
+                            OperationManualRecoveryReason
+                                .AmbiguousPathObservations,
+                            OperationManualRecoveryAction
+                                .InspectBothPathsWithoutMutation)),
+                CancellationToken.None)
+            .ConfigureAwait(false);
+        if (transition.Status is not (
+                TransitionOperationStatus.Transitioned
+                or TransitionOperationStatus.AlreadyApplied)
+            || transition.Entry?.State
+                != OperationJournalState.ManualRecovery)
+        {
+            throw new OperationJournalRecoveryRequiredException();
+        }
+    }
+
+    private static StableFileIdentity? AppliedIdentity(
+        OperationJournalEntry entry) =>
+        IsCrossVolume(entry.Kind)
+            ? entry.AppliedIdentity
+            : entry.Identity;
+
+    private static bool IsCrossVolume(FileOperationKind kind) =>
+        kind is
+            FileOperationKind.CrossVolumeMove
+            or FileOperationKind.UndoCrossVolumeMove;
+
+    private static long FileAppliedRevision(FileOperationKind kind) =>
+        IsCrossVolume(kind) ? 7 : 4;
 
     private static FileOperationFailure MapFailure(
         SameVolumeFileFailure failure) =>
@@ -711,6 +1143,24 @@ public sealed class FileOperationCoordinator :
                 FileOperationFailure.AccessDenied,
             SameVolumeFileFailure.SharingViolation =>
                 FileOperationFailure.SharingViolation,
+            _ => FileOperationFailure.NativeFailure,
+        };
+
+    private static FileOperationFailure MapFailure(
+        CrossVolumeFileFailure failure) =>
+        failure switch
+        {
+            CrossVolumeFileFailure.DestinationExists =>
+                FileOperationFailure.DestinationExists,
+            CrossVolumeFileFailure.SameVolume =>
+                FileOperationFailure.DifferentVolume,
+            CrossVolumeFileFailure.PathRejected =>
+                FileOperationFailure.PathRejected,
+            CrossVolumeFileFailure.SourceIdentityChanged =>
+                FileOperationFailure.SourceChanged,
+            CrossVolumeFileFailure.LengthMismatch
+                or CrossVolumeFileFailure.FingerprintMismatch =>
+                FileOperationFailure.IdentityMismatch,
             _ => FileOperationFailure.NativeFailure,
         };
 
@@ -762,6 +1212,8 @@ public sealed class FileOperationCoordinator :
         FileOperationFailure failure,
         OperationJournalState durableState) =>
         durableState is OperationJournalState.Renaming
+            or OperationJournalState.Verified
+            or OperationJournalState.DeletingSource
             or OperationJournalState.FileApplied
             or OperationJournalState.EventAndProjectionCommitted
             or OperationJournalState.SideEffectsPending
