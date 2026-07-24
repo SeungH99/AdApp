@@ -8,11 +8,13 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.FileSystem;
 internal static class WindowsFileSystemNative
 {
     internal const uint GenericRead = 0x80000000;
+    internal const uint GenericWrite = 0x40000000;
     internal const uint Delete = 0x00010000;
     internal const uint FileShareRead = 0x00000001;
     internal const uint FileShareWrite = 0x00000002;
     internal const uint FileShareDelete = 0x00000004;
     internal const uint OpenExisting = 3;
+    internal const uint CreateNew = 1;
     internal const uint FileFlagBackupSemantics = 0x02000000;
     internal const uint FileFlagSequentialScan = 0x08000000;
     internal const uint FileFlagOverlapped = 0x40000000;
@@ -76,6 +78,32 @@ internal static class WindowsFileSystemNative
             handle.Dispose();
             throw;
         }
+    }
+
+    internal static SafeFileHandle OpenNewCrossVolumeDestinationHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            GenericRead | GenericWrite | Delete,
+            FileShareRead,
+            IntPtr.Zero,
+            CreateNew,
+            FileFlagOpenReparsePoint
+                | FileFlagSequentialScan
+                | FileFlagOverlapped,
+            IntPtr.Zero);
+        if (!handle.IsInvalid)
+        {
+            return handle;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        handle.Dispose();
+        throw new IOException(
+            "The cross-volume destination could not be created.",
+            new Win32Exception(error));
     }
 
     internal static SafeFileHandle OpenIdentityProbeHandle(
@@ -972,6 +1000,13 @@ internal static class WindowsFileSystemNative
     internal struct FILE_DISPOSITION_INFO_EX
     {
         internal uint Flags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct FILE_DISPOSITION_INFO
+    {
+        [MarshalAs(UnmanagedType.Bool)]
+        internal bool DeleteFile;
     }
 }
 

@@ -783,7 +783,9 @@ public sealed class FileOperationCoordinator :
                 var cleanup =
                     await session.CleanupIncompleteDestinationAsync()
                         .ConfigureAwait(false);
-                if (cleanup == CrossVolumeCleanupResult.Uncertain)
+                if (cleanup
+                    != CrossVolumeCleanupResult
+                        .DeletedCreatedDestination)
                 {
                     await EnterCrossVolumeManualRecoveryAsync(
                             current,
@@ -791,6 +793,9 @@ public sealed class FileOperationCoordinator :
                             RecoveryPathObservation
                                 .InaccessibleOrUnknown)
                         .ConfigureAwait(false);
+                    return new FileOperationRecoveryRequired(
+                        FileOperationFailure.NativeFailure,
+                        OperationJournalState.ManualRecovery);
                 }
             }
 
@@ -1047,13 +1052,14 @@ public sealed class FileOperationCoordinator :
         if (current.State < OperationJournalState.Verified)
         {
             var cleanup = session is null
-                ? CrossVolumeCleanupResult.NoCreatedDestination
+                ? exception.PostCreateCleanupResult
                 : await session.CleanupIncompleteDestinationAsync()
                     .ConfigureAwait(false);
-            if (session is not null
-                && cleanup
-                    != CrossVolumeCleanupResult
-                        .DeletedCreatedDestination)
+            if (cleanup == CrossVolumeCleanupResult.Uncertain
+                || (session is not null
+                    && cleanup
+                        != CrossVolumeCleanupResult
+                            .DeletedCreatedDestination))
             {
                 await EnterCrossVolumeManualRecoveryAsync(
                         current,
@@ -1217,6 +1223,7 @@ public sealed class FileOperationCoordinator :
             or OperationJournalState.FileApplied
             or OperationJournalState.EventAndProjectionCommitted
             or OperationJournalState.SideEffectsPending
+            or OperationJournalState.ManualRecovery
             ? new FileOperationRecoveryRequired(failure, durableState)
             : new FileOperationNotApplied(failure, durableState);
 

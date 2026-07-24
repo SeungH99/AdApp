@@ -47,7 +47,28 @@ public sealed class CrossVolumeFileTransactionException : IOException
         Failure = failure;
     }
 
+    internal CrossVolumeFileTransactionException(
+        CrossVolumeFileFailure failure,
+        CrossVolumeCleanupResult postCreateCleanupResult,
+        Exception innerException)
+        : base(CreateMessage(failure), innerException)
+    {
+        if (postCreateCleanupResult
+            == CrossVolumeCleanupResult.NoCreatedDestination)
+        {
+            throw new ArgumentException(
+                "A post-create failure requires a definite or uncertain cleanup result.",
+                nameof(postCreateCleanupResult));
+        }
+
+        Failure = failure;
+        PostCreateCleanupResult = postCreateCleanupResult;
+    }
+
     public CrossVolumeFileFailure Failure { get; }
+
+    public CrossVolumeCleanupResult PostCreateCleanupResult { get; } =
+        CrossVolumeCleanupResult.NoCreatedDestination;
 
     private static string CreateMessage(CrossVolumeFileFailure failure) =>
         $"The cross-volume file transaction failed at '{failure}'.";
@@ -390,13 +411,9 @@ internal sealed class NativeCrossVolumeFileSystemAdapter
         SafeFileHandle? destinationHandle = null;
         try
         {
-            destinationHandle = File.OpenHandle(
-                WindowsFileSystemNative.ToExtendedPath(
-                    boundaries.DestinationPath),
-                FileMode.CreateNew,
-                FileAccess.ReadWrite,
-                FileShare.Read,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            destinationHandle = WindowsFileSystemNative
+                .OpenNewCrossVolumeDestinationHandle(
+                    boundaries.DestinationPath);
             RequireRegularFile(destinationHandle);
             var destinationVolume = ValidatedVolume(destinationHandle);
             if (destinationVolume == boundaries.SourceVolumeId)
@@ -416,11 +433,25 @@ internal sealed class NativeCrossVolumeFileSystemAdapter
             return ValueTask.FromResult<ICrossVolumeFileSystemSession>(
                 session);
         }
-        catch
+        catch (Exception exception)
         {
-            destinationHandle?.Dispose();
-            boundaries.Dispose();
-            throw;
+            if (destinationHandle is null)
+            {
+                boundaries.Dispose();
+                throw;
+            }
+
+            try
+            {
+                throw NativeCrossVolumeHandleDeletion
+                    .CleanupCreatedDestinationAfterAdmissionFailure(
+                        destinationHandle,
+                        exception);
+            }
+            finally
+            {
+                boundaries.Dispose();
+            }
         }
     }
 
@@ -493,9 +524,6 @@ internal sealed class NativeCrossVolumeFileSystemSession
     private const uint FileAttributeArchive = 0x00000020;
     private const uint FileAttributeNormal = 0x00000080;
     private const uint FileAttributeNotContentIndexed = 0x00002000;
-    private const int ErrorInvalidFunction = 1;
-    private const int ErrorNotSupported = 50;
-    private const int ErrorInvalidParameter = 87;
 
     private readonly VerifiedStableSource _source;
     private readonly StableFileIdentity _sourceIdentity;
@@ -662,7 +690,8 @@ internal sealed class NativeCrossVolumeFileSystemSession
 
     public void DeleteSourceByHandle()
     {
-        SetDeleteDisposition(_source.Handle);
+        NativeCrossVolumeHandleDeletion.SetDeleteDisposition(
+            _source.Handle);
     }
 
     public CrossVolumeCleanupResult CleanupDestinationByHandle()
@@ -674,7 +703,8 @@ internal sealed class NativeCrossVolumeFileSystemSession
 
         try
         {
-            SetDeleteDisposition(DestinationHandle);
+            NativeCrossVolumeHandleDeletion.SetDeleteDisposition(
+                DestinationHandle);
             return CrossVolumeCleanupResult.DeletedCreatedDestination;
         }
         catch
@@ -712,14 +742,61 @@ internal sealed class NativeCrossVolumeFileSystemSession
         ?? throw new ObjectDisposedException(
             nameof(NativeCrossVolumeFileSystemSession));
 
-    private static void SetDeleteDisposition(SafeFileHandle handle)
+}
+
+internal static class NativeCrossVolumeHandleDeletion
+{
+    private const int ErrorInvalidFunction = 1;
+    private const int ErrorNotSupported = 50;
+    private const int ErrorInvalidParameter = 87;
+
+    internal static CrossVolumeFileTransactionException
+        CleanupCreatedDestinationAfterAdmissionFailure(
+            SafeFileHandle handle,
+            Exception admissionFailure)
     {
+        ArgumentNullException.ThrowIfNull(handle);
+        ArgumentNullException.ThrowIfNull(admissionFailure);
+        var cleanup =
+            CrossVolumeCleanupResult.DeletedCreatedDestination;
+        Exception? cleanupFailure = null;
+        try
+        {
+            SetDeleteDisposition(handle);
+        }
+        catch (Exception exception)
+        {
+            cleanup = CrossVolumeCleanupResult.Uncertain;
+            cleanupFailure = exception;
+        }
+        finally
+        {
+            handle.Dispose();
+        }
+
+        var failure =
+            admissionFailure is CrossVolumeFileTransactionException
+                crossVolumeFailure
+                ? crossVolumeFailure.Failure
+                : CrossVolumeFileFailure.PathRejected;
+        return new CrossVolumeFileTransactionException(
+            failure,
+            cleanup,
+            cleanupFailure is null
+                ? admissionFailure
+                : new AggregateException(
+                    admissionFailure,
+                    cleanupFailure));
+    }
+
+    internal static void SetDeleteDisposition(SafeFileHandle handle)
+    {
+        ArgumentNullException.ThrowIfNull(handle);
         var information =
             new WindowsFileSystemNative.FILE_DISPOSITION_INFO_EX
             {
                 Flags =
                     WindowsFileSystemNative.FILE_DISPOSITION_DELETE
-                    | WindowsFileSystemNative.FILE_DISPOSITION_POSIX_SEMANTICS
                     | WindowsFileSystemNative.FILE_DISPOSITION_ON_CLOSE
                     | WindowsFileSystemNative
                         .FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
@@ -735,6 +812,54 @@ internal sealed class NativeCrossVolumeFileSystemSession
                     handle,
                     WindowsFileSystemNative.FileInfoByHandleClass
                         .FileDispositionInfoEx,
+                    buffer,
+                    size))
+            {
+                return;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            if (error is
+                ErrorInvalidFunction
+                or ErrorNotSupported
+                or ErrorInvalidParameter)
+            {
+                SetLegacyDeleteDisposition(handle);
+                return;
+            }
+
+            throw new CrossVolumeFileTransactionException(
+                CrossVolumeFileFailure.DeleteFailed,
+                new Win32Exception(error));
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    private static void SetLegacyDeleteDisposition(
+        SafeFileHandle handle)
+    {
+        var information =
+            new WindowsFileSystemNative.FILE_DISPOSITION_INFO
+            {
+                DeleteFile = true,
+            };
+        var size = checked(
+            (uint)Marshal.SizeOf<
+                WindowsFileSystemNative.FILE_DISPOSITION_INFO>());
+        var buffer = Marshal.AllocHGlobal(checked((int)size));
+        try
+        {
+            Marshal.StructureToPtr(
+                information,
+                buffer,
+                fDeleteOld: false);
+            if (WindowsFileSystemNative.SetFileInformationByHandle(
+                    handle,
+                    WindowsFileSystemNative.FileInfoByHandleClass
+                        .FileDispositionInfo,
                     buffer,
                     size))
             {
