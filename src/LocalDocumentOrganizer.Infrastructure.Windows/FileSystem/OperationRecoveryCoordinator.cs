@@ -20,6 +20,7 @@ internal enum FileOperationFaultPoint
     AfterFileApplied,
     AfterEventAndProjectionCommitted,
     AfterSideEffectsPending,
+    AfterSideEffectsDelivered,
     BeforeFinalizeSourceAbsenceRevalidation,
     BeforeDestinationAdmission,
     AfterCrossVolumeCopying,
@@ -678,6 +679,19 @@ public sealed class OperationRecoveryCoordinator
 
         var latest = await ReloadExactAsync(entry, cancellationToken)
             .ConfigureAwait(false);
+        if (result is FileOperationRecoveryRequired
+            {
+                Failure:
+                    FileOperationFailure.SideEffectDeliveryPending,
+                DurableState:
+                    OperationJournalState.SideEffectsPending,
+            }
+            && latest.State
+                == OperationJournalState.SideEffectsPending)
+        {
+            return result;
+        }
+
         if (latest.State == OperationJournalState.Completed)
         {
             var completedIdentity = AppliedIdentity(latest);

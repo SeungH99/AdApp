@@ -20,6 +20,70 @@ public sealed record FileOperationSideEffect
     public ReadOnlyMemory<byte> Data => _data.ToArray();
 }
 
+public sealed record OperationSideEffectDelivery
+{
+    private readonly byte[] _data;
+
+    public OperationSideEffectDelivery(
+        OperationId operationId,
+        int effectIndex,
+        string code,
+        ReadOnlyMemory<byte> data)
+    {
+        if (operationId.Value == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "An operation ID cannot be empty.",
+                nameof(operationId));
+        }
+
+        if (effectIndex < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(effectIndex),
+                effectIndex,
+                "The effect index cannot be negative.");
+        }
+
+        OperationCommitContractValidation.ValidateCode(
+            code,
+            nameof(code));
+        OperationId = operationId;
+        EffectIndex = effectIndex;
+        Code = code;
+        _data = data.ToArray();
+    }
+
+    public OperationId OperationId { get; }
+
+    public int EffectIndex { get; }
+
+    public string Code { get; }
+
+    public ReadOnlyMemory<byte> Data => _data.ToArray();
+}
+
+public enum OperationSideEffectDispatchStatus
+{
+    Delivered = 0,
+    Pending = 1,
+}
+
+public interface IOperationSideEffectSink
+{
+    Task DeliverIdempotentlyAsync(
+        OperationSideEffectDelivery delivery,
+        CancellationToken cancellationToken);
+}
+
+public interface IOperationSideEffectDispatcher
+{
+    Task<OperationSideEffectDispatchStatus> DispatchPendingAsync(
+        OperationId operationId,
+        IReadOnlyList<FileOperationSideEffect> sideEffects,
+        CancellationToken cancellationToken);
+}
+
 public sealed record FileOperationUsage
 {
     public FileOperationUsage(string code, long units)

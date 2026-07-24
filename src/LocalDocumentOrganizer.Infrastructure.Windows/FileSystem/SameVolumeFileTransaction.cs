@@ -142,6 +142,7 @@ public sealed class SameVolumeFileTransaction
                 SameVolumeFileFailure.DifferentVolume);
         }
 
+        source.RequireSingleLink();
         var renameFailure = RenameHandleNoReplace(
             source.Handle,
             destination.CanonicalPath);
@@ -169,6 +170,7 @@ public sealed class SameVolumeFileTransaction
             }
             faultInjector.ThrowIfRequested(
                 FileOperationFaultPoint.AfterDestinationIdentityVerification);
+            destination.TransferPinsTo(source);
         }
         catch (Exception exception) when (
             exception is FileSystemBoundaryException
@@ -542,6 +544,10 @@ public sealed class SameVolumeFileTransaction
         }
 
         internal SameVolumeFileFailure? Failure { get; }
+
+        internal void TransferPinsTo(
+            VerifiedStableSource destinationProof) =>
+            destinationProof.AttachPinnedAncestors(_pinned);
 
         internal static DestinationMutationScope Open(
             string approvedRoot,

@@ -23,6 +23,7 @@ public sealed class VaultFileFingerprintService
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(source);
+        source.RequireSingleLink();
         return await _keyRing.UseFileFingerprintSubkeyAsync(
             owner,
             expectedKeyId,
@@ -37,6 +38,7 @@ public sealed class VaultFileFingerprintService
                     fingerprint = await KeyedContentFingerprint
                         .ComputeAsync(subkey, content, token)
                         .ConfigureAwait(false);
+                    source.RequireSingleLink();
                     return source.CreateIdentity(fingerprint);
                 }
                 finally

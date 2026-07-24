@@ -505,7 +505,8 @@ internal static class WindowsFileSystemNative
                 string.Empty,
                 default,
                 Length: 0,
-                DateTimeOffset.UnixEpoch);
+                DateTimeOffset.UnixEpoch,
+                NumberOfLinks: 0);
         }
 
         if (!volume.HasVolumeInformation)
@@ -516,7 +517,8 @@ internal static class WindowsFileSystemNative
                 string.Empty,
                 default,
                 Length: 0,
-                DateTimeOffset.UnixEpoch);
+                DateTimeOffset.UnixEpoch,
+                NumberOfLinks: 0);
         }
 
         var standard = GetStandardInfo(handle);
@@ -547,7 +549,14 @@ internal static class WindowsFileSystemNative
             volume.FileSystemName,
             volume.FileId,
             standard.EndOfFile,
-            lastWriteTimeUtc);
+            lastWriteTimeUtc,
+            standard.NumberOfLinks);
+    }
+
+    internal static uint GetLinkCount(SafeFileHandle handle)
+    {
+        RequireUsableHandle(handle);
+        return GetStandardInfo(handle).NumberOfLinks;
     }
 
     internal static StableVolumeSnapshot GetStableVolumeSnapshot(
@@ -979,7 +988,8 @@ internal static class WindowsFileSystemNative
         string FileSystemName,
         FILE_ID_INFO FileId,
         long Length,
-        DateTimeOffset LastWriteTimeUtc);
+        DateTimeOffset LastWriteTimeUtc,
+        uint NumberOfLinks);
 
     internal readonly record struct StableVolumeSnapshot(
         bool IsLocal,

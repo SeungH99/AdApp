@@ -22,6 +22,7 @@ public enum FileOperationFailure
     CommitConflict = 11,
     CommitStorageBusy = 12,
     UnexpectedJournalState = 13,
+    SideEffectDeliveryPending = 14,
 }
 
 public sealed record FileOperationExecutionRequest
@@ -133,6 +134,8 @@ public sealed class FileOperationCoordinator :
     private readonly SameVolumeFileTransaction _sameVolume;
     private readonly CrossVolumeFileTransaction _crossVolume;
     private readonly IOperationCommitStore _commitStore;
+    private readonly IOperationSideEffectDispatcher?
+        _sideEffectDispatcher;
     private readonly IFileOperationFaultInjector _faults;
     private readonly OperationRecoveryCoordinator _liveRecovery;
 
@@ -149,6 +152,26 @@ public sealed class FileOperationCoordinator :
             sameVolume,
             new CrossVolumeFileTransaction(),
             commitStore,
+            sideEffectDispatcher: null,
+            NoOpFileOperationFaultInjector.Instance)
+    {
+    }
+
+    public FileOperationCoordinator(
+        IOperationJournalStore journal,
+        FileMutationGate mutationGate,
+        VaultFileFingerprintService fingerprints,
+        SameVolumeFileTransaction sameVolume,
+        IOperationCommitStore commitStore,
+        IOperationSideEffectDispatcher sideEffectDispatcher)
+        : this(
+            journal,
+            mutationGate,
+            fingerprints,
+            sameVolume,
+            new CrossVolumeFileTransaction(),
+            commitStore,
+            sideEffectDispatcher,
             NoOpFileOperationFaultInjector.Instance)
     {
     }
@@ -167,6 +190,27 @@ public sealed class FileOperationCoordinator :
             sameVolume,
             new CrossVolumeFileTransaction(),
             commitStore,
+            sideEffectDispatcher: null,
+            faultInjector)
+    {
+    }
+
+    internal FileOperationCoordinator(
+        IOperationJournalStore journal,
+        FileMutationGate mutationGate,
+        VaultFileFingerprintService fingerprints,
+        SameVolumeFileTransaction sameVolume,
+        IOperationCommitStore commitStore,
+        IOperationSideEffectDispatcher sideEffectDispatcher,
+        IFileOperationFaultInjector faultInjector)
+        : this(
+            journal,
+            mutationGate,
+            fingerprints,
+            sameVolume,
+            new CrossVolumeFileTransaction(),
+            commitStore,
+            sideEffectDispatcher,
             faultInjector)
     {
     }
@@ -178,6 +222,27 @@ public sealed class FileOperationCoordinator :
         SameVolumeFileTransaction sameVolume,
         CrossVolumeFileTransaction crossVolume,
         IOperationCommitStore commitStore,
+        IFileOperationFaultInjector faultInjector)
+        : this(
+            journal,
+            mutationGate,
+            fingerprints,
+            sameVolume,
+            crossVolume,
+            commitStore,
+            sideEffectDispatcher: null,
+            faultInjector)
+    {
+    }
+
+    internal FileOperationCoordinator(
+        IOperationJournalStore journal,
+        FileMutationGate mutationGate,
+        VaultFileFingerprintService fingerprints,
+        SameVolumeFileTransaction sameVolume,
+        CrossVolumeFileTransaction crossVolume,
+        IOperationCommitStore commitStore,
+        IOperationSideEffectDispatcher? sideEffectDispatcher,
         IFileOperationFaultInjector faultInjector)
     {
         ArgumentNullException.ThrowIfNull(journal);
@@ -193,6 +258,7 @@ public sealed class FileOperationCoordinator :
         _sameVolume = sameVolume;
         _crossVolume = crossVolume;
         _commitStore = commitStore;
+        _sideEffectDispatcher = sideEffectDispatcher;
         _faults = faultInjector;
         _liveRecovery = new OperationRecoveryCoordinator(
             journal,
@@ -344,6 +410,16 @@ public sealed class FileOperationCoordinator :
         }
         catch (StableSourceBoundaryException exception)
         {
+            if (exception.Failure
+                    == StableSourceBoundaryFailure.MultipleHardLinks
+                && current is not null)
+            {
+                return await _liveRecovery.RecoverWithinGateAsync(
+                        current,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+
             durableState = await ReloadDurableStateAsync(
                     request.Intent.OperationId,
                     durableState)
@@ -518,7 +594,8 @@ public sealed class FileOperationCoordinator :
                 recipe,
                 verifiedIdentity,
                 OperationJournalState.FileApplied,
-                sourceAbsenceGuard: null)
+                sourceAbsenceGuard: null,
+                observation.ExactSource.RequireSingleLink)
             .ConfigureAwait(false);
     }
 
@@ -764,7 +841,8 @@ public sealed class FileOperationCoordinator :
                     recipe,
                     verifiedAppliedIdentity,
                     current.State,
-                    sourceAbsenceGuard: null)
+                    sourceAbsenceGuard: null,
+                    session.RequireSingleLinkDestination)
                 .ConfigureAwait(false);
         }
         catch (CrossVolumeFileTransactionException exception)
@@ -899,7 +977,10 @@ public sealed class FileOperationCoordinator :
                 recipe,
                 identity,
                 current.State,
-                observation?.SourceAbsenceGuard)
+                observation?.SourceAbsenceGuard,
+                observation?.ExactDestination is { } exactDestination
+                    ? exactDestination.RequireSingleLink
+                    : null)
             .ConfigureAwait(false);
     }
 
@@ -908,8 +989,10 @@ public sealed class FileOperationCoordinator :
         OperationRecoveryRecipe recipe,
         StableFileIdentity identity,
         OperationJournalState durableState,
-        ISourceAbsenceGuard? sourceAbsenceGuard)
+        ISourceAbsenceGuard? sourceAbsenceGuard,
+        Action? destinationBoundaryGuard)
     {
+        destinationBoundaryGuard?.Invoke();
         if (sourceAbsenceGuard is not null)
         {
             _faults.ThrowIfRequested(
@@ -983,6 +1066,33 @@ public sealed class FileOperationCoordinator :
 
         if (current?.State == OperationJournalState.SideEffectsPending)
         {
+            if (recipe.SideEffects.Count > 0)
+            {
+                if (_sideEffectDispatcher is null)
+                {
+                    return new FileOperationRecoveryRequired(
+                        FileOperationFailure.SideEffectDeliveryPending,
+                        current.State);
+                }
+
+                var delivery =
+                    await _sideEffectDispatcher.DispatchPendingAsync(
+                            current.OperationId,
+                            recipe.SideEffects,
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+                if (delivery
+                    != OperationSideEffectDispatchStatus.Delivered)
+                {
+                    return new FileOperationRecoveryRequired(
+                        FileOperationFailure.SideEffectDeliveryPending,
+                        current.State);
+                }
+            }
+
+            _faults.ThrowIfRequested(
+                FileOperationFaultPoint.AfterSideEffectsDelivered);
+            destinationBoundaryGuard?.Invoke();
             if (sourceAbsenceGuard is not null
                 && !sourceAbsenceGuard.IsStillSafelyAbsent())
             {

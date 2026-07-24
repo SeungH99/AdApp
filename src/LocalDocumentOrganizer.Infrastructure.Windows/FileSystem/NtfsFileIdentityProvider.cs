@@ -11,6 +11,7 @@ public enum StableSourceBoundaryFailure
     NonNtfsVolume,
     MissingVolumeId,
     MissingFileId,
+    MultipleHardLinks,
 }
 
 public sealed class StableSourceBoundaryException : IOException
@@ -44,6 +45,8 @@ public sealed class StableSourceBoundaryException : IOException
                 "The source handle has no supported volume identifier.",
             StableSourceBoundaryFailure.MissingFileId =>
                 "The source handle has no supported file identifier.",
+            StableSourceBoundaryFailure.MultipleHardLinks =>
+                "The file handle does not identify an exclusive single-link file.",
             _ => "The source handle is outside the stable-source boundary.",
         };
 }
@@ -52,6 +55,7 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
 {
     private readonly byte[] _volumeId;
     private readonly byte[] _fileId;
+    private readonly List<SafeFileHandle> _pinnedAncestors;
     private SafeFileHandle? _handle;
 
     private VerifiedStableSource(
@@ -59,11 +63,13 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
         byte[] volumeId,
         byte[] fileId,
         long length,
-        DateTimeOffset lastWriteTimeUtc)
+        DateTimeOffset lastWriteTimeUtc,
+        List<SafeFileHandle> pinnedAncestors)
     {
         _handle = handle;
         _volumeId = volumeId;
         _fileId = fileId;
+        _pinnedAncestors = pinnedAncestors;
         Length = length;
         LastWriteTimeUtc = lastWriteTimeUtc;
     }
@@ -78,11 +84,18 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
     internal DateTimeOffset LastWriteTimeUtc { get; }
 
     internal static VerifiedStableSource Create(SafeFileHandle handle)
+        => Create(handle, []);
+
+    internal static VerifiedStableSource Create(
+        SafeFileHandle handle,
+        List<SafeFileHandle> pinnedAncestors)
     {
         ArgumentNullException.ThrowIfNull(handle);
+        ArgumentNullException.ThrowIfNull(pinnedAncestors);
         try
         {
             var snapshot = WindowsFileSystemNative.GetStableSourceSnapshot(handle);
+            RequireSingleLink(snapshot.NumberOfLinks);
             var identifiers = StableSourceValidator.Validate(
                 snapshot.IsLocal,
                 snapshot.HasVolumeInformation,
@@ -106,13 +119,32 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
                 volumeId,
                 fileId,
                 snapshot.Length,
-                snapshot.LastWriteTimeUtc);
+                snapshot.LastWriteTimeUtc,
+                pinnedAncestors);
         }
         catch
         {
             handle.Dispose();
+            PinnedDirectoryPathScope.DisposeHandles(
+                pinnedAncestors);
             throw;
         }
+    }
+
+    internal void RequireSingleLink()
+    {
+        _ = Handle;
+        RequireSingleLink(
+            WindowsFileSystemNative.GetLinkCount(Handle));
+    }
+
+    internal void AttachPinnedAncestors(
+        List<SafeFileHandle> pinnedAncestors)
+    {
+        ArgumentNullException.ThrowIfNull(pinnedAncestors);
+        _ = Handle;
+        _pinnedAncestors.AddRange(pinnedAncestors);
+        pinnedAncestors.Clear();
     }
 
     internal StableFileIdentity CreateIdentity(byte[] keyedFingerprint)
@@ -129,13 +161,30 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
     public void Dispose()
     {
         var handle = Interlocked.Exchange(ref _handle, null);
-        handle?.Dispose();
+        try
+        {
+            handle?.Dispose();
+        }
+        finally
+        {
+            PinnedDirectoryPathScope.DisposeHandles(
+                _pinnedAncestors);
+        }
     }
 
     public ValueTask DisposeAsync()
     {
         Dispose();
         return ValueTask.CompletedTask;
+    }
+
+    private static void RequireSingleLink(uint numberOfLinks)
+    {
+        if (numberOfLinks != 1)
+        {
+            throw new StableSourceBoundaryException(
+                StableSourceBoundaryFailure.MultipleHardLinks);
+        }
     }
 }
 

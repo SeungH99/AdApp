@@ -677,6 +677,17 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 keySession,
                 cancellationToken).ConfigureAwait(false);
             var current = currentPayload.Entry;
+            if (command.NextState
+                    == OperationJournalState.Completed)
+            {
+                await RequireAllSideEffectsDeliveredAsync(
+                        connection,
+                        transaction,
+                        current,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
             var isExactReplay = row.State == command.NextState
                 && row.Revision == checked(command.ExpectedRevision + 1)
                 && row.SourceHealth == command.SourceHealth;
@@ -826,6 +837,37 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         catch (Exception exception) when (IsRecoveryFailure(exception))
         {
             throw new OperationJournalRecoveryRequiredException(exception);
+        }
+    }
+
+    private static async Task RequireAllSideEffectsDeliveredAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        OperationJournalEntry current,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT COUNT(*),
+                   COALESCE(SUM(CASE WHEN state=1 THEN 1 ELSE 0 END), 0)
+            FROM main.operation_side_effects
+            WHERE operation_id=$operation_id;
+            """;
+        command.Parameters.Add("$operation_id", SqliteType.Text).Value =
+            current.OperationId.Value.ToString("D");
+        await using var reader = await command.ExecuteReaderAsync(
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken)
+                .ConfigureAwait(false)
+            || reader.GetValue(0) is not long total
+            || reader.GetValue(1) is not long delivered
+            || delivered != total
+            || await reader.ReadAsync(cancellationToken)
+                .ConfigureAwait(false))
+        {
+            throw new OperationJournalRecoveryRequiredException();
         }
     }
 
@@ -1627,81 +1669,88 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         }
 
         var buffer = new ArrayBufferWriter<byte>();
-        using (var writer = new Utf8JsonWriter(buffer))
+        try
         {
-            writer.WriteStartObject();
-            writer.WriteNumber("schemaVersion", PayloadSchemaVersion);
-            writer.WriteString("operationId", intent.OperationId.Value);
-            writer.WriteNumber("ownerKind", (int)intent.Owner.Kind);
-            writer.WriteString("ownerId", intent.Owner.Id.Value);
-            writer.WriteNumber("operationKind", (int)intent.Kind);
-            if (intent.OriginalOperationId is not null)
+            using (var writer = new Utf8JsonWriter(buffer))
             {
-                writer.WriteString(
-                    "originalOperationId",
-                    intent.OriginalOperationId.Value.Value);
-            }
-            writer.WriteString("sourcePath", intent.SourcePath);
-            writer.WriteString("destinationPath", intent.DestinationPath);
-            writer.WriteString("sourceRoot", intent.SourceRoot);
-            writer.WriteString("destinationRoot", intent.DestinationRoot);
-            writer.WriteString("streamId", intent.StreamId.Value);
-            writer.WriteNumber(
-                "expectedStreamVersion",
-                intent.ExpectedStreamVersion.Value);
-            writer.WriteBase64String(
-                "approvedProposal",
-                intent.ApprovedProposal.Span);
-            if (recoveryRecipe is not null)
-            {
-                WriteRecoveryRecipe(writer, recoveryRecipe);
-            }
+                writer.WriteStartObject();
+                writer.WriteNumber("schemaVersion", PayloadSchemaVersion);
+                writer.WriteString("operationId", intent.OperationId.Value);
+                writer.WriteNumber("ownerKind", (int)intent.Owner.Kind);
+                writer.WriteString("ownerId", intent.Owner.Id.Value);
+                writer.WriteNumber("operationKind", (int)intent.Kind);
+                if (intent.OriginalOperationId is not null)
+                {
+                    writer.WriteString(
+                        "originalOperationId",
+                        intent.OriginalOperationId.Value.Value);
+                }
+                writer.WriteString("sourcePath", intent.SourcePath);
+                writer.WriteString("destinationPath", intent.DestinationPath);
+                writer.WriteString("sourceRoot", intent.SourceRoot);
+                writer.WriteString("destinationRoot", intent.DestinationRoot);
+                writer.WriteString("streamId", intent.StreamId.Value);
+                writer.WriteNumber(
+                    "expectedStreamVersion",
+                    intent.ExpectedStreamVersion.Value);
+                writer.WriteBase64String(
+                    "approvedProposal",
+                    intent.ApprovedProposal.Span);
+                if (recoveryRecipe is not null)
+                {
+                    WriteRecoveryRecipe(writer, recoveryRecipe);
+                }
 
-            if (identity is not null)
-            {
-                WriteStableIdentity(writer, "identity", identity);
-            }
+                if (identity is not null)
+                {
+                    WriteStableIdentity(writer, "identity", identity);
+                }
 
-            if (appliedIdentity is not null)
-            {
-                WriteStableIdentity(
-                    writer,
-                    "appliedIdentity",
-                    appliedIdentity);
-            }
+                if (appliedIdentity is not null)
+                {
+                    WriteStableIdentity(
+                        writer,
+                        "appliedIdentity",
+                        appliedIdentity);
+                }
 
-            if (manualRecoveryEvidence is not null)
-            {
-                writer.WriteStartObject("manualRecoveryEvidence");
-                writer.WriteNumber(
-                    "observedState",
-                    (int)manualRecoveryEvidence.ObservedState);
-                writer.WriteNumber(
-                    "sourceObservation",
-                    (int)manualRecoveryEvidence.SourceObservation);
-                writer.WriteNumber(
-                    "destinationObservation",
-                    (int)manualRecoveryEvidence.DestinationObservation);
-                writer.WriteNumber(
-                    "reason",
-                    (int)manualRecoveryEvidence.Reason);
-                writer.WriteNumber(
-                    "recommendedAction",
-                    (int)manualRecoveryEvidence.RecommendedAction);
+                if (manualRecoveryEvidence is not null)
+                {
+                    writer.WriteStartObject("manualRecoveryEvidence");
+                    writer.WriteNumber(
+                        "observedState",
+                        (int)manualRecoveryEvidence.ObservedState);
+                    writer.WriteNumber(
+                        "sourceObservation",
+                        (int)manualRecoveryEvidence.SourceObservation);
+                    writer.WriteNumber(
+                        "destinationObservation",
+                        (int)manualRecoveryEvidence.DestinationObservation);
+                    writer.WriteNumber(
+                        "reason",
+                        (int)manualRecoveryEvidence.Reason);
+                    writer.WriteNumber(
+                        "recommendedAction",
+                        (int)manualRecoveryEvidence.RecommendedAction);
+                    writer.WriteEndObject();
+                }
+
+                if (!commitFingerprint.IsEmpty)
+                {
+                    writer.WriteBase64String(
+                        "commitFingerprint",
+                        commitFingerprint);
+                }
+
                 writer.WriteEndObject();
             }
 
-            if (!commitFingerprint.IsEmpty)
-            {
-                writer.WriteBase64String(
-                    "commitFingerprint",
-                    commitFingerprint);
-            }
-
-            writer.WriteEndObject();
+            return buffer.WrittenSpan.ToArray();
         }
-
-        return buffer.WrittenSpan.ToArray();
+        finally
+        {
+            buffer.Clear();
+        }
     }
 
     private static void WriteRecoveryRecipe(

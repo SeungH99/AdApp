@@ -118,6 +118,7 @@ public sealed class ApprovedRootPathGuard
                     ?? throw new FileSystemBoundaryException("The path root is invalid."))
             .ToArray();
         var pinnedAncestors = new List<SafeFileHandle>(Math.Max(0, components.Length - 1));
+        var ownershipTransferred = false;
         try
         {
             for (var index = 0; index < components.Length - 1; index++)
@@ -162,12 +163,19 @@ public sealed class ApprovedRootPathGuard
 
             var sourceHandle =
                 WindowsFileSystemNative.OpenVerifiedSourceHandle(canonical);
-            return VerifiedStableSource.Create(sourceHandle);
+            var proof = VerifiedStableSource.Create(
+                sourceHandle,
+                pinnedAncestors);
+            ownershipTransferred = true;
+            return proof;
         }
         finally
         {
-            for (var index = pinnedAncestors.Count - 1; index >= 0; index--)
-                pinnedAncestors[index].Dispose();
+            if (!ownershipTransferred)
+            {
+                PinnedDirectoryPathScope.DisposeHandles(
+                    pinnedAncestors);
+            }
         }
     }
 

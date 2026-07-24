@@ -111,6 +111,8 @@ internal interface ICrossVolumeFileSystemSession : IAsyncDisposable
             Task<StableFileIdentity>> capture,
         CancellationToken cancellationToken);
 
+    void RequireSingleLinkDestination();
+
     void DeleteSourceByHandle();
 
     CrossVolumeCleanupResult CleanupDestinationByHandle();
@@ -151,6 +153,7 @@ public sealed class CrossVolumeFileTransaction
                 .ConfigureAwait(false);
             return new CrossVolumeFileSession(
                 session,
+                source,
                 sourceIdentity,
                 faults);
         }
@@ -180,6 +183,7 @@ public sealed class CrossVolumeFileTransaction
             .ConfigureAwait(false);
         return new CrossVolumeFileSession(
             session,
+            source,
             sourceIdentity,
             faults);
     }
@@ -238,18 +242,22 @@ public sealed class CrossVolumeFileTransaction
 internal sealed class CrossVolumeFileSession : IAsyncDisposable
 {
     private readonly ICrossVolumeFileSystemSession _session;
+    private readonly VerifiedStableSource _source;
     private readonly StableFileIdentity _sourceIdentity;
     private readonly IFileOperationFaultInjector _faults;
 
     internal CrossVolumeFileSession(
         ICrossVolumeFileSystemSession session,
+        VerifiedStableSource source,
         StableFileIdentity sourceIdentity,
         IFileOperationFaultInjector faults)
     {
         ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(sourceIdentity);
         ArgumentNullException.ThrowIfNull(faults);
         _session = session;
+        _source = source;
         _sourceIdentity = sourceIdentity;
         _faults = faults;
     }
@@ -371,6 +379,8 @@ internal sealed class CrossVolumeFileSession : IAsyncDisposable
             FileOperationFaultPoint.BeforeCrossVolumeSourceDeletion);
         try
         {
+            _source.RequireSingleLink();
+            _session.RequireSingleLinkDestination();
             _session.DeleteSourceByHandle();
         }
         catch (CrossVolumeFileTransactionException)
@@ -391,6 +401,9 @@ internal sealed class CrossVolumeFileSession : IAsyncDisposable
     internal ValueTask<CrossVolumeCleanupResult>
         CleanupIncompleteDestinationAsync() =>
         ValueTask.FromResult(_session.CleanupDestinationByHandle());
+
+    internal void RequireSingleLinkDestination() =>
+        _session.RequireSingleLinkDestination();
 
     public ValueTask DisposeAsync() => _session.DisposeAsync();
 }
@@ -692,6 +705,28 @@ internal sealed class NativeCrossVolumeFileSystemSession
     {
         NativeCrossVolumeHandleDeletion.SetDeleteDisposition(
             _source.Handle);
+    }
+
+    public void RequireSingleLinkDestination()
+    {
+        if (_destination is not null)
+        {
+            _destination.RequireSingleLink();
+            return;
+        }
+
+        if (_destinationHandle is null)
+        {
+            throw new ObjectDisposedException(
+                nameof(NativeCrossVolumeFileSystemSession));
+        }
+
+        if (WindowsFileSystemNative.GetLinkCount(
+                _destinationHandle) != 1)
+        {
+            throw new StableSourceBoundaryException(
+                StableSourceBoundaryFailure.MultipleHardLinks);
+        }
     }
 
     public CrossVolumeCleanupResult CleanupDestinationByHandle()

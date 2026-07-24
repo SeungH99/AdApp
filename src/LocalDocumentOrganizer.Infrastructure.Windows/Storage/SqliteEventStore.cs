@@ -208,6 +208,13 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore,
         CancellationToken cancellationToken) =>
         _deletions.DeleteAsync(command, cancellationToken);
 
+    public IOperationSideEffectDispatcher CreateSideEffectDispatcher(
+        IOperationSideEffectSink sink)
+    {
+        ArgumentNullException.ThrowIfNull(sink);
+        return new SqliteOperationSideEffectDispatcher(this, sink);
+    }
+
     public async Task<CommitFileOperationResult> CommitAppliedAsync(
         CommitFileOperationCommand command,
         CancellationToken cancellationToken)
@@ -426,6 +433,325 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore,
                 await connection.DisposeAsync().ConfigureAwait(false);
             }
         }
+    }
+
+    private async Task<OperationSideEffectDispatchStatus>
+        DispatchPendingSideEffectsAsync(
+            OperationId operationId,
+            IReadOnlyList<FileOperationSideEffect> sideEffects,
+            IOperationSideEffectSink sink,
+            CancellationToken cancellationToken)
+    {
+        if (operationId.Value == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "An operation ID cannot be empty.",
+                nameof(operationId));
+        }
+
+        ArgumentNullException.ThrowIfNull(sideEffects);
+        ArgumentNullException.ThrowIfNull(sink);
+        if (sideEffects.Any(sideEffect => sideEffect is null))
+        {
+            throw new ArgumentException(
+                "Side effects cannot contain null entries.",
+                nameof(sideEffects));
+        }
+
+        IReadOnlyList<int> states;
+        try
+        {
+            states = await ReadSideEffectStatesAsync(
+                    operationId,
+                    sideEffects,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (SqliteException exception)
+            when (exception.SqliteErrorCode is 5 or 6)
+        {
+            return OperationSideEffectDispatchStatus.Pending;
+        }
+
+        for (var index = 0; index < sideEffects.Count; index++)
+        {
+            if (states[index] == 1)
+            {
+                continue;
+            }
+
+            var effect = sideEffects[index];
+            var delivery = new OperationSideEffectDelivery(
+                operationId,
+                index,
+                effect.Code,
+                effect.Data);
+            try
+            {
+                await sink.DeliverIdempotentlyAsync(
+                        delivery,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                return OperationSideEffectDispatchStatus.Pending;
+            }
+
+            try
+            {
+                if (!await AcknowledgeSideEffectAsync(
+                        operationId,
+                        index,
+                        effect.Code,
+                        cancellationToken)
+                    .ConfigureAwait(false))
+                {
+                    return OperationSideEffectDispatchStatus.Pending;
+                }
+            }
+            catch (SqliteException exception)
+                when (exception.SqliteErrorCode is 5 or 6)
+            {
+                return OperationSideEffectDispatchStatus.Pending;
+            }
+        }
+
+        try
+        {
+            states = await ReadSideEffectStatesAsync(
+                    operationId,
+                    sideEffects,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (SqliteException exception)
+            when (exception.SqliteErrorCode is 5 or 6)
+        {
+            return OperationSideEffectDispatchStatus.Pending;
+        }
+
+        return states.All(state => state == 1)
+            ? OperationSideEffectDispatchStatus.Delivered
+            : OperationSideEffectDispatchStatus.Pending;
+    }
+
+    private async Task<IReadOnlyList<int>> ReadSideEffectStatesAsync(
+        OperationId operationId,
+        IReadOnlyList<FileOperationSideEffect> sideEffects,
+        CancellationToken cancellationToken)
+    {
+        SqliteEventStoreSchema.ValidateVaultPath(
+            _connectionString,
+            _payloads.KeyRing.MaintenanceGate);
+        await using var lease = await _payloads.KeyRing.MaintenanceGate
+            .AcquireReadAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection =
+            await SqliteEventStoreSchema.OpenConnectionAsync(
+                _connectionString,
+                _payloads.KeyRing.MaintenanceGate,
+                cancellationToken).ConfigureAwait(false);
+        await using var transaction =
+            connection.BeginTransaction(deferred: true);
+        await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(
+            connection,
+            transaction,
+            cancellationToken).ConfigureAwait(false);
+        var expectedKeyRingIdentity =
+            await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
+                connection,
+                transaction,
+                cancellationToken).ConfigureAwait(false);
+        await using var keySession =
+            await _payloads.KeyRing.OpenReadSessionAsync(
+                lease,
+                expectedKeyRingIdentity,
+                cancellationToken).ConfigureAwait(false);
+        await SqliteEventStoreSchema.ValidateKeyRingIdentityAsync(
+            connection,
+            transaction,
+            keySession.Identity,
+            cancellationToken).ConfigureAwait(false);
+
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT effect_index, effect_code, state
+            FROM main.operation_side_effects
+            WHERE operation_id=$operation_id
+            ORDER BY effect_index;
+            """;
+        command.Parameters.Add("$operation_id", SqliteType.Text).Value =
+            operationId.Value.ToString("D");
+        var states = new List<int>(sideEffects.Count);
+        await using var reader = await command.ExecuteReaderAsync(
+                cancellationToken)
+            .ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken)
+                   .ConfigureAwait(false))
+        {
+            var expectedIndex = states.Count;
+            if (expectedIndex >= sideEffects.Count
+                || reader.GetValue(0) is not long persistedIndex
+                || persistedIndex != expectedIndex
+                || reader.GetValue(1) is not string code
+                || !string.Equals(
+                    code,
+                    sideEffects[expectedIndex].Code,
+                    StringComparison.Ordinal)
+                || reader.GetValue(2) is not long state
+                || state is not (0 or 1))
+            {
+                throw new OperationJournalRecoveryRequiredException();
+            }
+
+            states.Add(checked((int)state));
+        }
+
+        if (states.Count != sideEffects.Count)
+        {
+            throw new OperationJournalRecoveryRequiredException();
+        }
+
+        await transaction.RollbackAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return states.AsReadOnly();
+    }
+
+    private async Task<bool> AcknowledgeSideEffectAsync(
+        OperationId operationId,
+        int effectIndex,
+        string effectCode,
+        CancellationToken cancellationToken)
+    {
+        SqliteEventStoreSchema.ValidateVaultPath(
+            _connectionString,
+            _payloads.KeyRing.MaintenanceGate);
+        await using var lease = await _payloads.KeyRing.MaintenanceGate
+            .AcquireMutationAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection =
+            await SqliteEventStoreSchema.OpenConnectionAsync(
+                _connectionString,
+                _payloads.KeyRing.MaintenanceGate,
+                cancellationToken).ConfigureAwait(false);
+        await using var transaction =
+            connection.BeginTransaction(deferred: false);
+        await SqliteEventStoreSchema.ValidateExistingVersionThreeAsync(
+            connection,
+            transaction,
+            cancellationToken).ConfigureAwait(false);
+        var expectedKeyRingIdentity =
+            await SqliteEventStoreSchema.ReadPersistedKeyRingIdentityAsync(
+                connection,
+                transaction,
+                cancellationToken).ConfigureAwait(false);
+        await SqliteSensitiveDataDeletionStore.RequireNoPendingReceiptsAsync(
+            _payloads.KeyRing,
+            expectedKeyRingIdentity,
+            cancellationToken).ConfigureAwait(false);
+        await using var keySession =
+            await _payloads.KeyRing.OpenWriteSessionAsync(
+                lease,
+                expectedKeyRingIdentity,
+                cancellationToken).ConfigureAwait(false);
+        await SqliteEventStoreSchema.ValidateKeyRingIdentityAsync(
+            connection,
+            transaction,
+            keySession.Identity,
+            cancellationToken).ConfigureAwait(false);
+
+        await using var update = connection.CreateCommand();
+        update.Transaction = transaction;
+        update.CommandText = """
+            UPDATE main.operation_side_effects
+            SET state=1
+            WHERE operation_id=$operation_id
+              AND effect_index=$effect_index
+              AND effect_code=$effect_code
+              AND state=0
+              AND EXISTS(
+                  SELECT 1
+                  FROM main.operation_journal AS journal
+                  WHERE journal.operation_id=$operation_id
+                    AND journal.state=$side_effects_pending);
+            """;
+        update.Parameters.Add("$operation_id", SqliteType.Text).Value =
+            operationId.Value.ToString("D");
+        update.Parameters.Add("$effect_index", SqliteType.Integer).Value =
+            effectIndex;
+        update.Parameters.Add("$effect_code", SqliteType.Text).Value =
+            effectCode;
+        update.Parameters.Add(
+            "$side_effects_pending",
+            SqliteType.Integer).Value =
+            (int)OperationJournalState.SideEffectsPending;
+        var affected = await update.ExecuteNonQueryAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (affected == 0)
+        {
+            await using var read = connection.CreateCommand();
+            read.Transaction = transaction;
+            read.CommandText = """
+                SELECT state
+                FROM main.operation_side_effects
+                WHERE operation_id=$operation_id
+                  AND effect_index=$effect_index
+                  AND effect_code=$effect_code;
+                """;
+            read.Parameters.Add("$operation_id", SqliteType.Text).Value =
+                operationId.Value.ToString("D");
+            read.Parameters.Add("$effect_index", SqliteType.Integer).Value =
+                effectIndex;
+            read.Parameters.Add("$effect_code", SqliteType.Text).Value =
+                effectCode;
+            var state = await read.ExecuteScalarAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (state is not long { } persistedState
+                || persistedState != 1)
+            {
+                await transaction.RollbackAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                return false;
+            }
+        }
+        else if (affected != 1)
+        {
+            throw new OperationJournalRecoveryRequiredException();
+        }
+
+        await keySession.RequireCanonicalImageAsync(cancellationToken)
+            .ConfigureAwait(false);
+        await SqliteEventStoreSchema.ValidateKeyRingIdentityAsync(
+            connection,
+            transaction,
+            keySession.Identity,
+            cancellationToken).ConfigureAwait(false);
+        SqliteEventStoreSchema.ValidateVaultPath(
+            _connectionString,
+            _payloads.KeyRing.MaintenanceGate);
+        await transaction.CommitAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return true;
+    }
+
+    private sealed class SqliteOperationSideEffectDispatcher(
+        SqliteEventStore owner,
+        IOperationSideEffectSink sink)
+        : IOperationSideEffectDispatcher
+    {
+        public Task<OperationSideEffectDispatchStatus> DispatchPendingAsync(
+            OperationId operationId,
+            IReadOnlyList<FileOperationSideEffect> sideEffects,
+            CancellationToken cancellationToken) =>
+            owner.DispatchPendingSideEffectsAsync(
+                operationId,
+                sideEffects,
+                sink,
+                cancellationToken);
     }
 
     private static bool CommitIdentityMatches(
