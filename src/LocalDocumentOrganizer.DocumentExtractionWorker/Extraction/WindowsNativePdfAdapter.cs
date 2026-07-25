@@ -14,7 +14,7 @@ public sealed class WindowsNativePdfAdapter : IDocumentExtractionAdapter
     internal const string AdapterIdentifier = "windows-native-pdf-ocr";
     internal const string AdapterApiVersion = "1";
     internal const string DecoderApiVersion =
-        "Windows.Data.Pdf/UniversalApiContract-v1";
+        "windows-data-pdf-universal-api-contract-v1";
     private const double PointsPerDip = 72d / 96d;
     private const double RenderScale = 2d;
     private const int WrongPasswordHResult = unchecked((int)0x8007052B);

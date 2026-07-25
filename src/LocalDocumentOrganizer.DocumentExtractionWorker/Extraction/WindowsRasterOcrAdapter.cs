@@ -14,7 +14,7 @@ public sealed class WindowsRasterOcrAdapter : IDocumentExtractionAdapter
     internal const string AdapterIdentifier = "windows-raster-ocr";
     internal const string AdapterApiVersion = "1";
     internal const string OcrApiVersion =
-        "Windows.Media.Ocr/UniversalApiContract-v1";
+        "windows-media-ocr-universal-api-contract-v1";
 
     public bool CanHandle(DocumentSourceDescriptor source) =>
         source is not null
@@ -76,7 +76,7 @@ public sealed class WindowsRasterOcrAdapter : IDocumentExtractionAdapter
                 .AsTask(cancellationToken)
                 .ConfigureAwait(false);
             var decoderVersion =
-                $"Windows.Graphics.Imaging/{decoder.DecoderInformation.CodecId:D}";
+                $"windows-graphics-imaging-{decoder.DecoderInformation.CodecId:D}";
             var fragments = WindowsExtractionSupport.CreateOcrFragments(
                 ocrResult,
                 0,
