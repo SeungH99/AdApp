@@ -41,6 +41,10 @@ public sealed class DocumentExtractionException : Exception
         };
 }
 
+public sealed record DocumentExtractionEvaluationResult(
+    DocumentExtractionResponse Response,
+    ImmutableArray<byte> SourceSha256);
+
 public sealed class DocumentExtractionClient
 {
     private const int DiagnosticDrainLimit = 4096;
@@ -121,11 +125,11 @@ public sealed class DocumentExtractionClient
             await using var verified = VerifiedStableSource.Create(
                 verificationHandle);
             verificationHandle = null;
-            return await ExtractVerifiedAsync(
+            return (await ExtractVerifiedAsync(
                     verified,
                     descriptor,
                     cancellationToken)
-                .ConfigureAwait(false);
+                .ConfigureAwait(false)).Response;
         }
         catch (Exception exception) when (
             exception is StableSourceBoundaryException
@@ -176,18 +180,68 @@ public sealed class DocumentExtractionClient
 
         await using (verified)
         {
-            return await ExtractVerifiedAsync(
+            return (await ExtractVerifiedAsync(
                     verified,
                     descriptor,
                     cancellationToken)
+                .ConfigureAwait(false)).Response;
+        }
+    }
+
+    public async Task<DocumentExtractionEvaluationResult>
+        ExtractForEvaluationAsync(
+            string sourcePath,
+            DocumentSourceDescriptor descriptor,
+            ImmutableArray<string> requestedLanguages,
+            CancellationToken cancellationToken)
+    {
+        if (_approvedRoot is null)
+        {
+            throw new InvalidOperationException(
+                "A path extraction requires an approved root.");
+        }
+
+        if (requestedLanguages.IsDefaultOrEmpty)
+        {
+            throw new ArgumentException(
+                "At least one requested language is required.",
+                nameof(requestedLanguages));
+        }
+
+        VerifiedStableSource verified;
+        try
+        {
+            verified = _approvedRoot.OpenVerifiedSource(sourcePath);
+        }
+        catch (Exception exception) when (
+            exception is FileSystemBoundaryException
+                or StableSourceBoundaryException
+                or ArgumentException
+                or NotSupportedException
+                or PathTooLongException
+                or UnauthorizedAccessException)
+        {
+            throw new DocumentExtractionException(
+                DocumentExtractionFailureCode.InvalidSourceHandle);
+        }
+
+        await using (verified)
+        {
+            return await ExtractVerifiedAsync(
+                    verified,
+                    descriptor,
+                    cancellationToken,
+                    requestedLanguages)
                 .ConfigureAwait(false);
         }
     }
 
-    private async Task<DocumentExtractionResponse> ExtractVerifiedAsync(
+    private async Task<DocumentExtractionEvaluationResult>
+        ExtractVerifiedAsync(
         VerifiedStableSource source,
         DocumentSourceDescriptor descriptor,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ImmutableArray<string>? requestedLanguages = null)
     {
         byte[]? initialHash = null;
         try
@@ -228,7 +282,7 @@ public sealed class DocumentExtractionClient
                         source.Length,
                         ImmutableArray.Create(initialHash)),
                     ExtractionCapability.EmbeddedText | ExtractionCapability.Ocr,
-                    ImmutableArray<string>.Empty);
+                    requestedLanguages ?? ImmutableArray<string>.Empty);
                 var requestValidation =
                     DocumentExtractionValidator.ValidateRequest(request);
                 if (!requestValidation.IsValid)
@@ -305,7 +359,9 @@ public sealed class DocumentExtractionClient
                         CryptographicOperations.ZeroMemory(finalHash);
                     }
 
-                    return response;
+                    return new DocumentExtractionEvaluationResult(
+                        response,
+                        ImmutableArray.CreateRange(initialHash));
                 }
                 catch (OperationCanceledException exception)
                 {
