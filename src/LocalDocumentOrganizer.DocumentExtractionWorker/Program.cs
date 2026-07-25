@@ -14,13 +14,31 @@ public static class Program
             Console.OpenStandardOutput(),
             Console.Error,
             [],
+            TimeSpan.FromMilliseconds(
+                DocumentExtractionLimits.ExtractionTimeoutMilliseconds),
             CancellationToken.None);
+
+    public static Task<int> RunAsync(
+        Stream input,
+        Stream output,
+        TextWriter error,
+        IEnumerable<IDocumentExtractionAdapter> adapters,
+        CancellationToken cancellationToken) =>
+        RunAsync(
+            input,
+            output,
+            error,
+            adapters,
+            TimeSpan.FromMilliseconds(
+                DocumentExtractionLimits.ExtractionTimeoutMilliseconds),
+            cancellationToken);
 
     public static async Task<int> RunAsync(
         Stream input,
         Stream output,
         TextWriter error,
         IEnumerable<IDocumentExtractionAdapter> adapters,
+        TimeSpan workerLifetime,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(input);
@@ -28,11 +46,23 @@ public static class Program
         ArgumentNullException.ThrowIfNull(error);
         ArgumentNullException.ThrowIfNull(adapters);
 
+        using var deadline = new CancellationTokenSource(workerLifetime);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            deadline.Token);
+
         DocumentExtractionRequest request;
         try
         {
-            request = await FramedJsonTransport.ReadRequestAsync(input, cancellationToken)
+            request = await FramedJsonTransport.ReadRequestAsync(input, linked.Token)
                 .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (
+            deadline.IsCancellationRequested
+            && !cancellationToken.IsCancellationRequested)
+        {
+            error.WriteLine("worker:timeout");
+            return 70;
         }
         catch (Exception exception) when (
             exception is InvalidDataException
@@ -49,25 +79,45 @@ public static class Program
             return 70;
         }
 
-        using var timeout = new CancellationTokenSource(
-            DocumentExtractionLimits.ExtractionTimeoutMilliseconds);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken,
-            timeout.Token);
-
         try
         {
             var processor = new DocumentExtractionProcessor(adapters);
-            var response = await processor.ProcessAsync(request, linked.Token)
+            var response = await processor.ProcessAsync(
+                    request,
+                    linked.Token,
+                    cancellationToken,
+                    deadline.Token)
                 .ConfigureAwait(false);
-            using var responseWriteTimeout =
-                new CancellationTokenSource(TimeSpan.FromSeconds(1));
-            await FramedJsonTransport.WriteResponseAsync(
-                    output,
-                    response,
-                    responseWriteTimeout.Token)
-                .ConfigureAwait(false);
+
+            var responseWriteToken = linked.Token;
+            CancellationTokenSource? terminalResponseTimeout = null;
+            if (linked.IsCancellationRequested
+                && response.FailureCode is (
+                    DocumentExtractionFailureCode.ExtractionCancelled
+                    or DocumentExtractionFailureCode.ExtractionTimedOut))
+            {
+                terminalResponseTimeout =
+                    new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                responseWriteToken = terminalResponseTimeout.Token;
+            }
+
+            using (terminalResponseTimeout)
+            {
+                await FramedJsonTransport.WriteResponseAsync(
+                        output,
+                        response,
+                        responseWriteToken)
+                    .ConfigureAwait(false);
+            }
+
             return 0;
+        }
+        catch (OperationCanceledException) when (
+            deadline.IsCancellationRequested
+            && !cancellationToken.IsCancellationRequested)
+        {
+            error.WriteLine("worker:timeout");
+            return 70;
         }
         catch (Exception)
         {

@@ -6,6 +6,17 @@ namespace LocalDocumentOrganizer.DocumentExtractionWorker.Extraction;
 public static class ExtractionFailureMapper
 {
     public static DocumentExtractionFailureCode Map(Exception exception)
+        => Map(
+            exception,
+            CancellationToken.None,
+            CancellationToken.None,
+            CancellationToken.None);
+
+    internal static DocumentExtractionFailureCode Map(
+        Exception exception,
+        CancellationToken operationCancellationToken,
+        CancellationToken callerCancellationToken,
+        CancellationToken deadlineCancellationToken)
     {
         ArgumentNullException.ThrowIfNull(exception);
 
@@ -14,6 +25,12 @@ public static class ExtractionFailureMapper
             SourceDocumentException sourceException => sourceException.FailureCode,
             DocumentExtractionAdapterException adapterException =>
                 adapterException.FailureCode,
+            OperationCanceledException cancellationException
+                when deadlineCancellationToken.IsCancellationRequested
+                    && !callerCancellationToken.IsCancellationRequested
+                    && cancellationException.CancellationToken
+                        == operationCancellationToken =>
+                DocumentExtractionFailureCode.ExtractionTimedOut,
             OperationCanceledException =>
                 DocumentExtractionFailureCode.ExtractionCancelled,
             OutOfMemoryException =>

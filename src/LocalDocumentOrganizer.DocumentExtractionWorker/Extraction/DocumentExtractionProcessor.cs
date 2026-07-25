@@ -24,9 +24,20 @@ public sealed class DocumentExtractionProcessor
         }
     }
 
-    public async Task<DocumentExtractionResponse> ProcessAsync(
+    public Task<DocumentExtractionResponse> ProcessAsync(
         DocumentExtractionRequest request,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken) =>
+        ProcessAsync(
+            request,
+            cancellationToken,
+            cancellationToken,
+            CancellationToken.None);
+
+    internal async Task<DocumentExtractionResponse> ProcessAsync(
+        DocumentExtractionRequest request,
+        CancellationToken cancellationToken,
+        CancellationToken callerCancellationToken,
+        CancellationToken deadlineCancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
         var stopwatch = Stopwatch.StartNew();
@@ -94,7 +105,11 @@ public sealed class DocumentExtractionProcessor
         {
             return Failure(
                 request,
-                ExtractionFailureMapper.Map(exception),
+                ExtractionFailureMapper.Map(
+                    exception,
+                    cancellationToken,
+                    callerCancellationToken,
+                    deadlineCancellationToken),
                 stopwatch.ElapsedMilliseconds);
         }
     }
