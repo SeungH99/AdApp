@@ -13,7 +13,7 @@ public static class Program
             Console.OpenStandardInput(),
             Console.OpenStandardOutput(),
             Console.Error,
-            [],
+            ProductionDocumentExtractionAdapters.Create(),
             TimeSpan.FromMilliseconds(
                 DocumentExtractionLimits.ExtractionTimeoutMilliseconds),
             TimeProvider.System,

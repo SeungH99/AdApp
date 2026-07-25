@@ -7,7 +7,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="PdfPig" />
     <ProjectReference Include="..\LocalDocumentOrganizer.Core\LocalDocumentOrganizer.Core.csproj" />
   </ItemGroup>
 </Project>

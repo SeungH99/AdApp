@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Xml.Linq;
@@ -16,6 +17,28 @@ public static class PdfPigPackageInspector
     public const string ExpectedId = "PdfPig";
     public const string ExpectedVersion = "0.1.15";
     public const string ExpectedLicense = "Apache-2.0";
+
+    public static bool TryInspect(
+        string? packageRoot,
+        out PdfPigPackageMetadata? metadata)
+    {
+        try
+        {
+            metadata = Inspect(packageRoot);
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is InvalidDataException
+                or IOException
+                or UnauthorizedAccessException
+                or System.Xml.XmlException
+                or FormatException
+                or OverflowException)
+        {
+            metadata = null;
+            return false;
+        }
+    }
 
     public static PdfPigPackageMetadata Inspect(string? packageRoot = null)
     {
@@ -42,17 +65,15 @@ public static class PdfPigPackageInspector
         var document = XDocument.Load(
             nuspecPath,
             LoadOptions.None);
-        var metadata = document.Root?
-            .Elements()
-            .SingleOrDefault(static element => element.Name.LocalName == "metadata")
+        var root = document.Root
             ?? throw new InvalidDataException(
-                "The PdfPig nuspec has no metadata element.");
+                "The PdfPig nuspec has no package element.");
+        var metadata = RequiredSingleElement(root, "metadata");
         var id = RequiredValue(metadata, "id");
         var version = RequiredValue(metadata, "version");
-        var licenseElement = metadata.Elements().SingleOrDefault(
-            static element => element.Name.LocalName == "license");
-        var license = licenseElement?.Value?.Trim();
-        var licenseType = licenseElement?.Attribute("type")?.Value;
+        var licenseElement = RequiredSingleElement(metadata, "license");
+        var license = licenseElement.Value.Trim();
+        var licenseType = licenseElement.Attribute("type")?.Value;
         if (!string.Equals(id, ExpectedId, StringComparison.Ordinal)
             || !string.Equals(version, ExpectedVersion, StringComparison.Ordinal)
             || !string.Equals(
@@ -115,14 +136,25 @@ public static class PdfPigPackageInspector
 
     private static string RequiredValue(XElement metadata, string localName)
     {
-        var value = metadata.Elements()
-            .SingleOrDefault(element => element.Name.LocalName == localName)
-            ?.Value
-            ?.Trim();
+        var value = RequiredSingleElement(metadata, localName).Value.Trim();
         return string.IsNullOrWhiteSpace(value)
             ? throw new InvalidDataException(
                 $"The PdfPig nuspec is missing {localName}.")
             : value;
+    }
+
+    private static XElement RequiredSingleElement(
+        XElement parent,
+        string localName)
+    {
+        var matches = parent.Elements()
+            .Where(element => element.Name.LocalName == localName)
+            .Take(2)
+            .ToArray();
+        return matches.Length == 1
+            ? matches[0]
+            : throw new InvalidDataException(
+                $"The PdfPig nuspec must contain exactly one {localName}.");
     }
 }
 
@@ -200,10 +232,59 @@ public static class BenchmarkHashing
 public sealed record BenchmarkChildProcessSpec(
     string FileName,
     IReadOnlyList<string> Arguments,
-    string ResultPath);
+    string ResultPath,
+    string? AdapterId = null);
 
 public static class BenchmarkChildProcessRunner
 {
+    public static async Task<IReadOnlyList<AdapterCandidateMeasurement>>
+        RunCandidatesAsync(
+            IReadOnlyList<BenchmarkChildProcessSpec> specifications,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(specifications);
+        var results = new List<AdapterCandidateMeasurement>(
+            specifications.Count);
+        foreach (var specification in specifications)
+        {
+            if (string.IsNullOrWhiteSpace(specification.AdapterId))
+            {
+                throw new ArgumentException(
+                    "Every candidate child requires an adapter ID.",
+                    nameof(specifications));
+            }
+
+            try
+            {
+                results.Add(
+                    await RunAsync(
+                            specification,
+                            timeout,
+                            cancellationToken)
+                        .ConfigureAwait(false));
+            }
+            catch (TimeoutException)
+            {
+                results.Add(
+                    new AdapterCandidateMeasurement(
+                        specification.AdapterId,
+                        0,
+                        0,
+                        0,
+                        0,
+                        ["candidate-timeout"],
+                        []));
+            }
+        }
+
+        return results
+            .OrderBy(
+                static measurement => measurement.AdapterId,
+                StringComparer.Ordinal)
+            .ToArray();
+    }
+
     public static async Task<IReadOnlyList<AdapterCandidateMeasurement>>
         RunAllAsync(
             IReadOnlyList<BenchmarkChildProcessSpec> specifications,
@@ -256,25 +337,44 @@ public static class BenchmarkChildProcessRunner
         using var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException(
                 "The benchmark child process could not be started.");
-        var stdout = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderr = process.StandardError.ReadToEndAsync(cancellationToken);
-        var wait = process.WaitForExitAsync(cancellationToken);
-        var completed = await Task.WhenAny(
-                wait,
-                Task.Delay(timeout, cancellationToken))
-            .ConfigureAwait(false);
-        if (completed != wait)
+        var stdout = process.StandardOutput.ReadToEndAsync(
+            CancellationToken.None);
+        var stderr = process.StandardError.ReadToEndAsync(
+            CancellationToken.None);
+        using var timeoutCancellation = new CancellationTokenSource(timeout);
+        using var linkedCancellation =
+            CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                timeoutCancellation.Token);
+        try
+        {
+            await process.WaitForExitAsync(linkedCancellation.Token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
         {
             KillProcess(process);
             await process.WaitForExitAsync(CancellationToken.None)
                 .ConfigureAwait(false);
+            _ = await stdout.ConfigureAwait(false);
+            _ = await stderr.ConfigureAwait(false);
+            if (cancellationToken.IsCancellationRequested)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
             throw new TimeoutException(
                 "The benchmark child process exceeded its timeout.");
         }
 
-        await wait.ConfigureAwait(false);
         var errorText = await stderr.ConfigureAwait(false);
         _ = await stdout.ConfigureAwait(false);
+        if (process.ExitCode == CandidateProcessExitCodes.Timeout)
+        {
+            throw new TimeoutException(
+                "The benchmark child reported a fixture timeout.");
+        }
+
         if (process.ExitCode != 0)
         {
             throw new InvalidOperationException(
@@ -318,5 +418,57 @@ public static class BenchmarkChildProcessRunner
         {
             // The process exited between the state check and kill request.
         }
+    }
+}
+
+public static class CandidateProcessExitCodes
+{
+    public const int Timeout = 124;
+}
+
+public sealed class CandidateFixtureWatchdog : IDisposable
+{
+    private readonly CancellationTokenSource completion = new();
+    private readonly Task watchdog;
+
+    public CandidateFixtureWatchdog(TimeSpan timeout)
+    {
+        if (timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        }
+
+        watchdog = WatchAsync(timeout, completion.Token);
+    }
+
+    [DoesNotReturn]
+    public static void ExitTimedOutProcess()
+    {
+        Environment.Exit(CandidateProcessExitCodes.Timeout);
+        throw new UnreachableException();
+    }
+
+    public void Dispose()
+    {
+        completion.Cancel();
+        watchdog.GetAwaiter().GetResult();
+        completion.Dispose();
+    }
+
+    private static async Task WatchAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(timeout, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (
+            cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        ExitTimedOutProcess();
     }
 }

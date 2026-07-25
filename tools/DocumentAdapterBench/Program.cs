@@ -334,7 +334,7 @@ public static class Program
                             resultDirectory,
                             $"{candidateId}.json")))
                 .ToArray();
-            return await BenchmarkChildProcessRunner.RunAllAsync(
+            return await BenchmarkChildProcessRunner.RunCandidatesAsync(
                     specifications,
                     CandidateProcessTimeout,
                     CancellationToken.None)
@@ -369,7 +369,11 @@ public static class Program
         arguments.Add(manifestPath);
         arguments.Add("--result");
         arguments.Add(resultPath);
-        return new BenchmarkChildProcessSpec(processPath, arguments, resultPath);
+        return new BenchmarkChildProcessSpec(
+            processPath,
+            arguments,
+            resultPath,
+            candidateId);
     }
 
     private static async Task<AdapterCandidateMeasurement> MeasureCandidateAsync(
@@ -413,10 +417,13 @@ public static class Program
                 ? new WindowsRasterOcrAdapter()
                 : adapterId == BenchmarkAdapterIds.CandidateA
                     ? new WindowsNativePdfAdapter()
-                    : new PdfPigEmbeddedTextAdapter();
+                    : new PdfPigBenchmarkAdapter();
             var processor = new DocumentExtractionProcessor([adapter]);
             using var timeout = new CancellationTokenSource(
                 DocumentExtractionLimits.ExtractionTimeoutMilliseconds);
+            using var watchdog = new CandidateFixtureWatchdog(
+                TimeSpan.FromMilliseconds(
+                    DocumentExtractionLimits.ExtractionTimeoutMilliseconds));
             var stopwatch = Stopwatch.StartNew();
             var response = await processor.ProcessAsync(request, timeout.Token)
                 .ConfigureAwait(false);
@@ -427,12 +434,7 @@ public static class Program
 
             if (timeout.IsCancellationRequested)
             {
-                rejectionReasons.Add($"{fixture.Id}:timeout");
-                fixtureMeasurements.Add(
-                    FailedFixtureMeasurement(
-                        fixture,
-                        stopwatch.Elapsed.TotalMilliseconds));
-                continue;
+                CandidateFixtureWatchdog.ExitTimedOutProcess();
             }
 
             if (response.Outcome != DocumentExtractionOutcome.Success)
@@ -549,14 +551,11 @@ public static class Program
 
     private static PdfPigPackageMetadata? TryInspectPdfPigPackage()
     {
-        try
-        {
-            return PdfPigPackageInspector.Inspect();
-        }
-        catch (InvalidDataException)
-        {
-            return null;
-        }
+        return PdfPigPackageInspector.TryInspect(
+            packageRoot: null,
+            out var metadata)
+            ? metadata
+            : null;
     }
 
     private static double Percentile95(IReadOnlyList<double> values)

@@ -1,25 +1,26 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
 using LocalDocumentOrganizer.Core.Documents;
+using LocalDocumentOrganizer.DocumentExtractionWorker.Extraction;
 using LocalDocumentOrganizer.DocumentExtractionWorker.Source;
 using UglyToad.PdfPig;
 using UglyToad.PdfPig.Exceptions;
 
-namespace LocalDocumentOrganizer.DocumentExtractionWorker.Extraction;
+namespace LocalDocumentOrganizer.DocumentAdapterBench;
 
-public sealed class PdfPigEmbeddedTextAdapter : IDocumentExtractionAdapter
+public sealed class PdfPigBenchmarkAdapter : IDocumentExtractionAdapter
 {
     internal const string AdapterIdentifier = "pdfpig-embedded-text";
     internal const string AdapterApiVersion = "1";
     internal const string DecoderApiVersion = "PdfPig/0.1.15";
     private readonly WindowsNativePdfAdapter fallback;
 
-    public PdfPigEmbeddedTextAdapter()
+    public PdfPigBenchmarkAdapter()
         : this(new WindowsNativePdfAdapter())
     {
     }
 
-    internal PdfPigEmbeddedTextAdapter(WindowsNativePdfAdapter fallback)
+    internal PdfPigBenchmarkAdapter(WindowsNativePdfAdapter fallback)
     {
         this.fallback = fallback ?? throw new ArgumentNullException(nameof(fallback));
     }
@@ -56,26 +57,8 @@ public sealed class PdfPigEmbeddedTextAdapter : IDocumentExtractionAdapter
         var responseBudget = new ExtractionResponseBudget();
         try
         {
-            var ownedBytes = await WindowsExtractionSupport.ReadVerifiedBytesAsync(
-                    source.Content,
-                    source.VerifiedLength,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            var parseTask = Task.Run(
-                () => ParseOwnedDocument(ownedBytes, responseBudget),
-                CancellationToken.None);
-            ParsedPdf parsed;
-            try
-            {
-                parsed = await parseTask.WaitAsync(cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                ObserveBackgroundFault(parseTask);
-                throw;
-            }
-
+            source.Content.Position = 0;
+            var parsed = ParseDocument(source.Content, responseBudget);
             var fragments = parsed.Fragments.ToBuilder();
             if (parsed.MissingPages.Count > 0
                 && (request.RequestedCapabilities & ExtractionCapability.Ocr) != 0)
@@ -88,7 +71,8 @@ public sealed class PdfPigEmbeddedTextAdapter : IDocumentExtractionAdapter
                         cancellationToken)
                     .ConfigureAwait(false);
                 var compositeDecoder =
-                    $"{DecoderApiVersion}+{WindowsNativePdfAdapter.DecoderApiVersion}";
+                    $"{DecoderApiVersion}+"
+                    + fallbackResponse.RuntimeMetadata.DecoderVersion;
                 for (var index = 0; index < fragments.Count; index++)
                 {
                     fragments[index] = fragments[index] with
@@ -119,7 +103,7 @@ public sealed class PdfPigEmbeddedTextAdapter : IDocumentExtractionAdapter
                         AdapterIdentifier,
                         AdapterApiVersion,
                         compositeDecoder,
-                        WindowsRasterOcrAdapter.OcrApiVersion),
+                        fallbackResponse.RuntimeMetadata.OcrVersion),
                     stopwatch.ElapsedMilliseconds,
                     DocumentExtractionFailureCode.None);
             }
@@ -170,11 +154,10 @@ public sealed class PdfPigEmbeddedTextAdapter : IDocumentExtractionAdapter
         }
     }
 
-    private static ParsedPdf ParseOwnedDocument(
-        byte[] ownedBytes,
+    private static ParsedPdf ParseDocument(
+        Stream content,
         ExtractionResponseBudget responseBudget)
     {
-        using var content = new MemoryStream(ownedBytes, writable: false);
         using var document = PdfDocument.Open(
             content,
             new ParsingOptions { UseLenientParsing = false });
@@ -271,16 +254,6 @@ public sealed class PdfPigEmbeddedTextAdapter : IDocumentExtractionAdapter
             fragments.ToImmutable(),
             pages.ToImmutable(),
             missingPages);
-    }
-
-    private static void ObserveBackgroundFault(Task task)
-    {
-        _ = task.ContinueWith(
-            static completed => _ = completed.Exception,
-            CancellationToken.None,
-            TaskContinuationOptions.OnlyOnFaulted
-                | TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
     }
 
     private sealed record ParsedPdf(

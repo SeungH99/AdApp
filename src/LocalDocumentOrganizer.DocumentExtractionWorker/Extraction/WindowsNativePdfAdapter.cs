@@ -35,7 +35,7 @@ public sealed class WindowsNativePdfAdapter : IDocumentExtractionAdapter
             new ExtractionResponseBudget(),
             cancellationToken);
 
-    internal async Task<DocumentExtractionResponse> ExtractPagesAsync(
+    public async Task<DocumentExtractionResponse> ExtractPagesAsync(
         InheritedSourceDocument source,
         DocumentExtractionRequest request,
         IReadOnlySet<int>? pageIndexes,

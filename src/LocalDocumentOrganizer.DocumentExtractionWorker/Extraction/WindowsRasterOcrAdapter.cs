@@ -198,51 +198,6 @@ internal static class WindowsExtractionSupport
         }
     }
 
-    public static async Task<byte[]> ReadVerifiedBytesAsync(
-        Stream source,
-        long verifiedLength,
-        CancellationToken cancellationToken)
-    {
-        ArgumentNullException.ThrowIfNull(source);
-        if (verifiedLength < 0
-            || verifiedLength > DocumentExtractionLimits.MaxEncodedInputBytes
-            || verifiedLength > int.MaxValue)
-        {
-            throw new UnsupportedDocumentException(
-                "The encoded input exceeds the worker-owned byte boundary.");
-        }
-
-        var originalPosition = source.Position;
-        var bytes = GC.AllocateUninitializedArray<byte>(
-            checked((int)verifiedLength));
-        try
-        {
-            source.Position = 0;
-            var offset = 0;
-            while (offset < bytes.Length)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var read = await source.ReadAsync(
-                        bytes.AsMemory(offset, bytes.Length - offset),
-                        cancellationToken)
-                    .ConfigureAwait(false);
-                if (read == 0)
-                {
-                    throw new CorruptDocumentException(
-                        "The verified source ended during its bounded copy.");
-                }
-
-                offset += read;
-            }
-
-            return bytes;
-        }
-        finally
-        {
-            source.Position = originalPosition;
-        }
-    }
-
     public static OcrEngine CreateOcrEngine(
         ImmutableArray<string> requestedLanguages)
     {
