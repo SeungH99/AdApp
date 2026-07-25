@@ -492,6 +492,9 @@ public sealed class AppContainerProcessLauncher
 
 public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
 {
+    private const uint GracefulTerminationWaitMilliseconds = 5_000;
+    private const uint ForcedTerminationWaitMilliseconds = 1_000;
+
     private SafeKernelHandle? _process;
     private DocumentWorkerJob? _job;
     private int _disposed;
@@ -581,21 +584,27 @@ public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
 
         try
         {
-            try
-            {
-                StandardInput.Dispose();
-            }
-            catch (IOException)
-            {
-            }
-
+            var process = GetProcess();
             try
             {
                 _job?.Terminate(0xE0000003);
             }
             catch (AppContainerLaunchException)
             {
-                // Closing the last kill-on-close Job handle remains the rescue.
+                _ = WorkerNativeMethods.TerminateProcess(
+                    process,
+                    0xE0000004);
+            }
+
+            WaitForTermination(
+                process,
+                GracefulTerminationWaitMilliseconds);
+            try
+            {
+                StandardInput.Dispose();
+            }
+            catch (IOException)
+            {
             }
 
             try
@@ -618,4 +627,51 @@ public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
             ? process
             : throw new ObjectDisposedException(
                 nameof(LaunchedAppContainerProcess));
+
+    private static void WaitForTermination(
+        SafeKernelHandle process,
+        uint timeoutMilliseconds)
+    {
+        var result = WorkerNativeMethods.WaitForSingleObject(
+            process,
+            timeoutMilliseconds);
+        if (result == WorkerNativeMethods.WaitObject0)
+        {
+            return;
+        }
+
+        if (result == WorkerNativeMethods.WaitFailed)
+        {
+            throw new AppContainerLaunchException(
+                "Worker termination wait failed.",
+                new Win32Exception(Marshal.GetLastPInvokeError()));
+        }
+
+        if (result != WorkerNativeMethods.WaitTimeout)
+        {
+            throw new AppContainerLaunchException(
+                "Worker termination wait returned an invalid result.");
+        }
+
+        _ = WorkerNativeMethods.TerminateProcess(
+            process,
+            0xE0000005);
+        result = WorkerNativeMethods.WaitForSingleObject(
+            process,
+            ForcedTerminationWaitMilliseconds);
+        if (result == WorkerNativeMethods.WaitObject0)
+        {
+            return;
+        }
+
+        if (result == WorkerNativeMethods.WaitFailed)
+        {
+            throw new AppContainerLaunchException(
+                "Forced worker termination wait failed.",
+                new Win32Exception(Marshal.GetLastPInvokeError()));
+        }
+
+        throw new AppContainerLaunchException(
+            "The isolated worker did not terminate within the cleanup deadline.");
+    }
 }

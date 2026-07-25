@@ -17,6 +17,7 @@ internal static class WorkerNativeMethods
     internal const uint FileGenericRead = 0x00120089;
     internal const uint WaitObject0 = 0;
     internal const uint WaitTimeout = 258;
+    internal const uint WaitFailed = uint.MaxValue;
 
     internal static readonly UIntPtr ProcThreadAttributeHandleList =
         (UIntPtr)0x00020002;

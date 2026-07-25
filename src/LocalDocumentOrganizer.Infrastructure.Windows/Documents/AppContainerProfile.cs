@@ -122,6 +122,16 @@ public sealed class AppContainerProfile : IDisposable
 
     public void Dispose()
     {
+        DisposeCore(deleteProfile: true);
+    }
+
+    internal void ReleaseWithoutProfileDeletion()
+    {
+        DisposeCore(deleteProfile: false);
+    }
+
+    private void DisposeCore(bool deleteProfile)
+    {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return;
@@ -133,7 +143,10 @@ public sealed class AppContainerProfile : IDisposable
             null);
         try
         {
-            DeleteProfileOrThrow("AppContainer profile cleanup");
+            if (deleteProfile)
+            {
+                DeleteProfileOrThrow("AppContainer profile cleanup");
+            }
         }
         finally
         {
