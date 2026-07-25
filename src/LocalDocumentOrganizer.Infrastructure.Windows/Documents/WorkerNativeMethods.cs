@@ -10,6 +10,7 @@ internal static class WorkerNativeMethods
     internal const int ErrorInsufficientBuffer = 122;
 
     internal const uint CreateSuspended = 0x00000004;
+    internal const uint CreateUnicodeEnvironment = 0x00000400;
     internal const uint ExtendedStartupInfoPresent = 0x00080000;
     internal const uint StartfUseStdHandles = 0x00000100;
     internal const uint HandleFlagInherit = 0x00000001;
@@ -31,6 +32,10 @@ internal static class WorkerNativeMethods
         IntPtr capabilities,
         uint capabilityCount,
         out IntPtr appContainerSid);
+
+    [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
+    internal static extern int DeleteAppContainerProfile(
+        string appContainerName);
 
     [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
     internal static extern int DeriveAppContainerSidFromAppContainerName(

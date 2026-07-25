@@ -9,10 +9,17 @@ public sealed class AppContainerProfile : IDisposable
         "ProofToClosure.DocumentExtractionWorker.v1";
 
     private SafeSidHandle? _sid;
+    private FileStream? _lifecycleLock;
+    private int _disposed;
 
-    private AppContainerProfile(SafeSidHandle sid, string sidValue, string folderPath)
+    private AppContainerProfile(
+        SafeSidHandle sid,
+        string sidValue,
+        string folderPath,
+        FileStream lifecycleLock)
     {
         _sid = sid;
+        _lifecycleLock = lifecycleLock;
         Sid = sidValue;
         FolderPath = folderPath;
     }
@@ -28,32 +35,36 @@ public sealed class AppContainerProfile : IDisposable
 
     public static AppContainerProfile OpenOrCreate()
     {
-        var result = WorkerNativeMethods.CreateAppContainerProfile(
-            ProfileName,
-            "ProofToClosure Document Extraction Worker",
-            "Capability-free document extraction worker",
-            IntPtr.Zero,
-            0,
-            out var sidPointer);
-
-        if (result == WorkerNativeMethods.ErrorAlreadyExists)
-        {
-            result = WorkerNativeMethods.DeriveAppContainerSidFromAppContainerName(
-                ProfileName,
-                out sidPointer);
-        }
-
-        if (result < 0 || sidPointer == IntPtr.Zero)
-        {
-            throw AppContainerLaunchException.FromHResult(
-                "AppContainer profile creation",
-                result);
-        }
-
-        var sid = new SafeSidHandle(sidPointer);
+        var lifecycleLock = AcquireLifecycleLock();
+        IntPtr sidPointer = IntPtr.Zero;
+        SafeSidHandle? sid = null;
+        var profileCreated = false;
         try
         {
-            var sidValue = new SecurityIdentifier(sidPointer).Value;
+            DeleteProfileOrThrow("Stale AppContainer profile cleanup");
+
+            var result = WorkerNativeMethods.CreateAppContainerProfile(
+                ProfileName,
+                "ProofToClosure Document Extraction Worker",
+                "Capability-free document extraction worker",
+                IntPtr.Zero,
+                0,
+                out sidPointer);
+
+            if (result < 0 || sidPointer == IntPtr.Zero)
+            {
+                throw AppContainerLaunchException.FromHResult(
+                    result == WorkerNativeMethods.ErrorAlreadyExists
+                        ? "Exclusive AppContainer profile creation"
+                        : "AppContainer profile creation",
+                    result);
+            }
+
+            profileCreated = true;
+            sid = new SafeSidHandle(sidPointer);
+            sidPointer = IntPtr.Zero;
+            var sidValue = new SecurityIdentifier(
+                sid.DangerousGetHandle()).Value;
             var folderResult = WorkerNativeMethods.GetAppContainerFolderPath(
                 sidValue,
                 out var folderPointer);
@@ -76,17 +87,101 @@ public sealed class AppContainerProfile : IDisposable
                 Marshal.FreeCoTaskMem(folderPointer);
             }
 
-            return new AppContainerProfile(sid, sidValue, folderPath);
+            var profile = new AppContainerProfile(
+                sid,
+                sidValue,
+                folderPath,
+                lifecycleLock);
+            sid = null;
+            return profile;
         }
         catch
         {
-            sid.Dispose();
+            sid?.Dispose();
+            if (sidPointer != IntPtr.Zero)
+            {
+                using var pendingSid = new SafeSidHandle(sidPointer);
+            }
+
+            try
+            {
+                if (profileCreated)
+                {
+                    DeleteProfileOrThrow(
+                        "Failed AppContainer profile cleanup");
+                }
+            }
+            finally
+            {
+                lifecycleLock.Dispose();
+            }
+
             throw;
         }
     }
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
         Interlocked.Exchange(ref _sid, null)?.Dispose();
+        var lifecycleLock = Interlocked.Exchange(
+            ref _lifecycleLock,
+            null);
+        try
+        {
+            DeleteProfileOrThrow("AppContainer profile cleanup");
+        }
+        finally
+        {
+            lifecycleLock?.Dispose();
+        }
+    }
+
+    private static FileStream AcquireLifecycleLock()
+    {
+        try
+        {
+            var lockDirectory = Path.Combine(
+                Environment.GetFolderPath(
+                    Environment.SpecialFolder.LocalApplicationData),
+                "ProofToClosure",
+                "Locks");
+            Directory.CreateDirectory(lockDirectory);
+            return new FileStream(
+                Path.Combine(
+                    lockDirectory,
+                    "document-extraction-worker-profile.lock"),
+                FileMode.OpenOrCreate,
+                FileAccess.ReadWrite,
+                FileShare.None);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException)
+        {
+            throw new AppContainerLaunchException(
+                "The AppContainer profile is already in use.");
+        }
+    }
+
+    private static void DeleteProfileOrThrow(string operation)
+    {
+        var result = WorkerNativeMethods.DeleteAppContainerProfile(
+            ProfileName);
+        if (result < 0)
+        {
+            result = WorkerNativeMethods.DeleteAppContainerProfile(
+                ProfileName);
+        }
+
+        if (result < 0)
+        {
+            throw AppContainerLaunchException.FromHResult(
+                operation,
+                result);
+        }
     }
 }

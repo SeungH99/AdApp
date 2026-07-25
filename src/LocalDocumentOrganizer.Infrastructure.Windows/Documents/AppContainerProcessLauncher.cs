@@ -67,6 +67,7 @@ public sealed class AppContainerProcessLauncher
         var attributeListInitialized = false;
         IntPtr capabilitiesPointer = IntPtr.Zero;
         IntPtr handlesPointer = IntPtr.Zero;
+        IntPtr environmentPointer = IntPtr.Zero;
         try
         {
             CreateProtocolPipes(
@@ -155,6 +156,7 @@ public sealed class AppContainerProcessLauncher
             };
             var commandLine = new StringBuilder(
                 BuildCommandLine(executablePath, arguments));
+            environmentPointer = CreateMinimalEnvironmentBlock();
             job = new DocumentWorkerJob();
             if (!WorkerNativeMethods.CreateProcessW(
                     executablePath,
@@ -163,9 +165,10 @@ public sealed class AppContainerProcessLauncher
                     IntPtr.Zero,
                     inheritHandles: true,
                     WorkerNativeMethods.CreateSuspended
+                        | WorkerNativeMethods.CreateUnicodeEnvironment
                         | WorkerNativeMethods.ExtendedStartupInfoPresent,
-                    IntPtr.Zero,
-                    Path.GetDirectoryName(executablePath)!,
+                    environmentPointer,
+                    _profile.FolderPath,
                     ref startupInfo,
                     out var processInformation))
             {
@@ -269,6 +272,11 @@ public sealed class AppContainerProcessLauncher
             if (handlesPointer != IntPtr.Zero)
             {
                 Marshal.FreeHGlobal(handlesPointer);
+            }
+
+            if (environmentPointer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(environmentPointer);
             }
 
             if (profileSidAddedRef)
@@ -397,6 +405,43 @@ public sealed class AppContainerProcessLauncher
         }
 
         return builder.ToString();
+    }
+
+    private IntPtr CreateMinimalEnvironmentBlock()
+    {
+        var windowsDirectory = Environment.GetFolderPath(
+            Environment.SpecialFolder.Windows);
+        if (!Path.IsPathFullyQualified(windowsDirectory))
+        {
+            throw new AppContainerLaunchException(
+                "The Windows runtime directory is unavailable.");
+        }
+
+        var temporaryDirectory = Path.Combine(
+            _profile.FolderPath,
+            "Temp");
+        Directory.CreateDirectory(temporaryDirectory);
+        var entries = new[]
+        {
+            $"APPDATA={_profile.FolderPath}",
+            $"COMPlus_EnableDiagnostics=0",
+            $"DOTNET_CLI_TELEMETRY_OPTOUT=1",
+            $"DOTNET_EnableDiagnostics=0",
+            $"DOTNET_NOLOGO=1",
+            $"LOCALAPPDATA={_profile.FolderPath}",
+            $"SystemRoot={windowsDirectory}",
+            $"TEMP={temporaryDirectory}",
+            $"TMP={temporaryDirectory}",
+            $"USERPROFILE={_profile.FolderPath}",
+            $"windir={windowsDirectory}",
+        };
+        Array.Sort(entries, StringComparer.OrdinalIgnoreCase);
+        var block = string.Join('\0', entries) + "\0\0";
+        var characters = block.ToCharArray();
+        var pointer = Marshal.AllocHGlobal(
+            checked(characters.Length * sizeof(char)));
+        Marshal.Copy(characters, 0, pointer, characters.Length);
+        return pointer;
     }
 
     private static string QuoteArgument(string argument)

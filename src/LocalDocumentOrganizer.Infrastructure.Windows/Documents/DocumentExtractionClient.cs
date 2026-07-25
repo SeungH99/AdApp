@@ -45,18 +45,28 @@ public sealed class DocumentExtractionClient
 {
     private const int DiagnosticDrainLimit = 4096;
     private readonly string _workerExecutablePath;
+    private readonly IReadOnlyList<string> _workerArguments;
     private readonly ApprovedRootPathGuard? _approvedRoot;
 
     public DocumentExtractionClient(string workerExecutablePath)
-        : this(workerExecutablePath, approvedRoot: null)
+        : this(workerExecutablePath, approvedRoot: null, workerArguments: [])
     {
     }
 
     public DocumentExtractionClient(
         string workerExecutablePath,
         ApprovedRootPathGuard? approvedRoot)
+        : this(workerExecutablePath, approvedRoot, workerArguments: [])
+    {
+    }
+
+    public DocumentExtractionClient(
+        string workerExecutablePath,
+        ApprovedRootPathGuard? approvedRoot,
+        IReadOnlyList<string> workerArguments)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workerExecutablePath);
+        ArgumentNullException.ThrowIfNull(workerArguments);
         if (!Path.IsPathFullyQualified(workerExecutablePath))
         {
             throw new ArgumentException(
@@ -65,6 +75,7 @@ public sealed class DocumentExtractionClient
         }
 
         _workerExecutablePath = workerExecutablePath;
+        _workerArguments = workerArguments.ToArray();
         _approvedRoot = approvedRoot;
     }
 
@@ -75,6 +86,12 @@ public sealed class DocumentExtractionClient
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(descriptor);
+        if (cancellationToken.IsCancellationRequested)
+        {
+            throw new DocumentExtractionException(
+                DocumentExtractionFailureCode.ExtractionCancelled);
+        }
+
         if (source.IsClosed || source.IsInvalid)
         {
             throw new DocumentExtractionException(
@@ -94,11 +111,10 @@ public sealed class DocumentExtractionClient
                     cancellationToken)
                 .ConfigureAwait(false);
         }
-        catch (StableSourceBoundaryException exception)
+        catch (StableSourceBoundaryException)
         {
             throw new DocumentExtractionException(
-                DocumentExtractionFailureCode.InvalidSourceHandle,
-                exception);
+                DocumentExtractionFailureCode.InvalidSourceHandle);
         }
         finally
         {
@@ -117,12 +133,37 @@ public sealed class DocumentExtractionClient
                 "An approved-root guard is required for path-based extraction.");
         }
 
-        await using var verified = _approvedRoot.OpenVerifiedSource(sourcePath);
-        return await ExtractVerifiedAsync(
-                verified,
-                descriptor,
-                cancellationToken)
-            .ConfigureAwait(false);
+        if (cancellationToken.IsCancellationRequested)
+        {
+            throw new DocumentExtractionException(
+                DocumentExtractionFailureCode.ExtractionCancelled);
+        }
+
+        VerifiedStableSource verified;
+        try
+        {
+            verified = _approvedRoot.OpenVerifiedSource(sourcePath);
+        }
+        catch (Exception exception) when (
+            exception is FileSystemBoundaryException
+                or StableSourceBoundaryException
+                or ArgumentException
+                or NotSupportedException
+                or PathTooLongException
+                or UnauthorizedAccessException)
+        {
+            throw new DocumentExtractionException(
+                DocumentExtractionFailureCode.InvalidSourceHandle);
+        }
+
+        await using (verified)
+        {
+            return await ExtractVerifiedAsync(
+                    verified,
+                    descriptor,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
     }
 
     private async Task<DocumentExtractionResponse> ExtractVerifiedAsync(
@@ -130,26 +171,27 @@ public sealed class DocumentExtractionClient
         DocumentSourceDescriptor descriptor,
         CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (!File.Exists(_workerExecutablePath))
-        {
-            throw new DocumentExtractionException(
-                DocumentExtractionFailureCode.WorkerTerminated);
-        }
-
-        source.RequireSingleLink();
-        var initialHash = await ComputeSha256Async(
-                source.Handle,
-                source.Length,
-                cancellationToken)
-            .ConfigureAwait(false);
+        byte[]? initialHash = null;
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!File.Exists(_workerExecutablePath))
+            {
+                throw new DocumentExtractionException(
+                    DocumentExtractionFailureCode.WorkerTerminated);
+            }
+
+            source.RequireSingleLink();
+            initialHash = await ComputeSha256Async(
+                    source.Handle,
+                    source.Length,
+                    cancellationToken)
+                .ConfigureAwait(false);
             using var profile = AppContainerProfile.OpenOrCreate();
             var launcher = new AppContainerProcessLauncher(profile);
             await using var worker = launcher.Start(
                 _workerExecutablePath,
-                [],
+                _workerArguments,
                 source.Handle);
             var request = new DocumentExtractionRequest(
                 DocumentExtractionProtocol.CurrentVersion,
@@ -272,6 +314,18 @@ public sealed class DocumentExtractionClient
                 throw CreateTerminationFailure(worker, exception);
             }
         }
+        catch (OperationCanceledException exception)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            throw new DocumentExtractionException(
+                DocumentExtractionFailureCode.ExtractionCancelled,
+                exception);
+        }
+        catch (StableSourceBoundaryException)
+        {
+            throw new DocumentExtractionException(
+                DocumentExtractionFailureCode.InvalidSourceHandle);
+        }
         catch (AppContainerLaunchException exception)
         {
             throw new DocumentExtractionException(
@@ -280,7 +334,10 @@ public sealed class DocumentExtractionClient
         }
         finally
         {
-            CryptographicOperations.ZeroMemory(initialHash);
+            if (initialHash is not null)
+            {
+                CryptographicOperations.ZeroMemory(initialHash);
+            }
         }
     }
 
