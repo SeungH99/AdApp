@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using LocalDocumentOrganizer.Core.Documents;
@@ -16,6 +17,7 @@ public static class CorpusEvalExitCodes
     public const int GateFailure = 4;
     public const int EvaluationFailure = 5;
     public const int WorkerRequired = 6;
+    public const int WorkerAttestationFailed = 7;
 }
 
 public static class Program
@@ -45,6 +47,7 @@ public static class Program
             CorpusManifestValidator.Validate(manifest);
             if (manifest.CorpusKind == CorpusKind.OwnerApproved
                 && (options.WorkerPath is null
+                    || options.WorkerSha256 is null
                     || !Path.IsPathFullyQualified(options.WorkerPath)
                     || !File.Exists(options.WorkerPath)))
             {
@@ -53,43 +56,50 @@ public static class Program
             }
 
             if (manifest.CorpusKind == CorpusKind.Synthetic
-                && options.WorkerPath is not null)
+                && (options.WorkerPath is not null
+                    || options.WorkerSha256 is not null))
             {
                 Console.Error.WriteLine("corpus-eval:invalid-arguments");
                 return CorpusEvalExitCodes.InvalidArguments;
             }
 
-            Directory.CreateDirectory(outputDirectory);
-            await WriteSchemaAsync(
-                    Path.Combine(
-                        outputDirectory,
-                        "corpus-manifest.schema.json"))
-                .ConfigureAwait(false);
             ICorpusObservationRunner runner =
                 manifest.CorpusKind == CorpusKind.Synthetic
                     ? new SyntheticCorpusObservationRunner()
-                    : new PublishedWorkerCorpusObservationRunner(
+                    : await PublishedWorkerCorpusObservationRunner.CreateAsync(
+                            corpusRoot,
+                            options.WorkerPath!,
+                            options.WorkerSha256!,
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+            await using (runner.ConfigureAwait(false))
+            {
+                Directory.CreateDirectory(outputDirectory);
+                await WriteSchemaAsync(
+                        Path.Combine(
+                            outputDirectory,
+                            "corpus-manifest.schema.json"))
+                    .ConfigureAwait(false);
+                var result = await CorpusEvaluationRunner.RunAsync(
+                        manifest,
+                        manifestBytes,
                         corpusRoot,
-                        options.WorkerPath!);
-            var result = await CorpusEvaluationRunner.RunAsync(
-                    manifest,
-                    manifestBytes,
-                    corpusRoot,
-                    outputDirectory,
-                    runner,
-                    maximumDocuments: null,
-                    CancellationToken.None)
-                .ConfigureAwait(false);
-            if (!result.Completed)
-            {
-                Console.Error.WriteLine("corpus-eval:evaluation-failure");
-                return CorpusEvalExitCodes.EvaluationFailure;
-            }
+                        outputDirectory,
+                        runner,
+                        maximumDocuments: null,
+                        CancellationToken.None)
+                    .ConfigureAwait(false);
+                if (!result.Completed)
+                {
+                    Console.Error.WriteLine("corpus-eval:evaluation-failure");
+                    return CorpusEvalExitCodes.EvaluationFailure;
+                }
 
-            if (result.GatePassed != true)
-            {
-                Console.Error.WriteLine("corpus-eval:gate-failure");
-                return CorpusEvalExitCodes.GateFailure;
+                if (result.GatePassed != true)
+                {
+                    Console.Error.WriteLine("corpus-eval:gate-failure");
+                    return CorpusEvalExitCodes.GateFailure;
+                }
             }
 
             return CorpusEvalExitCodes.Success;
@@ -103,6 +113,12 @@ public static class Program
         {
             Console.Error.WriteLine("corpus-eval:corrupt-resume-state");
             return CorpusEvalExitCodes.CorruptResumeState;
+        }
+        catch (CorpusWorkerAttestationException)
+        {
+            Console.Error.WriteLine(
+                "corpus-eval:worker-attestation-failed");
+            return CorpusEvalExitCodes.WorkerAttestationFailed;
         }
         catch (Exception exception) when (
             exception is IOException
@@ -123,6 +139,7 @@ public static class Program
         string? manifest = null;
         string? output = null;
         string? worker = null;
+        string? workerSha256 = null;
         for (var index = 0; index < args.Count; index++)
         {
             if (args[index] == "--manifest"
@@ -143,6 +160,12 @@ public static class Program
             {
                 worker = args[++index];
             }
+            else if (args[index] == "--worker-sha256"
+                     && index + 1 < args.Count
+                     && workerSha256 is null)
+            {
+                workerSha256 = args[++index];
+            }
             else
             {
                 throw new ArgumentException(
@@ -159,7 +182,11 @@ public static class Program
                 nameof(args));
         }
 
-        return new CorpusEvalOptions(manifest, output, worker);
+        return new CorpusEvalOptions(
+            manifest,
+            output,
+            worker,
+            workerSha256);
     }
 
     private static async Task WriteSchemaAsync(string path)
@@ -186,7 +213,16 @@ public static class Program
     private sealed record CorpusEvalOptions(
         string ManifestPath,
         string OutputDirectory,
-        string? WorkerPath);
+        string? WorkerPath,
+        string? WorkerSha256);
+}
+
+public sealed class CorpusWorkerAttestationException : Exception
+{
+    public CorpusWorkerAttestationException()
+        : base("corpus-worker-attestation-failed")
+    {
+    }
 }
 
 public static class SyntheticCorpusSource
@@ -337,18 +373,90 @@ public sealed class PublishedWorkerCorpusObservationRunner
     : ICorpusObservationRunner
 {
     private readonly DocumentExtractionClient _client;
+    private readonly VerifiedStableSource _pinnedWorker;
 
-    public PublishedWorkerCorpusObservationRunner(
+    private PublishedWorkerCorpusObservationRunner(
         string corpusRoot,
-        string workerExecutablePath)
+        string workerExecutablePath,
+        string workerSha256,
+        VerifiedStableSource pinnedWorker)
     {
         var approvedRoot = new ApprovedRootPathGuard(corpusRoot);
         _client = new DocumentExtractionClient(
             Path.GetFullPath(workerExecutablePath),
             approvedRoot);
+        WorkerSha256 = workerSha256;
+        _pinnedWorker = pinnedWorker;
     }
 
     public bool IsEmpirical => true;
+
+    public string WorkerSha256 { get; }
+
+    public static async Task<PublishedWorkerCorpusObservationRunner>
+        CreateAsync(
+            string corpusRoot,
+            string workerExecutablePath,
+            string expectedWorkerSha256,
+            CancellationToken cancellationToken)
+    {
+        if (!IsSha256(expectedWorkerSha256)
+            || !Path.IsPathFullyQualified(workerExecutablePath))
+        {
+            throw new CorpusWorkerAttestationException();
+        }
+
+        VerifiedStableSource? pinned = null;
+        try
+        {
+            var fullPath = Path.GetFullPath(workerExecutablePath);
+            var workerRoot = Path.GetDirectoryName(fullPath)
+                ?? throw new CorpusWorkerAttestationException();
+            pinned = new ApprovedRootPathGuard(workerRoot)
+                .OpenVerifiedSource(fullPath);
+            var digest = await pinned.ComputeSha256Async(cancellationToken)
+                .ConfigureAwait(false);
+            var actual = Convert.ToHexString(digest).ToLowerInvariant();
+            CryptographicOperations.ZeroMemory(digest);
+            if (!CorpusHashing.FixedTimeEquals(
+                    expectedWorkerSha256.ToLowerInvariant(),
+                    actual))
+            {
+                throw new CorpusWorkerAttestationException();
+            }
+
+            var runner = new PublishedWorkerCorpusObservationRunner(
+                corpusRoot,
+                fullPath,
+                actual,
+                pinned);
+            pinned = null;
+            return runner;
+        }
+        catch (CorpusWorkerAttestationException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (
+            exception is IOException
+                or UnauthorizedAccessException
+                or ArgumentException
+                or StableSourceBoundaryException
+                or FileSystemBoundaryException)
+        {
+            throw new CorpusWorkerAttestationException();
+        }
+        finally
+        {
+            if (pinned is not null)
+            {
+                await pinned.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    public ValueTask DisposeAsync() =>
+        _pinnedWorker.DisposeAsync();
 
     public async ValueTask<CorpusObservation> ObserveAsync(
         CorpusObservationRequest request,
@@ -392,4 +500,7 @@ public sealed class PublishedWorkerCorpusObservationRunner
                 _ => throw new InvalidOperationException(
                     "The raster codec is invalid."),
             };
+
+    private static bool IsSha256(string value) =>
+        value.Length == 64 && value.All(Uri.IsHexDigit);
 }

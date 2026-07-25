@@ -12,12 +12,18 @@ public sealed record CorpusObservation(
     DocumentExtractionResponse Response);
 
 public interface ICorpusObservationRunner
+    : IAsyncDisposable
 {
     bool IsEmpirical { get; }
+
+    string WorkerSha256 =>
+        CorpusRuntimeTrust.SyntheticWorkerSha256;
 
     ValueTask<CorpusObservation> ObserveAsync(
         CorpusObservationRequest request,
         CancellationToken cancellationToken);
+
+    ValueTask IAsyncDisposable.DisposeAsync() => ValueTask.CompletedTask;
 }
 
 public static class CorpusEvaluator
@@ -98,7 +104,7 @@ public static class CorpusEvaluator
         CorpusManifest manifest,
         IReadOnlyDictionary<string, CorpusDocumentScore> scores,
         string runIdentityId,
-        bool perturbationsPassed,
+        IReadOnlyList<CorpusPerturbationResult> perturbations,
         bool empirical)
     {
         var cells = manifest.Cells
@@ -131,13 +137,16 @@ public static class CorpusEvaluator
             cells.Sum(static cell => cell.CriticalValueErrors),
             cells.Sum(static cell => cell.CriticalEvidenceErrors),
             cells.Sum(static cell => cell.CriticalCoordinateErrors),
-            perturbationsPassed,
-            perturbationsPassed && cells.All(static cell => cell.Passed));
+            perturbations.All(static result => result.Passed),
+            perturbations.All(static result => result.Passed)
+                && cells.All(static cell => cell.Passed));
         return new CorpusReport(
             "1",
             runIdentityId,
+            manifest.CorpusKind,
             empirical,
             empirical && aggregate.Passed,
+            perturbations,
             cells,
             aggregate);
     }
@@ -199,6 +208,52 @@ public static class CorpusEvaluator
         && baseline.CriticalEvidenceErrors == variant.CriticalEvidenceErrors
         && baseline.CriticalCoordinateErrors
             == variant.CriticalCoordinateErrors;
+
+    internal static bool EvaluatePerturbation(
+        CorpusHeldOutDocument baseline,
+        CorpusObservation baselineObservation,
+        CorpusHeldOutDocument variant,
+        CorpusObservation variantObservation,
+        CorpusPerturbationKind kind)
+    {
+        var baselineScore = EvaluateObservation(
+            baseline,
+            baselineObservation);
+        var variantScore = EvaluateObservation(
+            variant,
+            variantObservation);
+        if (!baselineScore.RequiredFieldsExact
+            || !variantScore.RequiredFieldsExact)
+        {
+            return false;
+        }
+
+        var baselineFields = baseline.ExpectedFields
+            .OrderBy(static field => field.FieldId, StringComparer.Ordinal)
+            .ToArray();
+        var variantFields = variant.ExpectedFields
+            .OrderBy(static field => field.FieldId, StringComparer.Ordinal)
+            .ToArray();
+        if (baselineFields.Length != variantFields.Length)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < baselineFields.Length; index++)
+        {
+            if (baselineFields[index].FieldId != variantFields[index].FieldId
+                || Normalize(baselineFields[index].NormalizedValue)
+                    != Normalize(variantFields[index].NormalizedValue)
+                || kind is not CorpusPerturbationKind.Orientation
+                    && baselineFields[index].Evidence
+                        != variantFields[index].Evidence)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     private static string Normalize(string value)
     {

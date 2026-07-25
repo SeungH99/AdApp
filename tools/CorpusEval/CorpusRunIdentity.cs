@@ -18,13 +18,34 @@ public sealed record CorpusActualRuntimeIdentity(
     string DecoderVersion,
     string OcrVersion);
 
+public sealed record CorpusRuntimeIdentity(
+    CorpusInputKind InputKind,
+    CorpusActualRuntimeIdentity Runtime);
+
+public static class CorpusRuntimeTrust
+{
+    public const string SyntheticWorkerSha256 =
+        "bf1e63c703fd6dfea2590b0dab5607f109b4a7a26aa5750b2a78079fdd9dcf83";
+
+    public static string ExpectedProductionAdapterId(
+        CorpusInputKind inputKind) =>
+        inputKind switch
+        {
+            CorpusInputKind.ImagePdf => "windows-native-pdf-ocr",
+            CorpusInputKind.StandaloneRaster => "windows-raster-ocr",
+            _ => throw new InvalidOperationException(
+                "The input-kind runtime is invalid."),
+        };
+}
+
 public sealed record CorpusRunIdentity(
     string Id,
     string AppVersion,
     string CatalogEpoch,
-    CorpusActualRuntimeIdentity Runtime,
+    IReadOnlyList<CorpusRuntimeIdentity> Runtimes,
     IReadOnlyList<CorpusOcrLanguageVersion> OcrLanguageVersions,
     string ManifestSha256,
+    string WorkerSha256,
     string OsBuild,
     string MachineClass,
     bool Empirical)
@@ -32,11 +53,34 @@ public sealed record CorpusRunIdentity(
     public static CorpusRunIdentity Create(
         CorpusManifest manifest,
         ReadOnlySpan<byte> manifestBytes,
-        CorpusActualRuntimeIdentity runtime,
+        IReadOnlyList<CorpusRuntimeIdentity> runtimes,
+        string workerSha256,
         bool empirical)
     {
         ArgumentNullException.ThrowIfNull(manifest);
-        ArgumentNullException.ThrowIfNull(runtime);
+        ArgumentNullException.ThrowIfNull(runtimes);
+        if (!IsSha256(workerSha256))
+        {
+            throw new ArgumentException(
+                "The worker attestation is invalid.",
+                nameof(workerSha256));
+        }
+        var sortedRuntimes = runtimes
+            .OrderBy(static entry => entry.InputKind)
+            .ToArray();
+        if (sortedRuntimes.Length != 2
+            || sortedRuntimes.Select(static entry => entry.InputKind)
+                .Distinct()
+                .Count() != 2)
+        {
+            throw new ArgumentException(
+                "Exactly one runtime per input kind is required.",
+                nameof(runtimes));
+        }
+
+        var ocrVersion = string.Join(
+            "+",
+            sortedRuntimes.Select(static entry => entry.Runtime.OcrVersion));
         var languages = manifest.Cells
             .Select(static cell => cell.MarketId)
             .Distinct(StringComparer.Ordinal)
@@ -45,7 +89,7 @@ public sealed record CorpusRunIdentity(
                 language =>
                     new CorpusOcrLanguageVersion(
                         language,
-                        runtime.OcrVersion))
+                        ocrVersion))
             .ToArray();
         var assembly = typeof(CorpusRunIdentity).Assembly;
         var appVersion = assembly
@@ -56,9 +100,10 @@ public sealed record CorpusRunIdentity(
         var payload = new CorpusRunIdentityPayload(
             appVersion,
             manifest.CatalogEpoch,
-            runtime,
+            sortedRuntimes,
             languages,
             CorpusHashing.Sha256(manifestBytes),
+            workerSha256,
             Environment.OSVersion.Version.ToString(),
             $"{RuntimeInformation.OSArchitecture}-cpu"
                 + Environment.ProcessorCount,
@@ -69,13 +114,35 @@ public sealed record CorpusRunIdentity(
             id,
             payload.AppVersion,
             payload.CatalogEpoch,
-            payload.Runtime,
+            payload.Runtimes,
             payload.OcrLanguageVersions,
             payload.ManifestSha256,
+            payload.WorkerSha256,
             payload.OsBuild,
             payload.MachineClass,
             payload.Empirical);
     }
+
+    internal static string RecomputeId(CorpusRunIdentity identity)
+    {
+        var payload = new CorpusRunIdentityPayload(
+            identity.AppVersion,
+            identity.CatalogEpoch,
+            identity.Runtimes,
+            identity.OcrLanguageVersions,
+            identity.ManifestSha256,
+            identity.WorkerSha256,
+            identity.OsBuild,
+            identity.MachineClass,
+            identity.Empirical);
+        return CorpusHashing.Sha256(
+            JsonSerializer.SerializeToUtf8Bytes(
+                payload,
+                CorpusJson.Options));
+    }
+
+    private static bool IsSha256(string value) =>
+        value.Length == 64 && value.All(Uri.IsHexDigit);
 }
 
 public static class CorpusHashing
@@ -157,9 +224,12 @@ public static class CorpusEvaluationRunner
         var workItems = EnumerateWorkItems(manifest);
         var observations = new Dictionary<string, CorpusObservation>(
             StringComparer.Ordinal);
-        ExtractionRuntimeMetadata? actualMetadata = null;
-        foreach (var item in workItems)
+        var runtimes = new List<CorpusRuntimeIdentity>(2);
+        foreach (var inputKind in Enum.GetValues<CorpusInputKind>()
+                     .OrderBy(static kind => kind))
         {
+            var item = workItems.First(
+                candidate => candidate.Document.InputKind == inputKind);
             cancellationToken.ThrowIfCancellationRequested();
             var observation = await observationRunner.ObserveAsync(
                     new CorpusObservationRequest(corpusRoot, item.Document),
@@ -168,25 +238,35 @@ public static class CorpusEvaluationRunner
             ValidateObservation(item, observation);
             observations.Add(item.WorkItemId, observation);
             if (observation.Response.Outcome
-                == DocumentExtractionOutcome.Success)
+                != DocumentExtractionOutcome.Success)
             {
-                actualMetadata = observation.Response.RuntimeMetadata;
-                break;
+                throw new InvalidOperationException(
+                    "Runtime preflight requires a successful observation.");
+            }
+
+            runtimes.Add(
+                new CorpusRuntimeIdentity(
+                    inputKind,
+                    ToRuntime(observation.Response.RuntimeMetadata)));
+            if (manifest.CorpusKind == CorpusKind.OwnerApproved
+                && runtimes[^1].Runtime.AdapterId
+                    != CorpusRuntimeTrust.ExpectedProductionAdapterId(
+                        inputKind))
+            {
+                throw new InvalidOperationException(
+                    "The production adapter identity is invalid.");
             }
         }
 
-        if (actualMetadata is null)
-        {
-            throw new InvalidOperationException(
-                "No successful adapter observation established runtime identity.");
-        }
-
-        var runtime = ToRuntime(actualMetadata);
         var identity = CorpusRunIdentity.Create(
             manifest,
             manifestBytes.Span,
-            runtime,
+            runtimes,
+            observationRunner.WorkerSha256,
             observationRunner.IsEmpirical);
+        var runtimeByInputKind = identity.Runtimes.ToDictionary(
+            static entry => entry.InputKind,
+            static entry => entry.Runtime);
         var root = Path.GetFullPath(outputDirectory);
         var runDirectory = Path.Combine(root, identity.Id);
         var scoreDirectory = Path.Combine(runDirectory, "scores");
@@ -232,7 +312,8 @@ public static class CorpusEvaluationRunner
 
             if (observation.Response.Outcome
                     == DocumentExtractionOutcome.Success
-                && ToRuntime(observation.Response.RuntimeMetadata) != runtime)
+                && ToRuntime(observation.Response.RuntimeMetadata)
+                    != runtimeByInputKind[item.Document.InputKind])
             {
                 throw new InvalidOperationException(
                     "The adapter runtime changed during the run.");
@@ -278,31 +359,126 @@ public static class CorpusEvaluationRunner
             static pair => pair.Key,
             static pair => pair.Value.Score.Score,
             StringComparer.Ordinal);
-        var scoresByDocument = workItems.ToDictionary(
+        var workItemsByDocument = workItems.ToDictionary(
             static item => item.Document.StableDocumentId,
-            item => scoreMap[item.WorkItemId],
             StringComparer.Ordinal);
-        var perturbationsPassed = manifest.CodecPerturbations.All(
-            perturbation =>
-                CorpusEvaluator.EquivalentForPerturbation(
-                    scoresByDocument[perturbation.BaselineDocumentId],
-                    scoresByDocument[perturbation.VariantDocumentId]));
+        var perturbationResults =
+            new List<CorpusPerturbationResult>(
+                manifest.CodecPerturbations.Count);
+        foreach (var perturbation in manifest.CodecPerturbations
+                     .OrderBy(static item => item.CodecId, StringComparer.Ordinal)
+                     .ThenBy(static item => item.Kind))
+        {
+            var baseline = workItemsByDocument[
+                perturbation.BaselineDocumentId];
+            var variant = workItemsByDocument[
+                perturbation.VariantDocumentId];
+            var baselineObservation =
+                await observationRunner.ObserveAsync(
+                        new CorpusObservationRequest(
+                            corpusRoot,
+                            baseline.Document),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            var variantObservation =
+                await observationRunner.ObserveAsync(
+                        new CorpusObservationRequest(
+                            corpusRoot,
+                            variant.Document),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            ValidateObservation(baseline, baselineObservation);
+            ValidateObservation(variant, variantObservation);
+            var expectedRuntime =
+                runtimeByInputKind[CorpusInputKind.StandaloneRaster];
+            if (baselineObservation.Response.Outcome
+                    == DocumentExtractionOutcome.Success
+                && ToRuntime(
+                    baselineObservation.Response.RuntimeMetadata)
+                    != expectedRuntime
+                || variantObservation.Response.Outcome
+                    == DocumentExtractionOutcome.Success
+                && ToRuntime(
+                    variantObservation.Response.RuntimeMetadata)
+                    != expectedRuntime)
+            {
+                throw new InvalidOperationException(
+                    "The adapter runtime changed during pair evaluation.");
+            }
+
+            perturbationResults.Add(
+                new CorpusPerturbationResult(
+                    perturbation.CodecId,
+                    perturbation.Kind,
+                    perturbation.BaselineDocumentId,
+                    perturbation.VariantDocumentId,
+                    CorpusEvaluator.EvaluatePerturbation(
+                        baseline.Document,
+                        baselineObservation,
+                        variant.Document,
+                        variantObservation,
+                        perturbation.Kind)));
+        }
+
         var report = CorpusEvaluator.CreateReport(
             manifest,
             scoreMap,
             identity.Id,
-            perturbationsPassed,
+            perturbationResults,
             observationRunner.IsEmpirical);
         var reportHash = CorpusReportJson.ComputeSha256(report);
         AtomicJson.Write(
             Path.Combine(runDirectory, "report.json"),
-            new CorpusReportFile(report, reportHash));
+            new CorpusReportFile(
+                manifest.CorpusKind,
+                report.Empirical,
+                report.EmpiricalGatePassed,
+                identity.Id,
+                reportHash,
+                report));
         AtomicJson.Write(
             Path.Combine(runDirectory, "cells.json"),
-            report.Cells);
+            new CorpusArtifact<IReadOnlyList<CorpusCellReport>>(
+                manifest.CorpusKind,
+                report.Empirical,
+                report.EmpiricalGatePassed,
+                identity.Id,
+                reportHash,
+                report.Cells));
         AtomicJson.Write(
             Path.Combine(runDirectory, "aggregate.json"),
-            report.Aggregate);
+            new CorpusArtifact<CorpusAggregateReport>(
+                manifest.CorpusKind,
+                report.Empirical,
+                report.EmpiricalGatePassed,
+                identity.Id,
+                reportHash,
+                report.Aggregate));
+        AtomicJson.Write(
+            Path.Combine(runDirectory, "perturbations.json"),
+            new CorpusArtifact<IReadOnlyList<CorpusPerturbationResult>>(
+                manifest.CorpusKind,
+                report.Empirical,
+                report.EmpiricalGatePassed,
+                identity.Id,
+                reportHash,
+                report.Perturbations));
+        var perCellDirectory = Path.Combine(runDirectory, "cells");
+        Directory.CreateDirectory(perCellDirectory);
+        foreach (var cell in report.Cells)
+        {
+            AtomicJson.Write(
+                Path.Combine(
+                    perCellDirectory,
+                    $"{cell.MarketId}-{cell.ContractId}.json"),
+                new CorpusArtifact<CorpusCellReport>(
+                    manifest.CorpusKind,
+                    report.Empirical,
+                    report.EmpiricalGatePassed,
+                    identity.Id,
+                    reportHash,
+                    cell));
+        }
         return new CorpusRunResult(
             identity.Id,
             runDirectory,
@@ -336,12 +512,33 @@ public static class CorpusEvaluationRunner
     }
 
     private static CorpusActualRuntimeIdentity ToRuntime(
-        ExtractionRuntimeMetadata metadata) =>
-        new(
+        ExtractionRuntimeMetadata metadata)
+    {
+        var runtime = new CorpusActualRuntimeIdentity(
             metadata.AdapterId,
             metadata.AdapterVersion,
             metadata.DecoderVersion,
             metadata.OcrVersion ?? string.Empty);
+        if (!IsSafeRuntimeToken(runtime.AdapterId)
+            || !IsSafeRuntimeToken(runtime.AdapterVersion)
+            || !IsSafeRuntimeToken(runtime.DecoderVersion)
+            || !IsSafeRuntimeToken(runtime.OcrVersion))
+        {
+            throw new InvalidOperationException(
+                "The adapter runtime metadata is invalid.");
+        }
+
+        return runtime;
+    }
+
+    private static bool IsSafeRuntimeToken(string value) =>
+        !string.IsNullOrWhiteSpace(value)
+        && value.Length <= 128
+        && char.IsAsciiLetterOrDigit(value[0])
+        && value.All(
+            static character =>
+                char.IsAsciiLetterOrDigit(character)
+                || character is '.' or '_' or '-' or '+');
 
     private static List<CorpusWorkItem> EnumerateWorkItems(
         CorpusManifest manifest) =>
@@ -399,7 +596,9 @@ public static class CorpusEvaluationRunner
                     || scoreFile.Score.RunIdentityId != identity.Id
                     || scoreFile.Score.ManifestSha256
                         != identity.ManifestSha256
-                    || scoreFile.Score.Runtime != identity.Runtime
+                    || !RuntimeSetsEqual(
+                        scoreFile.Score.Runtimes,
+                        identity.Runtimes)
                     || scoreFile.Score.WorkItemId != expected.WorkItemId
                     || scoreFile.Score.MarketId != expected.MarketId
                     || scoreFile.Score.ContractId != expected.ContractId
@@ -458,10 +657,19 @@ public static class CorpusEvaluationRunner
             var bytes = JsonSerializer.SerializeToUtf8Bytes(
                 file.Identity,
                 CorpusJson.Options);
+            var expectedBytes = JsonSerializer.SerializeToUtf8Bytes(
+                expected,
+                CorpusJson.Options);
             if (!CorpusHashing.FixedTimeEquals(
                     CorpusHashing.Sha256(bytes),
                     file.IntegritySha256)
-                || file.Identity.Id != expected.Id)
+                || !CorpusHashing.FixedTimeEquals(
+                    CorpusRunIdentity.RecomputeId(file.Identity),
+                    file.Identity.Id)
+                || bytes.Length != expectedBytes.Length
+                || !CryptographicOperations.FixedTimeEquals(
+                    bytes,
+                    expectedBytes))
             {
                 IdentityMismatch();
             }
@@ -477,6 +685,21 @@ public static class CorpusEvaluationRunner
         {
             IdentityMismatch();
         }
+    }
+
+    private static bool RuntimeSetsEqual(
+        IReadOnlyList<CorpusRuntimeIdentity> left,
+        IReadOnlyList<CorpusRuntimeIdentity> right)
+    {
+        if (left.Count != right.Count)
+        {
+            return false;
+        }
+
+        return left
+            .OrderBy(static entry => entry.InputKind)
+            .SequenceEqual(
+                right.OrderBy(static entry => entry.InputKind));
     }
 
     private static void ValidateCheckpointIfPresent(
@@ -648,9 +871,10 @@ internal static class AtomicJson
 internal sealed record CorpusRunIdentityPayload(
     string AppVersion,
     string CatalogEpoch,
-    CorpusActualRuntimeIdentity Runtime,
+    IReadOnlyList<CorpusRuntimeIdentity> Runtimes,
     IReadOnlyList<CorpusOcrLanguageVersion> OcrLanguageVersions,
     string ManifestSha256,
+    string WorkerSha256,
     string OsBuild,
     string MachineClass,
     bool Empirical);
@@ -682,7 +906,7 @@ internal sealed record CorpusWorkItem(
 internal sealed record PersistedCorpusScore(
     string RunIdentityId,
     string ManifestSha256,
-    CorpusActualRuntimeIdentity Runtime,
+    IReadOnlyList<CorpusRuntimeIdentity> Runtimes,
     string WorkItemId,
     string MarketId,
     string ContractId,
@@ -698,7 +922,7 @@ internal sealed record PersistedCorpusScore(
         new(
             identity.Id,
             identity.ManifestSha256,
-            identity.Runtime,
+            identity.Runtimes,
             item.WorkItemId,
             item.MarketId,
             item.ContractId,
@@ -715,10 +939,10 @@ internal sealed record PersistedCorpusScore(
                 "\u001f",
                 identity.Id,
                 identity.ManifestSha256,
-                identity.Runtime.AdapterId,
-                identity.Runtime.AdapterVersion,
-                identity.Runtime.DecoderVersion,
-                identity.Runtime.OcrVersion,
+                CorpusHashing.Sha256(
+                    JsonSerializer.SerializeToUtf8Bytes(
+                        identity.Runtimes,
+                        CorpusJson.Options)),
                 item.WorkItemId,
                 item.MarketId,
                 item.ContractId,
@@ -745,5 +969,9 @@ internal sealed record CorpusCheckpointFile(
     string IntegritySha256);
 
 internal sealed record CorpusReportFile(
-    CorpusReport Report,
-    string ReportSha256);
+    CorpusKind CorpusKind,
+    bool Empirical,
+    bool EmpiricalGatePassed,
+    string RunIdentityId,
+    string ReportSha256,
+    CorpusReport Report);

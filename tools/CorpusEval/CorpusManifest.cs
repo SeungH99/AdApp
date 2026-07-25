@@ -68,6 +68,11 @@ public sealed record CorpusExpectedField(
     string NormalizedValue,
     CorpusEvidenceRectangle Evidence);
 
+public sealed record CorpusPerturbationLineage(
+    string BaselineStableDocumentId,
+    string BaselineContentSha256,
+    CorpusPerturbationKind TransformationKind);
+
 public sealed record CorpusCalibrationDocument(
     string StableDocumentId,
     string SourceFamilyId,
@@ -87,7 +92,8 @@ public sealed record CorpusHeldOutDocument(
     string? CodecId,
     IReadOnlyList<string> LabelingSourceIds,
     bool OwnerApproved,
-    IReadOnlyList<CorpusExpectedField> ExpectedFields);
+    IReadOnlyList<CorpusExpectedField> ExpectedFields,
+    CorpusPerturbationLineage? PerturbationLineage = null);
 
 public sealed record CorpusCell(
     string MarketId,
@@ -251,7 +257,7 @@ public static class CorpusManifestJson
             "heldOutDocument": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["stableDocumentId", "sourceFamilyId", "contentSha256", "sourceLocator", "languageId", "inputKind", "codecId", "labelingSourceIds", "ownerApproved", "expectedFields"],
+              "required": ["stableDocumentId", "sourceFamilyId", "contentSha256", "sourceLocator", "languageId", "inputKind", "codecId", "labelingSourceIds", "ownerApproved", "expectedFields", "perturbationLineage"],
               "properties": {
                 "stableDocumentId": { "$ref": "#/$defs/id" },
                 "sourceFamilyId": { "$ref": "#/$defs/id" },
@@ -262,7 +268,23 @@ public static class CorpusManifestJson
                 "codecId": { "type": ["string", "null"], "enum": ["jpeg", "png", "tiff", "bmp", null] },
                 "labelingSourceIds": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
                 "ownerApproved": { "const": true },
-                "expectedFields": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/expectedField" } }
+                "expectedFields": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/expectedField" } },
+                "perturbationLineage": {
+                  "oneOf": [
+                    { "type": "null" },
+                    { "$ref": "#/$defs/perturbationLineage" }
+                  ]
+                }
+              }
+            },
+            "perturbationLineage": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["baselineStableDocumentId", "baselineContentSha256", "transformationKind"],
+              "properties": {
+                "baselineStableDocumentId": { "$ref": "#/$defs/id" },
+                "baselineContentSha256": { "$ref": "#/$defs/sha256" },
+                "transformationKind": { "enum": ["recompression", "orientation", "metadata"] }
               }
             },
             "cell": {
@@ -465,10 +487,7 @@ public static class CorpusManifestValidator
                     hashes,
                     stableIds,
                     locators);
-                if (!heldOutFamilies.Add(document.SourceFamilyId))
-                {
-                    Fail(CorpusManifestFailureCode.SourceFamilyLeakage);
-                }
+                heldOutFamilies.Add(document.SourceFamilyId);
 
                 if (document.ExpectedFields.Count == 0
                     || document.ExpectedFields
@@ -552,31 +571,151 @@ public static class CorpusManifestValidator
         }
 
         var heldOut = manifest.Cells
-            .SelectMany(static cell => cell.HeldOutDocuments)
+            .SelectMany(
+                static cell => cell.HeldOutDocuments.Select(
+                    document => new
+                    {
+                        Cell = cell,
+                        Document = document,
+                    }))
             .ToDictionary(
-                static document => document.StableDocumentId,
+                static item => item.Document.StableDocumentId,
                 StringComparer.Ordinal);
         var used = new HashSet<string>(StringComparer.Ordinal);
+        var usedVariants = new HashSet<string>(StringComparer.Ordinal);
         foreach (var perturbation in manifest.CodecPerturbations)
         {
             if (perturbation.BaselineDocumentId
-                    == perturbation.VariantDocumentId
-                || !heldOut.TryGetValue(
+                == perturbation.VariantDocumentId)
+            {
+                Fail(CorpusManifestFailureCode.InvalidCodecPerturbation);
+            }
+
+            if (!heldOut.TryGetValue(
                     perturbation.BaselineDocumentId,
-                    out var baseline)
-                || !heldOut.TryGetValue(
+                    out var baselineItem))
+            {
+                Fail(CorpusManifestFailureCode.InvalidCodecPerturbation);
+            }
+
+            if (!heldOut.TryGetValue(
                     perturbation.VariantDocumentId,
-                    out var variant)
-                || baseline.InputKind != CorpusInputKind.StandaloneRaster
+                    out var variantItem))
+            {
+                Fail(CorpusManifestFailureCode.InvalidCodecPerturbation);
+            }
+
+            if (baselineItem.Cell.MarketId != variantItem.Cell.MarketId
+                || baselineItem.Cell.ContractId != variantItem.Cell.ContractId
+                || baselineItem.Document.SourceFamilyId
+                    != variantItem.Document.SourceFamilyId
+                || baselineItem.Document.ContentSha256
+                    == variantItem.Document.ContentSha256
+                || baselineItem.Document.PerturbationLineage is not null
+                || variantItem.Document.PerturbationLineage is not
+                    { } lineage
+                || lineage.BaselineStableDocumentId
+                    != baselineItem.Document.StableDocumentId
+                || !string.Equals(
+                    lineage.BaselineContentSha256,
+                    baselineItem.Document.ContentSha256,
+                    StringComparison.OrdinalIgnoreCase)
+                || lineage.TransformationKind != perturbation.Kind
+                || !ExpectedFieldsHaveApprovedRelation(
+                    baselineItem.Document,
+                    variantItem.Document,
+                    perturbation.Kind)
+                || !usedVariants.Add(
+                    variantItem.Document.StableDocumentId)
+                || !used.Add(baselineItem.Document.StableDocumentId)
+                || !used.Add(variantItem.Document.StableDocumentId))
+            {
+                Fail(CorpusManifestFailureCode.InvalidCodecPerturbation);
+            }
+
+            var baseline = baselineItem.Document;
+            var variant = variantItem.Document;
+            if (baseline.InputKind != CorpusInputKind.StandaloneRaster
                 || variant.InputKind != CorpusInputKind.StandaloneRaster
                 || baseline.CodecId != perturbation.CodecId
-                || variant.CodecId != perturbation.CodecId
-                || !used.Add(perturbation.BaselineDocumentId)
-                || !used.Add(perturbation.VariantDocumentId))
+                || variant.CodecId != perturbation.CodecId)
             {
                 Fail(CorpusManifestFailureCode.InvalidCodecPerturbation);
             }
         }
+
+        if (heldOut.Values.Any(
+                item =>
+                    item.Document.PerturbationLineage is not null
+                    && !usedVariants.Contains(
+                        item.Document.StableDocumentId)))
+        {
+            Fail(CorpusManifestFailureCode.InvalidCodecPerturbation);
+        }
+
+        foreach (var family in heldOut.Values.GroupBy(
+                     static item => item.Document.SourceFamilyId,
+                     StringComparer.Ordinal))
+        {
+            var documents = family
+                .Select(static item => item.Document)
+                .ToArray();
+            if (documents.Length == 1)
+            {
+                continue;
+            }
+
+            if (documents.Length != 2
+                || !manifest.CodecPerturbations.Any(
+                    pair =>
+                        documents.Any(
+                            document =>
+                                document.StableDocumentId
+                                == pair.BaselineDocumentId)
+                        && documents.Any(
+                            document =>
+                                document.StableDocumentId
+                                == pair.VariantDocumentId)))
+            {
+                Fail(CorpusManifestFailureCode.InvalidCodecPerturbation);
+            }
+        }
+    }
+
+    private static bool ExpectedFieldsHaveApprovedRelation(
+        CorpusHeldOutDocument baseline,
+        CorpusHeldOutDocument variant,
+        CorpusPerturbationKind kind)
+    {
+        var baselineFields = baseline.ExpectedFields
+            .OrderBy(static field => field.FieldId, StringComparer.Ordinal)
+            .ToArray();
+        var variantFields = variant.ExpectedFields
+            .OrderBy(static field => field.FieldId, StringComparer.Ordinal)
+            .ToArray();
+        if (baselineFields.Length != variantFields.Length)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < baselineFields.Length; index++)
+        {
+            if (baselineFields[index].FieldId != variantFields[index].FieldId
+                || baselineFields[index].NormalizedValue
+                    != variantFields[index].NormalizedValue)
+            {
+                return false;
+            }
+
+            if (kind is not CorpusPerturbationKind.Orientation
+                && baselineFields[index].Evidence
+                    != variantFields[index].Evidence)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool SetEquals(

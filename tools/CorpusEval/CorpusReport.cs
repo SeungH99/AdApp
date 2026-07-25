@@ -37,13 +37,30 @@ public sealed record CorpusAggregateReport(
     bool PerturbationsPassed,
     bool Passed);
 
+public sealed record CorpusPerturbationResult(
+    string CodecId,
+    CorpusPerturbationKind Kind,
+    string BaselineDocumentId,
+    string VariantDocumentId,
+    bool Passed);
+
 public sealed record CorpusReport(
     string SchemaVersion,
     string? RunIdentityId,
+    CorpusKind CorpusKind,
     bool Empirical,
     bool EmpiricalGatePassed,
+    IReadOnlyList<CorpusPerturbationResult> Perturbations,
     IReadOnlyList<CorpusCellReport> Cells,
     CorpusAggregateReport Aggregate);
+
+public sealed record CorpusArtifact<T>(
+    CorpusKind CorpusKind,
+    bool Empirical,
+    bool EmpiricalGatePassed,
+    string RunIdentityId,
+    string ReportSha256,
+    T Data);
 
 public static class CorpusReportJson
 {
