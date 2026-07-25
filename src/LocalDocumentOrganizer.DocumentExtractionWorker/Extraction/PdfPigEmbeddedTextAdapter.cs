@@ -1,6 +1,5 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
-using System.Text;
 using LocalDocumentOrganizer.Core.Documents;
 using LocalDocumentOrganizer.DocumentExtractionWorker.Source;
 using UglyToad.PdfPig;
@@ -13,8 +12,6 @@ public sealed class PdfPigEmbeddedTextAdapter : IDocumentExtractionAdapter
     internal const string AdapterIdentifier = "pdfpig-embedded-text";
     internal const string AdapterApiVersion = "1";
     internal const string DecoderApiVersion = "PdfPig/0.1.15";
-    private const int MaximumAccumulatedTextBytes =
-        DocumentExtractionLimits.MaxSerializedResponseBytes - (64 * 1024);
     private readonly WindowsNativePdfAdapter fallback;
 
     public PdfPigEmbeddedTextAdapter()
@@ -44,121 +41,50 @@ public sealed class PdfPigEmbeddedTextAdapter : IDocumentExtractionAdapter
             source.Content,
             source.DeclaredMimeType,
             source.ContainerKind);
+        if ((request.RequestedCapabilities & ExtractionCapability.EmbeddedText) == 0)
+        {
+            return await fallback.ExtractPagesAsync(
+                    source,
+                    request,
+                    pageIndexes: null,
+                    new ExtractionResponseBudget(),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         var stopwatch = Stopwatch.StartNew();
-        var fragments = ImmutableArray.CreateBuilder<TextFragment>();
-        var pages = ImmutableArray.CreateBuilder<DocumentSourcePage>();
-        var missingPages = new HashSet<int>();
-        var textBytes = 0;
+        var responseBudget = new ExtractionResponseBudget();
         try
         {
-            source.Content.Position = 0;
-            using (var document = PdfDocument.Open(
-                       source.Content,
-                       new ParsingOptions { UseLenientParsing = false }))
+            var ownedBytes = await WindowsExtractionSupport.ReadVerifiedBytesAsync(
+                    source.Content,
+                    source.VerifiedLength,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var parseTask = Task.Run(
+                () => ParseOwnedDocument(ownedBytes, responseBudget),
+                CancellationToken.None);
+            ParsedPdf parsed;
+            try
             {
-                DocumentMagicClassifier.ValidatePdfPageCount(
-                    checked((uint)document.NumberOfPages));
-                if (document.IsEncrypted)
-                {
-                    throw new EncryptedDocumentException(
-                        "Password-protected PDFs are not supported.");
-                }
-
-                for (var pageNumber = 1;
-                     pageNumber <= document.NumberOfPages;
-                     pageNumber++)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var page = document.GetPage(pageNumber);
-                    var sourceIndex = pageNumber - 1;
-                    pages.Add(
-                        new DocumentSourcePage(
-                            sourceIndex,
-                            page.Width,
-                            page.Height,
-                            EvidenceCoordinateSystem.PdfPagePoints));
-                    var pageFragmentStart = fragments.Count;
-                    foreach (var word in page.GetWords())
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        var text = word.Text?.Trim();
-                        if (string.IsNullOrWhiteSpace(text))
-                        {
-                            continue;
-                        }
-
-                        var bounds = word.BoundingBox;
-                        var left = new[]
-                        {
-                            bounds.BottomLeft.X,
-                            bounds.TopLeft.X,
-                            bounds.BottomRight.X,
-                            bounds.TopRight.X,
-                        }.Min();
-                        var bottom = new[]
-                        {
-                            bounds.BottomLeft.Y,
-                            bounds.TopLeft.Y,
-                            bounds.BottomRight.Y,
-                            bounds.TopRight.Y,
-                        }.Min();
-                        var right = new[]
-                        {
-                            bounds.BottomLeft.X,
-                            bounds.TopLeft.X,
-                            bounds.BottomRight.X,
-                            bounds.TopRight.X,
-                        }.Max();
-                        var top = new[]
-                        {
-                            bounds.BottomLeft.Y,
-                            bounds.TopLeft.Y,
-                            bounds.BottomRight.Y,
-                            bounds.TopRight.Y,
-                        }.Max();
-                        if (right <= left || top <= bottom)
-                        {
-                            continue;
-                        }
-
-                        textBytes = checked(
-                            textBytes + Encoding.UTF8.GetByteCount(text));
-                        if (textBytes > MaximumAccumulatedTextBytes)
-                        {
-                            throw new ResponseTooLargeAdapterException();
-                        }
-
-                        fragments.Add(
-                            new TextFragment(
-                                text,
-                                sourceIndex,
-                                EvidenceCoordinateSystem.PdfPagePoints,
-                                new EvidenceRectangle(
-                                    left,
-                                    bottom,
-                                    right - left,
-                                    top - bottom),
-                                new OrientationTransform(1, 0, 0, 1, 0, 0),
-                                ExtractionCapability.EmbeddedText,
-                                DecoderApiVersion,
-                                null));
-                    }
-
-                    if (fragments.Count == pageFragmentStart)
-                    {
-                        missingPages.Add(sourceIndex);
-                    }
-                }
+                parsed = await parseTask.WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                ObserveBackgroundFault(parseTask);
+                throw;
             }
 
-            if (missingPages.Count > 0
+            var fragments = parsed.Fragments.ToBuilder();
+            if (parsed.MissingPages.Count > 0
                 && (request.RequestedCapabilities & ExtractionCapability.Ocr) != 0)
             {
                 var fallbackResponse = await fallback.ExtractPagesAsync(
                         source,
                         request,
-                        missingPages,
+                        parsed.MissingPages,
+                        responseBudget,
                         cancellationToken)
                     .ConfigureAwait(false);
                 var compositeDecoder =
@@ -188,7 +114,7 @@ public sealed class PdfPigEmbeddedTextAdapter : IDocumentExtractionAdapter
                     request.JobId,
                     DocumentExtractionOutcome.Success,
                     fragments.ToImmutable(),
-                    pages.ToImmutable(),
+                    parsed.Pages,
                     new ExtractionRuntimeMetadata(
                         AdapterIdentifier,
                         AdapterApiVersion,
@@ -209,7 +135,7 @@ public sealed class PdfPigEmbeddedTextAdapter : IDocumentExtractionAdapter
                 request.JobId,
                 DocumentExtractionOutcome.Success,
                 fragments.ToImmutable(),
-                pages.ToImmutable(),
+                parsed.Pages,
                 new ExtractionRuntimeMetadata(
                     AdapterIdentifier,
                     AdapterApiVersion,
@@ -243,4 +169,122 @@ public sealed class PdfPigEmbeddedTextAdapter : IDocumentExtractionAdapter
             source.Content.Position = 0;
         }
     }
+
+    private static ParsedPdf ParseOwnedDocument(
+        byte[] ownedBytes,
+        ExtractionResponseBudget responseBudget)
+    {
+        using var content = new MemoryStream(ownedBytes, writable: false);
+        using var document = PdfDocument.Open(
+            content,
+            new ParsingOptions { UseLenientParsing = false });
+        DocumentMagicClassifier.ValidatePdfPageCount(
+            checked((uint)document.NumberOfPages));
+        if (document.IsEncrypted)
+        {
+            throw new EncryptedDocumentException(
+                "Password-protected PDFs are not supported.");
+        }
+
+        var fragments = ImmutableArray.CreateBuilder<TextFragment>();
+        var pages = ImmutableArray.CreateBuilder<DocumentSourcePage>();
+        var missingPages = new HashSet<int>();
+        for (var pageNumber = 1;
+             pageNumber <= document.NumberOfPages;
+             pageNumber++)
+        {
+            var page = document.GetPage(pageNumber);
+            var sourceIndex = pageNumber - 1;
+            pages.Add(
+                new DocumentSourcePage(
+                    sourceIndex,
+                    page.Width,
+                    page.Height,
+                    EvidenceCoordinateSystem.PdfPagePoints));
+            var pageFragmentStart = fragments.Count;
+            foreach (var word in page.GetWords())
+            {
+                var text = word.Text?.Trim();
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    continue;
+                }
+
+                var bounds = word.BoundingBox;
+                var left = new[]
+                {
+                    bounds.BottomLeft.X,
+                    bounds.TopLeft.X,
+                    bounds.BottomRight.X,
+                    bounds.TopRight.X,
+                }.Min();
+                var bottom = new[]
+                {
+                    bounds.BottomLeft.Y,
+                    bounds.TopLeft.Y,
+                    bounds.BottomRight.Y,
+                    bounds.TopRight.Y,
+                }.Min();
+                var right = new[]
+                {
+                    bounds.BottomLeft.X,
+                    bounds.TopLeft.X,
+                    bounds.BottomRight.X,
+                    bounds.TopRight.X,
+                }.Max();
+                var top = new[]
+                {
+                    bounds.BottomLeft.Y,
+                    bounds.TopLeft.Y,
+                    bounds.BottomRight.Y,
+                    bounds.TopRight.Y,
+                }.Max();
+                if (right <= left || top <= bottom)
+                {
+                    continue;
+                }
+
+                responseBudget.AddText(text);
+                fragments.Add(
+                    new TextFragment(
+                        text,
+                        sourceIndex,
+                        EvidenceCoordinateSystem.PdfPagePoints,
+                        new EvidenceRectangle(
+                            left,
+                            bottom,
+                            right - left,
+                            top - bottom),
+                        new OrientationTransform(1, 0, 0, 1, 0, 0),
+                        ExtractionCapability.EmbeddedText,
+                        DecoderApiVersion,
+                        null));
+            }
+
+            if (fragments.Count == pageFragmentStart)
+            {
+                missingPages.Add(sourceIndex);
+            }
+        }
+
+        return new ParsedPdf(
+            fragments.ToImmutable(),
+            pages.ToImmutable(),
+            missingPages);
+    }
+
+    private static void ObserveBackgroundFault(Task task)
+    {
+        _ = task.ContinueWith(
+            static completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted
+                | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private sealed record ParsedPdf(
+        ImmutableArray<TextFragment> Fragments,
+        ImmutableArray<DocumentSourcePage> Pages,
+        IReadOnlySet<int> MissingPages);
 }

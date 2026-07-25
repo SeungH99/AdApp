@@ -1,6 +1,5 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
-using System.Text;
 using LocalDocumentOrganizer.Core.Documents;
 using LocalDocumentOrganizer.DocumentExtractionWorker.Source;
 using Windows.Globalization;
@@ -87,7 +86,8 @@ public sealed class WindowsRasterOcrAdapter : IDocumentExtractionAdapter
                 orientation,
                 decoderVersion,
                 OcrApiVersion,
-                mapEvidence: null);
+                mapEvidence: null,
+                new ExtractionResponseBudget());
             if (fragments.IsEmpty)
             {
                 throw new UnsupportedDocumentException(
@@ -134,8 +134,6 @@ public sealed class WindowsRasterOcrAdapter : IDocumentExtractionAdapter
 internal static class WindowsExtractionSupport
 {
     private const int CopyBufferBytes = 81_920;
-    private const int MaximumAccumulatedTextBytes =
-        DocumentExtractionLimits.MaxSerializedResponseBytes - (64 * 1024);
     private const string JpegOrientationQuery = "/app1/ifd/{ushort=274}";
     private const string TiffOrientationQuery = "/ifd/{ushort=274}";
 
@@ -200,6 +198,51 @@ internal static class WindowsExtractionSupport
         }
     }
 
+    public static async Task<byte[]> ReadVerifiedBytesAsync(
+        Stream source,
+        long verifiedLength,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        if (verifiedLength < 0
+            || verifiedLength > DocumentExtractionLimits.MaxEncodedInputBytes
+            || verifiedLength > int.MaxValue)
+        {
+            throw new UnsupportedDocumentException(
+                "The encoded input exceeds the worker-owned byte boundary.");
+        }
+
+        var originalPosition = source.Position;
+        var bytes = GC.AllocateUninitializedArray<byte>(
+            checked((int)verifiedLength));
+        try
+        {
+            source.Position = 0;
+            var offset = 0;
+            while (offset < bytes.Length)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var read = await source.ReadAsync(
+                        bytes.AsMemory(offset, bytes.Length - offset),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (read == 0)
+                {
+                    throw new CorruptDocumentException(
+                        "The verified source ended during its bounded copy.");
+                }
+
+                offset += read;
+            }
+
+            return bytes;
+        }
+        finally
+        {
+            source.Position = originalPosition;
+        }
+    }
+
     public static OcrEngine CreateOcrEngine(
         ImmutableArray<string> requestedLanguages)
     {
@@ -245,10 +288,11 @@ internal static class WindowsExtractionSupport
         OrientationTransform orientation,
         string decoderVersion,
         string ocrVersion,
-        Func<EvidenceRectangle, EvidenceRectangle>? mapEvidence)
+        Func<EvidenceRectangle, EvidenceRectangle>? mapEvidence,
+        ExtractionResponseBudget responseBudget)
     {
+        ArgumentNullException.ThrowIfNull(responseBudget);
         var fragments = ImmutableArray.CreateBuilder<TextFragment>();
-        var textBytes = 0;
         foreach (var line in result.Lines)
         {
             foreach (var word in line.Words)
@@ -259,11 +303,7 @@ internal static class WindowsExtractionSupport
                     continue;
                 }
 
-                textBytes = checked(textBytes + Encoding.UTF8.GetByteCount(text));
-                if (textBytes > MaximumAccumulatedTextBytes)
-                {
-                    throw new ResponseTooLargeAdapterException();
-                }
+                responseBudget.AddText(text);
 
                 var bounds = word.BoundingRect;
                 var evidence = new EvidenceRectangle(

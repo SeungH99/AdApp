@@ -28,16 +28,23 @@ public sealed class WindowsNativePdfAdapter : IDocumentExtractionAdapter
         InheritedSourceDocument source,
         DocumentExtractionRequest request,
         CancellationToken cancellationToken) =>
-        ExtractPagesAsync(source, request, pageIndexes: null, cancellationToken);
+        ExtractPagesAsync(
+            source,
+            request,
+            pageIndexes: null,
+            new ExtractionResponseBudget(),
+            cancellationToken);
 
     internal async Task<DocumentExtractionResponse> ExtractPagesAsync(
         InheritedSourceDocument source,
         DocumentExtractionRequest request,
-        ISet<int>? pageIndexes,
+        IReadOnlySet<int>? pageIndexes,
+        ExtractionResponseBudget responseBudget,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(responseBudget);
         cancellationToken.ThrowIfCancellationRequested();
         if ((request.RequestedCapabilities & ExtractionCapability.Ocr) == 0)
         {
@@ -160,7 +167,8 @@ public sealed class WindowsNativePdfAdapter : IDocumentExtractionAdapter
                                 decoder.OrientedPixelWidth,
                                 decoder.OrientedPixelHeight,
                                 pdfWidth,
-                                pdfHeight)));
+                                pdfHeight),
+                        responseBudget));
             }
 
             if (fragments.Count == 0)

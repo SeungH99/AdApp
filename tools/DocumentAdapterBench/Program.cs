@@ -175,18 +175,36 @@ public static class AdapterBenchmarkSelector
                 candidate.AdapterId == BenchmarkAdapterIds.CandidateB);
         if (candidateA is not null && candidateB is not null)
         {
-            var exactMatchImprovement =
-                (long)candidateB.RequiredFieldExactMatches * 100
-                >= (long)candidateA.RequiredFieldExactMatches * 110
-                && candidateB.RequiredFieldExactMatches
-                    > candidateA.RequiredFieldExactMatches;
-            var p95Improvement =
-                candidateA.P95ElapsedMilliseconds > 0
+            if (candidateB.RequiredFieldExactMatches
+                != candidateA.RequiredFieldExactMatches)
+            {
+                return candidateB.RequiredFieldExactMatches
+                        > candidateA.RequiredFieldExactMatches
+                    ? candidateB.AdapterId
+                    : candidateA.AdapterId;
+            }
+
+            if (candidateA.P95ElapsedMilliseconds > 0
                 && candidateB.P95ElapsedMilliseconds * 100
-                    <= candidateA.P95ElapsedMilliseconds * 90;
-            return exactMatchImprovement || p95Improvement
-                ? candidateB.AdapterId
-                : candidateA.AdapterId;
+                    <= candidateA.P95ElapsedMilliseconds * 90)
+            {
+                return candidateB.AdapterId;
+            }
+
+            if (candidateB.P95ElapsedMilliseconds > 0
+                && candidateA.P95ElapsedMilliseconds * 100
+                    <= candidateB.P95ElapsedMilliseconds * 90)
+            {
+                return candidateA.AdapterId;
+            }
+
+            return new[] { candidateA, candidateB }
+                .OrderBy(static candidate => candidate.PeakWorkingSetBytes)
+                .ThenBy(
+                    static candidate => candidate.AdapterId,
+                    StringComparer.Ordinal)
+                .First()
+                .AdapterId;
         }
 
         return passing
@@ -199,8 +217,8 @@ public static class AdapterBenchmarkSelector
 
 public static class Program
 {
-    private const string PdfPigExpectedVersion = "0.1.15";
-    private const string PdfPigLicense = "Apache-2.0";
+    private static readonly TimeSpan CandidateProcessTimeout =
+        TimeSpan.FromMinutes(7);
 
     public static async Task<int> Main(string[] args)
     {
@@ -221,19 +239,35 @@ public static class Program
                 ?? throw new InvalidDataException(
                     "The benchmark manifest has no base directory.");
             ValidateFixtureFiles(manifest, baseDirectory);
-            var measurements = new[]
+            if (options.ChildCandidateId is not null)
             {
-                await MeasureCandidateAsync(
-                        BenchmarkAdapterIds.CandidateA,
+                _ = await MeasureCandidateAsync(
+                        options.ChildCandidateId,
                         manifest,
                         baseDirectory)
-                    .ConfigureAwait(false),
-                await MeasureCandidateAsync(
-                        BenchmarkAdapterIds.CandidateB,
+                    .ConfigureAwait(false);
+                var measurement = await MeasureCandidateAsync(
+                        options.ChildCandidateId,
                         manifest,
                         baseDirectory)
-                    .ConfigureAwait(false),
-            };
+                    .ConfigureAwait(false);
+                var resultPath = System.IO.Path.GetFullPath(
+                    options.ChildResultPath
+                    ?? throw new ArgumentException(
+                        "A child result path is required."));
+                await File.WriteAllBytesAsync(
+                        resultPath,
+                        JsonSerializer.SerializeToUtf8Bytes(
+                            measurement,
+                            JsonOptions(indented: true)))
+                    .ConfigureAwait(false);
+                return 0;
+            }
+
+            var measurements = await RunCandidateChildrenAsync(
+                    manifestPath,
+                    options.CandidateOrder)
+                .ConfigureAwait(false);
 
             string? selected = null;
             var reportRejections = new List<string>();
@@ -246,11 +280,12 @@ public static class Program
                 reportRejections.Add(exception.Message);
             }
 
+            var packageMetadata = TryInspectPdfPigPackage();
             var report = new AdapterSelectionReport(
                 "1",
                 new AdapterSelectionPackageVersions(
-                    PdfPigExpectedVersion,
-                    PdfPigLicense,
+                    packageMetadata?.Version ?? "unverified",
+                    packageMetadata?.License ?? "unverified",
                     "UniversalApiContract-v1",
                     "UniversalApiContract-v1",
                     "UniversalApiContract-v1"),
@@ -258,7 +293,10 @@ public static class Program
                 measurements,
                 selected,
                 reportRejections);
-            var outputPath = System.IO.Path.GetFullPath(options.OutputPath);
+            var outputPath = System.IO.Path.GetFullPath(
+                options.OutputPath
+                ?? throw new ArgumentException(
+                    "A coordinator output path is required."));
             Directory.CreateDirectory(
                 System.IO.Path.GetDirectoryName(outputPath)
                 ?? throw new InvalidDataException(
@@ -276,6 +314,64 @@ public static class Program
         }
     }
 
+    private static async Task<IReadOnlyList<AdapterCandidateMeasurement>>
+        RunCandidateChildrenAsync(
+            string manifestPath,
+            IReadOnlyList<string> candidateOrder)
+    {
+        var resultDirectory = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(),
+            $"document-adapter-bench-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(resultDirectory);
+        try
+        {
+            var specifications = candidateOrder
+                .Select(
+                    candidateId => CreateChildSpecification(
+                        candidateId,
+                        manifestPath,
+                        System.IO.Path.Combine(
+                            resultDirectory,
+                            $"{candidateId}.json")))
+                .ToArray();
+            return await BenchmarkChildProcessRunner.RunAllAsync(
+                    specifications,
+                    CandidateProcessTimeout,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            Directory.Delete(resultDirectory, recursive: true);
+        }
+    }
+
+    private static BenchmarkChildProcessSpec CreateChildSpecification(
+        string candidateId,
+        string manifestPath,
+        string resultPath)
+    {
+        var processPath = Environment.ProcessPath
+            ?? throw new InvalidOperationException(
+                "The benchmark process path is unavailable.");
+        var arguments = new List<string>();
+        if (string.Equals(
+                System.IO.Path.GetFileNameWithoutExtension(processPath),
+                "dotnet",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            arguments.Add(Assembly.GetExecutingAssembly().Location);
+        }
+
+        arguments.Add("--child-candidate");
+        arguments.Add(candidateId);
+        arguments.Add("--manifest");
+        arguments.Add(manifestPath);
+        arguments.Add("--result");
+        arguments.Add(resultPath);
+        return new BenchmarkChildProcessSpec(processPath, arguments, resultPath);
+    }
+
     private static async Task<AdapterCandidateMeasurement> MeasureCandidateAsync(
         string adapterId,
         AdapterBenchmarkManifest manifest,
@@ -290,7 +386,7 @@ public static class Program
         var peakWorkingSet = process.WorkingSet64;
 
         if (adapterId == BenchmarkAdapterIds.CandidateB
-            && !HasExpectedPdfPigPackage())
+            && TryInspectPdfPigPackage() is null)
         {
             rejectionReasons.Add("package-license-failure");
         }
@@ -451,20 +547,16 @@ public static class Program
             fixture.RequiredFields.Count,
             []);
 
-    private static bool HasExpectedPdfPigPackage()
+    private static PdfPigPackageMetadata? TryInspectPdfPigPackage()
     {
-        var assembly = typeof(PdfDocument).Assembly;
-        var informational = assembly
-            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
-            ?.InformationalVersion;
-        var assemblyVersion = assembly.GetName().Version?.ToString();
-        return (informational?.StartsWith(
-                    PdfPigExpectedVersion,
-                    StringComparison.Ordinal) == true
-                || assemblyVersion?.StartsWith(
-                    PdfPigExpectedVersion,
-                    StringComparison.Ordinal) == true)
-            && PdfPigLicense == "Apache-2.0";
+        try
+        {
+            return PdfPigPackageInspector.Inspect();
+        }
+        catch (InvalidDataException)
+        {
+            return null;
+        }
     }
 
     private static double Percentile95(IReadOnlyList<double> values)
@@ -527,8 +619,12 @@ public static class Program
                      StringComparer.Ordinal))
         {
             hash.AppendData(Encoding.UTF8.GetBytes(fixture.Id));
-            hash.AppendData(
-                File.ReadAllBytes(ResolveFixturePath(baseDirectory, fixture.Path)));
+            using var fixtureStream = new FileStream(
+                ResolveFixturePath(baseDirectory, fixture.Path),
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read);
+            BenchmarkHashing.AppendStream(hash, fixtureStream);
         }
 
         return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
@@ -560,11 +656,13 @@ public static class Program
         return fullPath;
     }
 
-    private static (string ManifestPath, string OutputPath) ParseArguments(
+    private static BenchmarkOptions ParseArguments(
         IReadOnlyList<string> args)
     {
         string? manifest = null;
         string? output = null;
+        string? childCandidateId = null;
+        string? childResultPath = null;
         for (var index = 0; index < args.Count; index++)
         {
             if (args[index] == "--manifest" && index + 1 < args.Count)
@@ -575,17 +673,51 @@ public static class Program
             {
                 output = args[++index];
             }
+            else if (args[index] == "--child-candidate"
+                     && index + 1 < args.Count)
+            {
+                childCandidateId = args[++index];
+            }
+            else if (args[index] == "--result" && index + 1 < args.Count)
+            {
+                childResultPath = args[++index];
+            }
             else
             {
                 throw new ArgumentException("Unknown benchmark argument.");
             }
         }
 
-        return string.IsNullOrWhiteSpace(manifest)
-            || string.IsNullOrWhiteSpace(output)
-            ? throw new ArgumentException(
-                "Both --manifest and --output are required.")
-            : (manifest, output);
+        if (string.IsNullOrWhiteSpace(manifest))
+        {
+            throw new ArgumentException("A manifest is required.");
+        }
+
+        if (childCandidateId is null)
+        {
+            if (string.IsNullOrWhiteSpace(output)
+                || childResultPath is not null)
+            {
+                throw new ArgumentException(
+                    "A coordinator requires --manifest and --output.");
+            }
+        }
+        else if (childCandidateId is not (
+                     BenchmarkAdapterIds.CandidateA
+                     or BenchmarkAdapterIds.CandidateB)
+                 || string.IsNullOrWhiteSpace(childResultPath)
+                 || output is not null)
+        {
+            throw new ArgumentException(
+                "A child requires a known candidate and --result.");
+        }
+
+        return new BenchmarkOptions(
+            manifest,
+            output,
+            childCandidateId,
+            childResultPath,
+            [BenchmarkAdapterIds.CandidateA, BenchmarkAdapterIds.CandidateB]);
     }
 
     private static JsonSerializerOptions JsonOptions(bool indented = false) =>
@@ -598,23 +730,40 @@ public static class Program
     private sealed class FixtureSource : IDisposable
     {
         private readonly FileStream stream;
-        private readonly byte[] bytes;
+        private readonly long length;
+        private readonly ImmutableArray<byte> sha256;
 
-        private FixtureSource(FileStream stream, byte[] bytes)
+        private FixtureSource(
+            FileStream stream,
+            long length,
+            ImmutableArray<byte> sha256)
         {
             this.stream = stream;
-            this.bytes = bytes;
+            this.length = length;
+            this.sha256 = sha256;
         }
 
         public static FixtureSource Open(string path)
         {
-            var bytes = File.ReadAllBytes(path);
             var stream = new FileStream(
                 path,
                 FileMode.Open,
                 FileAccess.Read,
                 FileShare.Read);
-            return new FixtureSource(stream, bytes);
+            try
+            {
+                var length = stream.Length;
+                var sha256 = ImmutableArray.Create(
+                    BenchmarkHashing.ComputeHash(
+                        stream,
+                        HashAlgorithmName.SHA256));
+                return new FixtureSource(stream, length, sha256);
+            }
+            catch
+            {
+                stream.Dispose();
+                throw;
+            }
         }
 
         public DocumentExtractionRequest CreateRequest(
@@ -629,11 +778,18 @@ public static class Program
                     unchecked((ulong)stream.SafeFileHandle.DangerousGetHandle().ToInt64()),
                     container,
                     mimeType,
-                    bytes.LongLength,
-                    ImmutableArray.Create(SHA256.HashData(bytes))),
+                    length,
+                    sha256),
                 capabilities,
                 [language]);
 
         public void Dispose() => stream.Dispose();
     }
+
+    private sealed record BenchmarkOptions(
+        string ManifestPath,
+        string? OutputPath,
+        string? ChildCandidateId,
+        string? ChildResultPath,
+        IReadOnlyList<string> CandidateOrder);
 }
