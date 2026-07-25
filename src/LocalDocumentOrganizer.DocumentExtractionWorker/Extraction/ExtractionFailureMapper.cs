@@ -107,3 +107,14 @@ public sealed class OcrFailureException : DocumentExtractionAdapterException
     {
     }
 }
+
+public sealed class ResponseTooLargeAdapterException
+    : DocumentExtractionAdapterException
+{
+    public ResponseTooLargeAdapterException()
+        : base(
+            "The extracted response exceeds the supported boundary.",
+            DocumentExtractionFailureCode.ResponseTooLarge)
+    {
+    }
+}
