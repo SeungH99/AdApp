@@ -47,6 +47,7 @@ public sealed class DocumentExtractionClient
     private readonly string _workerExecutablePath;
     private readonly IReadOnlyList<string> _workerArguments;
     private readonly ApprovedRootPathGuard? _approvedRoot;
+    private readonly IWorkerLaunchFaultInjector _faultInjector;
 
     public DocumentExtractionClient(string workerExecutablePath)
         : this(workerExecutablePath, approvedRoot: null, workerArguments: [])
@@ -64,6 +65,19 @@ public sealed class DocumentExtractionClient
         string workerExecutablePath,
         ApprovedRootPathGuard? approvedRoot,
         IReadOnlyList<string> workerArguments)
+        : this(
+            workerExecutablePath,
+            approvedRoot,
+            workerArguments,
+            NoOpWorkerLaunchFaultInjector.Instance)
+    {
+    }
+
+    internal DocumentExtractionClient(
+        string workerExecutablePath,
+        ApprovedRootPathGuard? approvedRoot,
+        IReadOnlyList<string> workerArguments,
+        IWorkerLaunchFaultInjector? faultInjector)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workerExecutablePath);
         ArgumentNullException.ThrowIfNull(workerArguments);
@@ -77,6 +91,8 @@ public sealed class DocumentExtractionClient
         _workerExecutablePath = workerExecutablePath;
         _workerArguments = workerArguments.ToArray();
         _approvedRoot = approvedRoot;
+        _faultInjector = faultInjector
+            ?? NoOpWorkerLaunchFaultInjector.Instance;
     }
 
     public async Task<DocumentExtractionResponse> ExtractAsync(
@@ -194,7 +210,9 @@ public sealed class DocumentExtractionClient
             Exception? primaryException = null;
             try
             {
-                var launcher = new AppContainerProcessLauncher(profile);
+                var launcher = new AppContainerProcessLauncher(
+                    profile,
+                    _faultInjector);
                 var activeWorker = launcher.Start(
                     _workerExecutablePath,
                     _workerArguments,

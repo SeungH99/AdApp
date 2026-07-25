@@ -1,9 +1,45 @@
 using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
+[assembly: InternalsVisibleTo(
+    "LocalDocumentOrganizer.WorkerSecurity.Tests")]
+
 namespace LocalDocumentOrganizer.Infrastructure.Windows.Documents;
+
+internal enum WorkerLaunchFaultPoint
+{
+    BeforeJobAssignment,
+    BeforeThreadResume,
+    BeforeOutputStreamConstruction,
+    BeforeTerminationWait,
+}
+
+internal interface IWorkerLaunchFaultInjector
+{
+    void ThrowIfRequested(
+        WorkerLaunchFaultPoint point,
+        uint processId);
+}
+
+internal sealed class NoOpWorkerLaunchFaultInjector
+    : IWorkerLaunchFaultInjector
+{
+    internal static NoOpWorkerLaunchFaultInjector Instance { get; } = new();
+
+    private NoOpWorkerLaunchFaultInjector()
+    {
+    }
+
+    public void ThrowIfRequested(
+        WorkerLaunchFaultPoint point,
+        uint processId)
+    {
+    }
+}
 
 public sealed class AppContainerLaunchException : Exception
 {
@@ -25,10 +61,20 @@ public sealed class AppContainerLaunchException : Exception
 public sealed class AppContainerProcessLauncher
 {
     private readonly AppContainerProfile _profile;
+    private readonly IWorkerLaunchFaultInjector _faultInjector;
 
     public AppContainerProcessLauncher(AppContainerProfile profile)
+        : this(profile, NoOpWorkerLaunchFaultInjector.Instance)
+    {
+    }
+
+    internal AppContainerProcessLauncher(
+        AppContainerProfile profile,
+        IWorkerLaunchFaultInjector faultInjector)
     {
         _profile = profile ?? throw new ArgumentNullException(nameof(profile));
+        _faultInjector = faultInjector
+            ?? throw new ArgumentNullException(nameof(faultInjector));
     }
 
     public LaunchedAppContainerProcess Start(
@@ -68,6 +114,7 @@ public sealed class AppContainerProcessLauncher
         IntPtr capabilitiesPointer = IntPtr.Zero;
         IntPtr handlesPointer = IntPtr.Zero;
         IntPtr environmentPointer = IntPtr.Zero;
+        uint processId = 0;
         try
         {
             CreateProtocolPipes(
@@ -177,25 +224,24 @@ public sealed class AppContainerProcessLauncher
 
             process = new SafeKernelHandle(processInformation.Process);
             thread = new SafeKernelHandle(processInformation.Thread);
-            try
+            processId = processInformation.ProcessId;
+            _faultInjector.ThrowIfRequested(
+                WorkerLaunchFaultPoint.BeforeJobAssignment,
+                processId);
+            job.Assign(process);
+            _faultInjector.ThrowIfRequested(
+                WorkerLaunchFaultPoint.BeforeThreadResume,
+                processId);
+            var previousSuspendCount = WorkerNativeMethods.ResumeThread(thread);
+            if (previousSuspendCount == uint.MaxValue)
             {
-                job.Assign(process);
-                var previousSuspendCount = WorkerNativeMethods.ResumeThread(thread);
-                if (previousSuspendCount == uint.MaxValue)
-                {
-                    ThrowLastWin32("Suspended worker resume");
-                }
-
-                if (previousSuspendCount != 1)
-                {
-                    throw new AppContainerLaunchException(
-                        "The worker primary thread had an unexpected suspend count.");
-                }
+                ThrowLastWin32("Suspended worker resume");
             }
-            catch
+
+            if (previousSuspendCount != 1)
             {
-                _ = WorkerNativeMethods.TerminateProcess(process, 0xE0000001);
-                throw;
+                throw new AppContainerLaunchException(
+                    "The worker primary thread had an unexpected suspend count.");
             }
 
             thread.Dispose();
@@ -213,6 +259,9 @@ public sealed class AppContainerProcessLauncher
                 bufferSize: 4096,
                 isAsync: false);
             parentInput = null;
+            _faultInjector.ThrowIfRequested(
+                WorkerLaunchFaultPoint.BeforeOutputStreamConstruction,
+                processId);
             outputStream = new FileStream(
                 parentOutput,
                 FileAccess.Read,
@@ -225,19 +274,41 @@ public sealed class AppContainerProcessLauncher
                 inputStream,
                 outputStream,
                 processInformation.ProcessId,
-                unchecked((ulong)handles[2].ToInt64()));
+                unchecked((ulong)handles[2].ToInt64()),
+                _profile,
+                _faultInjector);
             inputStream = null;
             outputStream = null;
             process = null;
             job = null;
             return launched;
         }
-        catch (AppContainerLaunchException)
-        {
-            throw;
-        }
         catch (Exception exception)
         {
+            if (process is not null)
+            {
+                try
+                {
+                    WorkerProcessTermination.TerminateAndWait(
+                        process,
+                        job,
+                        _faultInjector,
+                        processId,
+                        0xE0000001,
+                        0xE0000002);
+                }
+                catch (Exception cleanupException)
+                {
+                    _profile.MarkCleanupUnsafe();
+                    TryAttachCleanupFailure(exception, cleanupException);
+                }
+            }
+
+            if (exception is AppContainerLaunchException)
+            {
+                ExceptionDispatchInfo.Capture(exception).Throw();
+            }
+
             throw new AppContainerLaunchException(
                 "Capability-free document worker launch failed.",
                 exception);
@@ -283,6 +354,21 @@ public sealed class AppContainerProcessLauncher
             {
                 profileSid!.DangerousRelease();
             }
+        }
+    }
+
+    private static void TryAttachCleanupFailure(
+        Exception primaryException,
+        Exception cleanupException)
+    {
+        try
+        {
+            primaryException.Data["AppContainerLaunchCleanup"] =
+                cleanupException.Message;
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or NotSupportedException)
+        {
         }
     }
 
@@ -492,11 +578,10 @@ public sealed class AppContainerProcessLauncher
 
 public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
 {
-    private const uint GracefulTerminationWaitMilliseconds = 5_000;
-    private const uint ForcedTerminationWaitMilliseconds = 1_000;
-
     private SafeKernelHandle? _process;
     private DocumentWorkerJob? _job;
+    private readonly AppContainerProfile _profile;
+    private readonly IWorkerLaunchFaultInjector _faultInjector;
     private int _disposed;
 
     internal LaunchedAppContainerProcess(
@@ -505,10 +590,14 @@ public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
         Stream standardInput,
         Stream standardOutput,
         uint processId,
-        ulong inheritedSourceHandle)
+        ulong inheritedSourceHandle,
+        AppContainerProfile profile,
+        IWorkerLaunchFaultInjector faultInjector)
     {
         _process = process;
         _job = job;
+        _profile = profile;
+        _faultInjector = faultInjector;
         StandardInput = standardInput;
         StandardOutput = standardOutput;
         ProcessId = processId;
@@ -582,43 +671,58 @@ public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
             return;
         }
 
+        Exception? cleanupFailure = null;
         try
         {
-            var process = GetProcess();
             try
             {
-                _job?.Terminate(0xE0000003);
-            }
-            catch (AppContainerLaunchException)
-            {
-                _ = WorkerNativeMethods.TerminateProcess(
-                    process,
+                WorkerProcessTermination.TerminateAndWait(
+                    GetProcess(),
+                    _job,
+                    _faultInjector,
+                    ProcessId,
+                    0xE0000003,
                     0xE0000004);
             }
-
-            WaitForTermination(
-                process,
-                GracefulTerminationWaitMilliseconds);
+            catch (Exception exception)
+            {
+                _profile.MarkCleanupUnsafe();
+                cleanupFailure = exception;
+            }
+        }
+        finally
+        {
             try
             {
                 StandardInput.Dispose();
             }
-            catch (IOException)
+            catch (Exception exception)
             {
+                cleanupFailure ??= exception;
             }
 
             try
             {
                 await StandardOutput.DisposeAsync().ConfigureAwait(false);
             }
-            catch (IOException)
+            catch (Exception exception)
             {
+                cleanupFailure ??= exception;
+            }
+
+            try
+            {
+                Interlocked.Exchange(ref _job, null)?.Dispose();
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _process, null)?.Dispose();
             }
         }
-        finally
+
+        if (cleanupFailure is not null)
         {
-            Interlocked.Exchange(ref _job, null)?.Dispose();
-            Interlocked.Exchange(ref _process, null)?.Dispose();
+            ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
         }
     }
 
@@ -628,13 +732,36 @@ public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
             : throw new ObjectDisposedException(
                 nameof(LaunchedAppContainerProcess));
 
-    private static void WaitForTermination(
+}
+
+internal static class WorkerProcessTermination
+{
+    private const uint GracefulTerminationWaitMilliseconds = 5_000;
+    private const uint ForcedTerminationWaitMilliseconds = 1_000;
+
+    internal static void TerminateAndWait(
         SafeKernelHandle process,
-        uint timeoutMilliseconds)
+        DocumentWorkerJob? job,
+        IWorkerLaunchFaultInjector faultInjector,
+        uint processId,
+        uint jobExitCode,
+        uint processExitCode)
     {
+        try
+        {
+            job?.Terminate(jobExitCode);
+        }
+        catch (AppContainerLaunchException)
+        {
+        }
+
+        _ = WorkerNativeMethods.TerminateProcess(process, processExitCode);
+        faultInjector.ThrowIfRequested(
+            WorkerLaunchFaultPoint.BeforeTerminationWait,
+            processId);
         var result = WorkerNativeMethods.WaitForSingleObject(
             process,
-            timeoutMilliseconds);
+            GracefulTerminationWaitMilliseconds);
         if (result == WorkerNativeMethods.WaitObject0)
         {
             return;
@@ -655,7 +782,7 @@ public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
 
         _ = WorkerNativeMethods.TerminateProcess(
             process,
-            0xE0000005);
+            processExitCode);
         result = WorkerNativeMethods.WaitForSingleObject(
             process,
             ForcedTerminationWaitMilliseconds);

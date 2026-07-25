@@ -10,6 +10,7 @@ public sealed class AppContainerProfile : IDisposable
 
     private SafeSidHandle? _sid;
     private FileStream? _lifecycleLock;
+    private int _cleanupUnsafe;
     private int _disposed;
 
     private AppContainerProfile(
@@ -122,7 +123,12 @@ public sealed class AppContainerProfile : IDisposable
 
     public void Dispose()
     {
-        DisposeCore(deleteProfile: true);
+        DisposeCore(deleteProfile: Volatile.Read(ref _cleanupUnsafe) == 0);
+    }
+
+    internal void MarkCleanupUnsafe()
+    {
+        Volatile.Write(ref _cleanupUnsafe, 1);
     }
 
     internal void ReleaseWithoutProfileDeletion()
