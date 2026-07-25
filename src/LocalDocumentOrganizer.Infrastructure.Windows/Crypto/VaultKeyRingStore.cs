@@ -24,6 +24,8 @@ public sealed class VaultKeyRingStore
         "LocalDocumentOrganizer/VaultKeyRing/Identity/v1"u8.ToArray();
     private static readonly byte[] ProjectionValueEncryptionKeyDomain =
         "LocalDocumentOrganizer/ProjectionValue/EncryptionKey/v1"u8.ToArray();
+    private static readonly byte[] FileFingerprintKeyDomain =
+        "proof-to-closure/file-fingerprint/v1"u8.ToArray();
 
     private const int AuthenticationTagSize = 32;
     private const int NonceSize = 12;
@@ -416,6 +418,38 @@ public sealed class VaultKeyRingStore
         }
     }
 
+    internal async ValueTask<TResult> UseFileFingerprintSubkeyAsync<TResult>(
+        SensitiveObjectRef owner,
+        DataKeyId expectedKeyId,
+        Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>> callback,
+        CancellationToken cancellationToken)
+    {
+        ValidateOwner(owner);
+        if (expectedKeyId.Value == Guid.Empty)
+            throw new ArgumentException("A data-key ID is required.", nameof(expectedKeyId));
+        ArgumentNullException.ThrowIfNull(callback);
+
+        byte[]? subkey = null;
+        try
+        {
+            return await OpenDataKeyAsync(
+                owner,
+                async (actualKeyId, dataKey, token) =>
+                {
+                    if (actualKeyId != expectedKeyId) throw new VaultReceiptConflictException();
+                    subkey = HMACSHA256.HashData(
+                        dataKey.Span,
+                        FileFingerprintKeyDomain);
+                    return await callback(subkey, token).ConfigureAwait(false);
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (subkey is not null) CryptographicOperations.ZeroMemory(subkey);
+        }
+    }
+
     internal sealed class VaultKeyRingSession : IAsyncDisposable
     {
         private readonly VaultKeyRingStore _store;
@@ -531,6 +565,68 @@ public sealed class VaultKeyRingStore
                 subkey = HMACSHA256.HashData(
                     cached.Key.Span,
                     ProjectionValueEncryptionKeyDomain);
+
+                var operation = _operation!;
+                _operation = null;
+                await operation.DisposeAsync().ConfigureAwait(false);
+                try
+                {
+                    return await callback(subkey, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    try
+                    {
+                        _operation = await _store.MaintenanceGate
+                            .EnterOperationAsync(_lease, CancellationToken.None)
+                            .ConfigureAwait(false);
+                        await _store.RequireCanonicalImageAsync(_image!, CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        if (_operation is not null)
+                        {
+                            await _operation.DisposeAsync().ConfigureAwait(false);
+                            _operation = null;
+                        }
+
+                        throw;
+                    }
+                }
+            }
+            finally
+            {
+                if (subkey is not null) CryptographicOperations.ZeroMemory(subkey);
+                _gate.Release();
+            }
+        }
+
+        internal async ValueTask<TResult> UseFileFingerprintSubkeyAsync<TResult>(
+            SensitiveObjectRef owner,
+            DataKeyId expectedKeyId,
+            Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>> callback,
+            CancellationToken cancellationToken)
+        {
+            ValidateOwner(owner);
+            if (expectedKeyId.Value == Guid.Empty)
+                throw new ArgumentException("A data-key ID is required.", nameof(expectedKeyId));
+            ArgumentNullException.ThrowIfNull(callback);
+
+            byte[]? subkey = null;
+            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                ThrowIfDisposed();
+                ThrowIfAdmissionReleased();
+                if (_destroyed.ContainsKey(owner)) throw new VaultDataKeyDestroyedException();
+                if (!_active.TryGetValue(owner, out var active))
+                    throw new VaultDataKeyNotFoundException();
+                if (active.KeyId != expectedKeyId) throw new VaultReceiptConflictException();
+                var cached = GetOrUnwrap(active);
+                subkey = HMACSHA256.HashData(
+                    cached.Key.Span,
+                    FileFingerprintKeyDomain);
 
                 var operation = _operation!;
                 _operation = null;
