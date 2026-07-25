@@ -1,6 +1,6 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Diagnostics.CodeAnalysis;
 
 namespace LocalDocumentOrganizer.CorpusEval;
 
@@ -12,14 +12,19 @@ public static class LaunchCorpusCatalog
     public static IReadOnlyList<string> ContractIds { get; } =
         ["A1", "A2", "B1", "B2", "C1", "C2"];
 
-    public static IReadOnlyList<string> LanguageIds { get; } =
-        ["en-US", "ko-KR", "ja-JP", "de-DE", "fr-FR", "es-ES"];
-
     public static IReadOnlyList<string> AdvertisedRasterCodecIds { get; } =
         ["jpeg", "png", "tiff", "bmp"];
 }
 
-[JsonConverter(typeof(JsonStringEnumConverter<CorpusInputKind>))]
+public enum CorpusKind
+{
+    [JsonStringEnumMemberName("synthetic")]
+    Synthetic,
+
+    [JsonStringEnumMemberName("owner-approved")]
+    OwnerApproved,
+}
+
 public enum CorpusInputKind
 {
     [JsonStringEnumMemberName("image-pdf")]
@@ -29,7 +34,6 @@ public enum CorpusInputKind
     StandaloneRaster,
 }
 
-[JsonConverter(typeof(JsonStringEnumConverter<CorpusPerturbationKind>))]
 public enum CorpusPerturbationKind
 {
     [JsonStringEnumMemberName("recompression")]
@@ -40,19 +44,6 @@ public enum CorpusPerturbationKind
 
     [JsonStringEnumMemberName("metadata")]
     Metadata,
-}
-
-[JsonConverter(typeof(JsonStringEnumConverter<CorpusOutputDisposition>))]
-public enum CorpusOutputDisposition
-{
-    [JsonStringEnumMemberName("accepted")]
-    Accepted,
-
-    [JsonStringEnumMemberName("needs-review")]
-    NeedsReview,
-
-    [JsonStringEnumMemberName("unsupported")]
-    Unsupported,
 }
 
 public sealed record CorpusOwnerApproval(
@@ -77,15 +68,11 @@ public sealed record CorpusExpectedField(
     string NormalizedValue,
     CorpusEvidenceRectangle Evidence);
 
-public sealed record CorpusObservedField(
-    string FieldId,
-    string NormalizedValue,
-    CorpusEvidenceRectangle? Evidence);
-
 public sealed record CorpusCalibrationDocument(
     string StableDocumentId,
     string SourceFamilyId,
     string ContentSha256,
+    string SourceLocator,
     string LanguageId,
     IReadOnlyList<string> LabelingSourceIds,
     bool OwnerApproved);
@@ -94,14 +81,13 @@ public sealed record CorpusHeldOutDocument(
     string StableDocumentId,
     string SourceFamilyId,
     string ContentSha256,
+    string SourceLocator,
     string LanguageId,
     CorpusInputKind InputKind,
     string? CodecId,
     IReadOnlyList<string> LabelingSourceIds,
     bool OwnerApproved,
-    IReadOnlyList<CorpusExpectedField> ExpectedFields,
-    IReadOnlyList<CorpusObservedField> ObservedFields,
-    CorpusOutputDisposition OutputDisposition);
+    IReadOnlyList<CorpusExpectedField> ExpectedFields);
 
 public sealed record CorpusCell(
     string MarketId,
@@ -112,23 +98,14 @@ public sealed record CorpusCell(
 public sealed record CorpusCodecPerturbation(
     string CodecId,
     CorpusPerturbationKind Kind,
-    string BaselineId,
-    string VariantId,
-    bool RequiredFieldsInvariant,
-    bool EvidenceInvariant,
-    bool SafeRejection);
+    string BaselineDocumentId,
+    string VariantDocumentId);
 
 public sealed record CorpusManifest(
     string SchemaVersion,
+    CorpusKind CorpusKind,
     CorpusOwnerApproval OwnerApproval,
     string CatalogEpoch,
-    string AppVersion,
-    string AdapterId,
-    string AdapterVersion,
-    string OcrRuntimeVersion,
-    IReadOnlyDictionary<string, string> OcrLanguageVersions,
-    string OsBuild,
-    string MachineClass,
     IReadOnlyList<CorpusLabelingSource> LabelingSources,
     IReadOnlyList<string> AdvertisedRasterCodecs,
     IReadOnlyList<CorpusCell> Cells,
@@ -146,6 +123,8 @@ public enum CorpusManifestFailureCode
     InvalidLabelingSource,
     UnknownCatalogIdentifier,
     IncompleteCodecPerturbations,
+    InvalidCodecPerturbation,
+    DocumentLanguageMismatch,
     InvalidManifest,
 }
 
@@ -162,11 +141,7 @@ public sealed class CorpusManifestException : Exception
 
 public static class CorpusManifestJson
 {
-    private static readonly JsonSerializerOptions Options =
-        new(JsonSerializerDefaults.Web)
-        {
-            UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
-        };
+    private static readonly JsonSerializerOptions Options = CreateOptions();
 
     public static byte[] Serialize(CorpusManifest manifest) =>
         JsonSerializer.SerializeToUtf8Bytes(manifest, Options);
@@ -178,6 +153,10 @@ public static class CorpusManifestJson
             return JsonSerializer.Deserialize<CorpusManifest>(json, Options)
                 ?? throw new CorpusManifestException(
                     CorpusManifestFailureCode.MalformedJson);
+        }
+        catch (CorpusManifestException)
+        {
+            throw;
         }
         catch (JsonException exception)
         {
@@ -197,73 +176,29 @@ public static class CorpusManifestJson
           "title": "LocalDocumentOrganizer Corpus Manifest",
           "type": "object",
           "additionalProperties": false,
-          "required": ["schemaVersion", "ownerApproval", "catalogEpoch", "appVersion", "adapterId", "adapterVersion", "ocrRuntimeVersion", "ocrLanguageVersions", "osBuild", "machineClass", "labelingSources", "advertisedRasterCodecs", "cells", "codecPerturbations"],
+          "required": ["schemaVersion", "corpusKind", "ownerApproval", "catalogEpoch", "labelingSources", "advertisedRasterCodecs", "cells", "codecPerturbations"],
           "properties": {
             "schemaVersion": { "const": "1" },
+            "corpusKind": { "enum": ["synthetic", "owner-approved"] },
             "ownerApproval": { "$ref": "#/$defs/ownerApproval" },
             "catalogEpoch": { "$ref": "#/$defs/token" },
-            "appVersion": { "$ref": "#/$defs/token" },
-            "adapterId": { "$ref": "#/$defs/token" },
-            "adapterVersion": { "$ref": "#/$defs/token" },
-            "ocrRuntimeVersion": { "$ref": "#/$defs/token" },
-            "ocrLanguageVersions": {
-              "type": "object",
-              "minProperties": 6,
-              "maxProperties": 6,
-              "propertyNames": { "enum": ["en-US", "ko-KR", "ja-JP", "de-DE", "fr-FR", "es-ES"] },
-              "additionalProperties": { "$ref": "#/$defs/token" }
-            },
-            "osBuild": { "$ref": "#/$defs/token" },
-            "machineClass": { "$ref": "#/$defs/token" },
-            "labelingSources": {
-              "type": "array",
-              "minItems": 1,
-              "items": { "$ref": "#/$defs/labelingSource" }
-            },
-            "advertisedRasterCodecs": {
-              "type": "array",
-              "minItems": 4,
-              "maxItems": 4,
-              "uniqueItems": true,
-              "items": { "enum": ["jpeg", "png", "tiff", "bmp"] }
-            },
-            "cells": {
-              "type": "array",
-              "minItems": 36,
-              "maxItems": 36,
-              "items": { "$ref": "#/$defs/cell" }
-            },
-            "codecPerturbations": {
-              "type": "array",
-              "minItems": 12,
-              "maxItems": 12,
-              "items": { "$ref": "#/$defs/codecPerturbation" }
-            }
+            "labelingSources": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/labelingSource" } },
+            "advertisedRasterCodecs": { "type": "array", "minItems": 4, "maxItems": 4, "uniqueItems": true, "items": { "enum": ["jpeg", "png", "tiff", "bmp"] } },
+            "cells": { "type": "array", "minItems": 36, "maxItems": 36, "items": { "$ref": "#/$defs/cell" } },
+            "codecPerturbations": { "type": "array", "minItems": 12, "maxItems": 12, "items": { "$ref": "#/$defs/codecPerturbation" } }
           },
           "$defs": {
-            "token": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"
-            },
-            "opaqueId": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
-            },
-            "sha256": {
-              "type": "string",
-              "pattern": "^[A-Fa-f0-9]{64}$"
-            },
+            "token": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$" },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+            "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+            "sourceLocator": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,511}$" },
             "ownerApproval": {
               "type": "object",
               "additionalProperties": false,
               "required": ["approved", "approvalId", "approvedAtUtc"],
               "properties": {
                 "approved": { "const": true },
-                "approvalId": { "$ref": "#/$defs/opaqueId" },
+                "approvalId": { "$ref": "#/$defs/id" },
                 "approvedAtUtc": { "type": "string", "format": "date-time" }
               }
             },
@@ -272,8 +207,8 @@ public static class CorpusManifestJson
               "additionalProperties": false,
               "required": ["id", "reference", "isOfficial"],
               "properties": {
-                "id": { "$ref": "#/$defs/opaqueId" },
-                "reference": { "type": "string", "format": "uri", "pattern": "^https://" },
+                "id": { "$ref": "#/$defs/id" },
+                "reference": { "type": "string", "minLength": 1, "maxLength": 2048, "format": "uri", "pattern": "^https://" },
                 "isOfficial": { "const": true }
               }
             },
@@ -294,77 +229,40 @@ public static class CorpusManifestJson
               "additionalProperties": false,
               "required": ["fieldId", "normalizedValue", "evidence"],
               "properties": {
-                "fieldId": { "$ref": "#/$defs/opaqueId" },
+                "fieldId": { "$ref": "#/$defs/id" },
                 "normalizedValue": { "type": "string", "minLength": 1 },
                 "evidence": { "$ref": "#/$defs/evidence" }
-              }
-            },
-            "observedField": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["fieldId", "normalizedValue", "evidence"],
-              "properties": {
-                "fieldId": { "$ref": "#/$defs/opaqueId" },
-                "normalizedValue": { "type": "string" },
-                "evidence": {
-                  "oneOf": [
-                    { "$ref": "#/$defs/evidence" },
-                    { "type": "null" }
-                  ]
-                }
               }
             },
             "calibrationDocument": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["stableDocumentId", "sourceFamilyId", "contentSha256", "languageId", "labelingSourceIds", "ownerApproved"],
+              "required": ["stableDocumentId", "sourceFamilyId", "contentSha256", "sourceLocator", "languageId", "labelingSourceIds", "ownerApproved"],
               "properties": {
-                "stableDocumentId": { "$ref": "#/$defs/opaqueId" },
-                "sourceFamilyId": { "$ref": "#/$defs/opaqueId" },
+                "stableDocumentId": { "$ref": "#/$defs/id" },
+                "sourceFamilyId": { "$ref": "#/$defs/id" },
                 "contentSha256": { "$ref": "#/$defs/sha256" },
+                "sourceLocator": { "$ref": "#/$defs/sourceLocator" },
                 "languageId": { "enum": ["en-US", "ko-KR", "ja-JP", "de-DE", "fr-FR", "es-ES"] },
-                "labelingSourceIds": {
-                  "type": "array",
-                  "minItems": 1,
-                  "uniqueItems": true,
-                  "items": { "$ref": "#/$defs/opaqueId" }
-                },
+                "labelingSourceIds": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
                 "ownerApproved": { "const": true }
               }
             },
             "heldOutDocument": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["stableDocumentId", "sourceFamilyId", "contentSha256", "languageId", "inputKind", "codecId", "labelingSourceIds", "ownerApproved", "expectedFields", "observedFields", "outputDisposition"],
+              "required": ["stableDocumentId", "sourceFamilyId", "contentSha256", "sourceLocator", "languageId", "inputKind", "codecId", "labelingSourceIds", "ownerApproved", "expectedFields"],
               "properties": {
-                "stableDocumentId": { "$ref": "#/$defs/opaqueId" },
-                "sourceFamilyId": { "$ref": "#/$defs/opaqueId" },
+                "stableDocumentId": { "$ref": "#/$defs/id" },
+                "sourceFamilyId": { "$ref": "#/$defs/id" },
                 "contentSha256": { "$ref": "#/$defs/sha256" },
+                "sourceLocator": { "$ref": "#/$defs/sourceLocator" },
                 "languageId": { "enum": ["en-US", "ko-KR", "ja-JP", "de-DE", "fr-FR", "es-ES"] },
                 "inputKind": { "enum": ["image-pdf", "standalone-raster"] },
-                "codecId": {
-                  "oneOf": [
-                    { "enum": ["jpeg", "png", "tiff", "bmp"] },
-                    { "type": "null" }
-                  ]
-                },
-                "labelingSourceIds": {
-                  "type": "array",
-                  "minItems": 1,
-                  "uniqueItems": true,
-                  "items": { "$ref": "#/$defs/opaqueId" }
-                },
+                "codecId": { "type": ["string", "null"], "enum": ["jpeg", "png", "tiff", "bmp", null] },
+                "labelingSourceIds": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
                 "ownerApproved": { "const": true },
-                "expectedFields": {
-                  "type": "array",
-                  "minItems": 1,
-                  "items": { "$ref": "#/$defs/expectedField" }
-                },
-                "observedFields": {
-                  "type": "array",
-                  "items": { "$ref": "#/$defs/observedField" }
-                },
-                "outputDisposition": { "enum": ["accepted", "needs-review", "unsupported"] }
+                "expectedFields": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/expectedField" } }
               }
             },
             "cell": {
@@ -374,35 +272,49 @@ public static class CorpusManifestJson
               "properties": {
                 "marketId": { "enum": ["en-US", "ko-KR", "ja-JP", "de-DE", "fr-FR", "es-ES"] },
                 "contractId": { "enum": ["A1", "A2", "B1", "B2", "C1", "C2"] },
-                "calibrationDocuments": {
-                  "type": "array",
-                  "minItems": 1,
-                  "items": { "$ref": "#/$defs/calibrationDocument" }
-                },
-                "heldOutDocuments": {
-                  "type": "array",
-                  "minItems": 40,
-                  "items": { "$ref": "#/$defs/heldOutDocument" }
-                }
+                "calibrationDocuments": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/calibrationDocument" } },
+                "heldOutDocuments": { "type": "array", "minItems": 40, "items": { "$ref": "#/$defs/heldOutDocument" } }
               }
             },
             "codecPerturbation": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["codecId", "kind", "baselineId", "variantId", "requiredFieldsInvariant", "evidenceInvariant", "safeRejection"],
+              "required": ["codecId", "kind", "baselineDocumentId", "variantDocumentId"],
               "properties": {
                 "codecId": { "enum": ["jpeg", "png", "tiff", "bmp"] },
                 "kind": { "enum": ["recompression", "orientation", "metadata"] },
-                "baselineId": { "$ref": "#/$defs/opaqueId" },
-                "variantId": { "$ref": "#/$defs/opaqueId" },
-                "requiredFieldsInvariant": { "type": "boolean" },
-                "evidenceInvariant": { "type": "boolean" },
-                "safeRejection": { "type": "boolean" }
+                "baselineDocumentId": { "$ref": "#/$defs/id" },
+                "variantDocumentId": { "$ref": "#/$defs/id" }
               }
             }
           }
         }
         """;
+
+    internal static JsonSerializerOptions CreateOptions()
+    {
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web)
+        {
+            PropertyNameCaseInsensitive = false,
+            UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+            NumberHandling = JsonNumberHandling.Strict,
+            RespectNullableAnnotations = true,
+            RespectRequiredConstructorParameters = true,
+        };
+        options.Converters.Add(
+            new JsonStringEnumConverter<CorpusKind>(
+                namingPolicy: null,
+                allowIntegerValues: false));
+        options.Converters.Add(
+            new JsonStringEnumConverter<CorpusInputKind>(
+                namingPolicy: null,
+                allowIntegerValues: false));
+        options.Converters.Add(
+            new JsonStringEnumConverter<CorpusPerturbationKind>(
+                namingPolicy: null,
+                allowIntegerValues: false));
+        return options;
+    }
 }
 
 public static class CorpusManifestValidator
@@ -410,123 +322,73 @@ public static class CorpusManifestValidator
     public static void Validate(CorpusManifest manifest)
     {
         ArgumentNullException.ThrowIfNull(manifest);
-        if (manifest.SchemaVersion != "1")
+        if (manifest.SchemaVersion != "1"
+            || !Enum.IsDefined(manifest.CorpusKind)
+            || !IsToken(manifest.CatalogEpoch))
         {
             Fail(CorpusManifestFailureCode.InvalidManifest);
         }
 
-        if (!IsSafeToken(manifest.CatalogEpoch)
-            || !IsSafeToken(manifest.AppVersion)
-            || !IsSafeToken(manifest.AdapterId)
-            || !IsSafeToken(manifest.AdapterVersion)
-            || !IsSafeToken(manifest.OcrRuntimeVersion)
-            || !IsSafeToken(manifest.OsBuild)
-            || !IsSafeToken(manifest.MachineClass))
-        {
-            Fail(CorpusManifestFailureCode.InvalidManifest);
-        }
-
-        if (manifest.OwnerApproval is null
-            || !manifest.OwnerApproval.Approved
-            || !IsSafeOpaqueId(manifest.OwnerApproval.ApprovalId))
+        if (!manifest.OwnerApproval.Approved
+            || !IsId(manifest.OwnerApproval.ApprovalId))
         {
             Fail(CorpusManifestFailureCode.OwnerApprovalRequired);
         }
 
-        var sources = ValidateSources(manifest.LabelingSources);
-        ValidateCatalog(manifest);
-        ValidateCells(manifest.Cells, sources);
-        ValidatePerturbations(
-            manifest.AdvertisedRasterCodecs,
-            manifest.CodecPerturbations);
-    }
-
-    private static HashSet<string> ValidateSources(
-        IReadOnlyList<CorpusLabelingSource> labelingSources)
-    {
-        if (labelingSources is null || labelingSources.Count == 0)
+        var labelingSourceIds = manifest.LabelingSources
+            .Select(static source => source.Id)
+            .ToHashSet(StringComparer.Ordinal);
+        if (manifest.LabelingSources.Count == 0
+            || labelingSourceIds.Count != manifest.LabelingSources.Count
+            || manifest.LabelingSources.Any(
+                static source =>
+                    !source.IsOfficial
+                    || !IsId(source.Id)
+                    || !IsPublicHttpsReference(source.Reference)))
         {
             Fail(CorpusManifestFailureCode.InvalidLabelingSource);
         }
 
-        var ids = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var source in labelingSources)
-        {
-            if (source is null
-                || !source.IsOfficial
-                || !IsSafeOpaqueId(source.Id)
-                || !ids.Add(source.Id)
-                || !Uri.TryCreate(
-                    source.Reference,
-                    UriKind.Absolute,
-                    out var uri)
-                || uri.Scheme != Uri.UriSchemeHttps)
-            {
-                Fail(CorpusManifestFailureCode.InvalidLabelingSource);
-            }
-        }
-
-        return ids;
-    }
-
-    private static void ValidateCatalog(CorpusManifest manifest)
-    {
-        if (manifest.AdvertisedRasterCodecs is null
-            || manifest.AdvertisedRasterCodecs.Count
-                != LaunchCorpusCatalog.AdvertisedRasterCodecIds.Count
-            || manifest.AdvertisedRasterCodecs
-                .Except(
-                    LaunchCorpusCatalog.AdvertisedRasterCodecIds,
-                    StringComparer.Ordinal)
-                .Any()
-            || LaunchCorpusCatalog.AdvertisedRasterCodecIds
-                .Except(
-                    manifest.AdvertisedRasterCodecs,
-                    StringComparer.Ordinal)
-                .Any()
-            || manifest.OcrLanguageVersions is null
-            || manifest.OcrLanguageVersions.Count
-                != LaunchCorpusCatalog.LanguageIds.Count
-            || manifest.OcrLanguageVersions.Keys
-                .Except(
-                    LaunchCorpusCatalog.LanguageIds,
-                    StringComparer.Ordinal)
-                .Any()
-            || LaunchCorpusCatalog.LanguageIds
-                .Except(
-                    manifest.OcrLanguageVersions.Keys,
-                    StringComparer.Ordinal)
-                .Any()
-            || manifest.OcrLanguageVersions.Values.Any(
-                static version => !IsSafeToken(version)))
+        if (!SetEquals(
+                manifest.AdvertisedRasterCodecs,
+                LaunchCorpusCatalog.AdvertisedRasterCodecIds))
         {
             Fail(CorpusManifestFailureCode.UnknownCatalogIdentifier);
-        }
-    }
-
-    private static void ValidateCells(
-        IReadOnlyList<CorpusCell> cells,
-        IReadOnlySet<string> labelingSourceIds)
-    {
-        if (cells is null || cells.Count != 36)
-        {
-            Fail(CorpusManifestFailureCode.InvalidLaunchCellSet);
         }
 
         var expectedCells = (
             from market in LaunchCorpusCatalog.MarketIds
             from contract in LaunchCorpusCatalog.ContractIds
-            select $"{market}\0{contract}")
+            select $"{market}\u001f{contract}")
             .ToHashSet(StringComparer.Ordinal);
-        var actualCells = new HashSet<string>(StringComparer.Ordinal);
+        var actualCells = manifest.Cells
+            .Select(static cell => $"{cell.MarketId}\u001f{cell.ContractId}")
+            .ToArray();
+        if (actualCells.Length != expectedCells.Count
+            || actualCells.Distinct(StringComparer.Ordinal).Count()
+                != actualCells.Length
+            || actualCells.Any(cell => !expectedCells.Contains(cell)))
+        {
+            Fail(CorpusManifestFailureCode.InvalidLaunchCellSet);
+        }
+
+        ValidateDocuments(manifest, labelingSourceIds);
+        ValidatePerturbations(manifest);
+    }
+
+    private static void ValidateDocuments(
+        CorpusManifest manifest,
+        IReadOnlySet<string> labelingSourceIds)
+    {
+        var hashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var stableIds = new HashSet<string>(StringComparer.Ordinal);
+        var locators = new HashSet<string>(StringComparer.Ordinal);
         var calibrationFamilies = new HashSet<string>(StringComparer.Ordinal);
         var heldOutFamilies = new HashSet<string>(StringComparer.Ordinal);
-        var hashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var stableDocumentIds = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var cell in cells)
+
+        foreach (var cell in manifest.Cells)
         {
-            if (cell is null
-                || !LaunchCorpusCatalog.MarketIds.Contains(
+            if (!LaunchCorpusCatalog.MarketIds.Contains(
                     cell.MarketId,
                     StringComparer.Ordinal)
                 || !LaunchCorpusCatalog.ContractIds.Contains(
@@ -536,92 +398,93 @@ public static class CorpusManifestValidator
                 Fail(CorpusManifestFailureCode.UnknownCatalogIdentifier);
             }
 
-            if (!actualCells.Add($"{cell.MarketId}\0{cell.ContractId}"))
-            {
-                Fail(CorpusManifestFailureCode.InvalidLaunchCellSet);
-            }
-
-            if (cell.CalibrationDocuments is null
-                || cell.HeldOutDocuments is null
-                || cell.HeldOutDocuments.Any(
-                    static document =>
-                        document is null
-                        || !Enum.IsDefined(document.InputKind)
-                        || !Enum.IsDefined(document.OutputDisposition))
-            )
-            {
-                Fail(CorpusManifestFailureCode.UnknownCatalogIdentifier);
-            }
-
             if (cell.HeldOutDocuments.Count(
                     static document =>
-                        document.InputKind == CorpusInputKind.ImagePdf) < 20
+                        document.InputKind == CorpusInputKind.ImagePdf)
+                < 20
                 || cell.HeldOutDocuments.Count(
                     static document =>
                         document.InputKind
-                        == CorpusInputKind.StandaloneRaster) < 20)
+                        == CorpusInputKind.StandaloneRaster)
+                < 20)
             {
                 Fail(CorpusManifestFailureCode.InsufficientHeldOutCoverage);
             }
 
             foreach (var document in cell.CalibrationDocuments)
             {
-                if (document is null)
+                if (document.LanguageId != cell.MarketId)
                 {
-                    Fail(CorpusManifestFailureCode.InvalidManifest);
+                    Fail(CorpusManifestFailureCode.DocumentLanguageMismatch);
                 }
 
-                ValidateDocument(
+                ValidateCommon(
                     document.StableDocumentId,
                     document.SourceFamilyId,
                     document.ContentSha256,
-                    document.LanguageId,
+                    document.SourceLocator,
                     document.LabelingSourceIds,
                     document.OwnerApproved,
                     labelingSourceIds,
                     hashes,
-                    stableDocumentIds);
-                calibrationFamilies.Add(document.SourceFamilyId);
+                    stableIds,
+                    locators);
+                if (!calibrationFamilies.Add(document.SourceFamilyId))
+                {
+                    Fail(CorpusManifestFailureCode.SourceFamilyLeakage);
+                }
             }
 
             foreach (var document in cell.HeldOutDocuments)
             {
-                ValidateDocument(
+                if (document.LanguageId != cell.MarketId)
+                {
+                    Fail(CorpusManifestFailureCode.DocumentLanguageMismatch);
+                }
+
+                if (!Enum.IsDefined(document.InputKind)
+                    || document.InputKind == CorpusInputKind.ImagePdf
+                        && document.CodecId is not null
+                    || document.InputKind == CorpusInputKind.StandaloneRaster
+                        && !LaunchCorpusCatalog.AdvertisedRasterCodecIds
+                            .Contains(
+                                document.CodecId!,
+                                StringComparer.Ordinal))
+                {
+                    Fail(CorpusManifestFailureCode.UnknownCatalogIdentifier);
+                }
+
+                ValidateCommon(
                     document.StableDocumentId,
                     document.SourceFamilyId,
                     document.ContentSha256,
-                    document.LanguageId,
+                    document.SourceLocator,
                     document.LabelingSourceIds,
                     document.OwnerApproved,
                     labelingSourceIds,
                     hashes,
-                    stableDocumentIds);
+                    stableIds,
+                    locators);
                 if (!heldOutFamilies.Add(document.SourceFamilyId))
                 {
                     Fail(CorpusManifestFailureCode.SourceFamilyLeakage);
                 }
 
-                if (document.InputKind == CorpusInputKind.StandaloneRaster
-                    && !LaunchCorpusCatalog.AdvertisedRasterCodecIds.Contains(
-                        document.CodecId,
-                        StringComparer.Ordinal))
+                if (document.ExpectedFields.Count == 0
+                    || document.ExpectedFields
+                        .Select(static field => field.FieldId)
+                        .Distinct(StringComparer.Ordinal)
+                        .Count() != document.ExpectedFields.Count
+                    || document.ExpectedFields.Any(
+                        static field =>
+                            !IsId(field.FieldId)
+                            || string.IsNullOrWhiteSpace(
+                                field.NormalizedValue)
+                            || !IsEvidenceValid(field.Evidence)))
                 {
-                    Fail(CorpusManifestFailureCode.UnknownCatalogIdentifier);
+                    Fail(CorpusManifestFailureCode.InvalidManifest);
                 }
-
-                if (document.InputKind == CorpusInputKind.ImagePdf
-                    && document.CodecId is not null)
-                {
-                    Fail(CorpusManifestFailureCode.UnknownCatalogIdentifier);
-                }
-
-                ValidateFields(document);
             }
-        }
-
-        if (!expectedCells.SetEquals(actualCells))
-        {
-            Fail(CorpusManifestFailureCode.InvalidLaunchCellSet);
         }
 
         if (calibrationFamilies.Overlaps(heldOutFamilies))
@@ -630,27 +493,24 @@ public static class CorpusManifestValidator
         }
     }
 
-    private static void ValidateDocument(
+    private static void ValidateCommon(
         string stableDocumentId,
         string sourceFamilyId,
         string contentSha256,
-        string languageId,
+        string sourceLocator,
         IReadOnlyList<string> sourceIds,
         bool ownerApproved,
-        IReadOnlySet<string> labelingSourceIds,
+        IReadOnlySet<string> knownSourceIds,
         ISet<string> hashes,
-        ISet<string> stableDocumentIds)
+        ISet<string> stableIds,
+        ISet<string> locators)
     {
-        if (!IsSafeOpaqueId(stableDocumentId)
-            || !IsSafeOpaqueId(sourceFamilyId)
-            || contentSha256 is null
-            || contentSha256.Length != 64
-            || !contentSha256.All(Uri.IsHexDigit))
-        {
-            Fail(CorpusManifestFailureCode.InvalidManifest);
-        }
-
-        if (!stableDocumentIds.Add(stableDocumentId))
+        if (!IsId(stableDocumentId)
+            || !IsId(sourceFamilyId)
+            || !IsSha256(contentSha256)
+            || !IsSafeRelativeLocator(sourceLocator)
+            || !stableIds.Add(stableDocumentId)
+            || !locators.Add(sourceLocator))
         {
             Fail(CorpusManifestFailureCode.InvalidManifest);
         }
@@ -660,127 +520,131 @@ public static class CorpusManifestValidator
             Fail(CorpusManifestFailureCode.DuplicateContentHash);
         }
 
-        if (!LaunchCorpusCatalog.LanguageIds.Contains(
-                languageId,
-                StringComparer.Ordinal))
-        {
-            Fail(CorpusManifestFailureCode.UnknownCatalogIdentifier);
-        }
-
-        if (!ownerApproved
-            || sourceIds is null
-            || sourceIds.Count == 0
-            || sourceIds.Any(sourceId => !labelingSourceIds.Contains(sourceId)))
+        if (!ownerApproved)
         {
             Fail(CorpusManifestFailureCode.OwnerApprovalRequired);
         }
+
+        if (sourceIds.Count == 0
+            || sourceIds.Distinct(StringComparer.Ordinal).Count()
+                != sourceIds.Count
+            || sourceIds.Any(id => !knownSourceIds.Contains(id)))
+        {
+            Fail(CorpusManifestFailureCode.InvalidLabelingSource);
+        }
     }
 
-    private static void ValidatePerturbations(
-        IReadOnlyList<string> codecs,
-        IReadOnlyList<CorpusCodecPerturbation> perturbations)
+    private static void ValidatePerturbations(CorpusManifest manifest)
     {
-        if (perturbations is null)
+        var expectedPairs = (
+            from codec in LaunchCorpusCatalog.AdvertisedRasterCodecIds
+            from kind in Enum.GetValues<CorpusPerturbationKind>()
+            select $"{codec}\u001f{kind}")
+            .ToHashSet(StringComparer.Ordinal);
+        var actualPairs = manifest.CodecPerturbations
+            .Select(static item => $"{item.CodecId}\u001f{item.Kind}")
+            .ToArray();
+        if (actualPairs.Length != 12
+            || actualPairs.Distinct(StringComparer.Ordinal).Count() != 12
+            || actualPairs.Any(pair => !expectedPairs.Contains(pair)))
         {
             Fail(CorpusManifestFailureCode.IncompleteCodecPerturbations);
         }
 
-        foreach (var codec in codecs)
+        var heldOut = manifest.Cells
+            .SelectMany(static cell => cell.HeldOutDocuments)
+            .ToDictionary(
+                static document => document.StableDocumentId,
+                StringComparer.Ordinal);
+        var used = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var perturbation in manifest.CodecPerturbations)
         {
-            foreach (var kind in Enum.GetValues<CorpusPerturbationKind>())
+            if (perturbation.BaselineDocumentId
+                    == perturbation.VariantDocumentId
+                || !heldOut.TryGetValue(
+                    perturbation.BaselineDocumentId,
+                    out var baseline)
+                || !heldOut.TryGetValue(
+                    perturbation.VariantDocumentId,
+                    out var variant)
+                || baseline.InputKind != CorpusInputKind.StandaloneRaster
+                || variant.InputKind != CorpusInputKind.StandaloneRaster
+                || baseline.CodecId != perturbation.CodecId
+                || variant.CodecId != perturbation.CodecId
+                || !used.Add(perturbation.BaselineDocumentId)
+                || !used.Add(perturbation.VariantDocumentId))
             {
-                var matches = perturbations.Where(
-                        perturbation =>
-                            perturbation.CodecId == codec
-                            && perturbation.Kind == kind)
-                    .ToArray();
-                if (matches.Length != 1
-                    || !IsSafeOpaqueId(matches[0].BaselineId)
-                    || !IsSafeOpaqueId(matches[0].VariantId)
-                    || matches[0].BaselineId == matches[0].VariantId)
-                {
-                    Fail(
-                        CorpusManifestFailureCode
-                            .IncompleteCodecPerturbations);
-                }
+                Fail(CorpusManifestFailureCode.InvalidCodecPerturbation);
             }
         }
     }
 
-    private static void ValidateFields(CorpusHeldOutDocument document)
-    {
-        if (document.ExpectedFields is null
-            || document.ExpectedFields.Count == 0
-            || document.ObservedFields is null)
-        {
-            Fail(CorpusManifestFailureCode.InvalidManifest);
-        }
+    private static bool SetEquals(
+        IReadOnlyList<string> actual,
+        IReadOnlyList<string> expected) =>
+        actual.Count == expected.Count
+        && actual.ToHashSet(StringComparer.Ordinal)
+            .SetEquals(expected);
 
-        var expectedIds = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var field in document.ExpectedFields)
-        {
-            if (field is null
-                || !IsSafeOpaqueId(field.FieldId)
-                || string.IsNullOrWhiteSpace(field.NormalizedValue)
-                || field.Evidence is null
-                || !IsValidEvidence(field.Evidence)
-                || !expectedIds.Add(field.FieldId))
-            {
-                Fail(CorpusManifestFailureCode.InvalidManifest);
-            }
-        }
-
-        foreach (var field in document.ObservedFields)
-        {
-            if (field is null
-                || !IsSafeOpaqueId(field.FieldId)
-                || field.NormalizedValue is null)
-            {
-                Fail(CorpusManifestFailureCode.InvalidManifest);
-            }
-        }
-    }
-
-    private static bool IsValidEvidence(CorpusEvidenceRectangle evidence) =>
+    private static bool IsEvidenceValid(CorpusEvidenceRectangle evidence) =>
         evidence.SourceIndex >= 0
         && double.IsFinite(evidence.X)
-        && double.IsFinite(evidence.Y)
-        && double.IsFinite(evidence.Width)
-        && double.IsFinite(evidence.Height)
         && evidence.X >= 0
+        && double.IsFinite(evidence.Y)
         && evidence.Y >= 0
+        && double.IsFinite(evidence.Width)
         && evidence.Width > 0
+        && double.IsFinite(evidence.Height)
         && evidence.Height > 0;
 
-    private static bool IsSafeToken(string? value) =>
-        IsSafeAsciiIdentifier(value, allowPlus: true);
-
-    private static bool IsSafeOpaqueId(string? value) =>
-        IsSafeAsciiIdentifier(value, allowPlus: false);
-
-    private static bool IsSafeAsciiIdentifier(
-        string? value,
-        bool allowPlus)
+    private static bool IsSafeRelativeLocator(string value)
     {
-        if (string.IsNullOrEmpty(value)
-            || value.Length > 128
-            || !char.IsAsciiLetterOrDigit(value[0]))
+        if (string.IsNullOrWhiteSpace(value)
+            || value.Length > 512
+            || Path.IsPathFullyQualified(value)
+            || value.Contains('\\')
+            || value.Split(
+                    '/',
+                    StringSplitOptions.RemoveEmptyEntries)
+                .Any(static segment => segment is "." or ".."))
         {
             return false;
         }
 
-        foreach (var character in value.AsSpan(1))
-        {
-            if (!char.IsAsciiLetterOrDigit(character)
-                && character is not ('.' or '_' or '-')
-                && (!allowPlus || character != '+'))
-            {
-                return false;
-            }
-        }
-
-        return true;
+        return value.All(
+            static character =>
+                char.IsAsciiLetterOrDigit(character)
+                || character is '.' or '_' or '-' or '/');
     }
+
+    private static bool IsPublicHttpsReference(string value) =>
+        Uri.TryCreate(value, UriKind.Absolute, out var uri)
+        && uri.Scheme == Uri.UriSchemeHttps
+        && !string.IsNullOrWhiteSpace(uri.Host)
+        && string.IsNullOrEmpty(uri.UserInfo);
+
+    private static bool IsId(string value) =>
+        !string.IsNullOrWhiteSpace(value)
+        && value.Length <= 128
+        && char.IsAsciiLetterOrDigit(value[0])
+        && value.All(
+            static character =>
+                char.IsAsciiLetterOrDigit(character)
+                || character is '.' or '_' or '-');
+
+    private static bool IsToken(string value) =>
+        !string.IsNullOrWhiteSpace(value)
+        && value.Length <= 128
+        && char.IsAsciiLetterOrDigit(value[0])
+        && value.All(
+            static character =>
+                char.IsAsciiLetterOrDigit(character)
+                || character is '.' or '_' or '-' or '+');
+
+    private static bool IsSha256(string value) =>
+        value is not null
+        && value.Length == 64
+        && value.All(Uri.IsHexDigit);
 
     [DoesNotReturn]
     private static void Fail(CorpusManifestFailureCode code) =>

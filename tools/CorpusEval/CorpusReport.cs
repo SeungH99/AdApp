@@ -40,6 +40,8 @@ public sealed record CorpusAggregateReport(
 public sealed record CorpusReport(
     string SchemaVersion,
     string? RunIdentityId,
+    bool Empirical,
+    bool EmpiricalGatePassed,
     IReadOnlyList<CorpusCellReport> Cells,
     CorpusAggregateReport Aggregate);
 
