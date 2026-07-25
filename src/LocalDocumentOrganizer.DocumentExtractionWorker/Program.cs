@@ -16,6 +16,7 @@ public static class Program
             [],
             TimeSpan.FromMilliseconds(
                 DocumentExtractionLimits.ExtractionTimeoutMilliseconds),
+            TimeProvider.System,
             CancellationToken.None);
 
     public static Task<int> RunAsync(
@@ -31,6 +32,23 @@ public static class Program
             adapters,
             TimeSpan.FromMilliseconds(
                 DocumentExtractionLimits.ExtractionTimeoutMilliseconds),
+            TimeProvider.System,
+            cancellationToken);
+
+    public static Task<int> RunAsync(
+        Stream input,
+        Stream output,
+        TextWriter error,
+        IEnumerable<IDocumentExtractionAdapter> adapters,
+        TimeSpan workerLifetime,
+        CancellationToken cancellationToken) =>
+        RunAsync(
+            input,
+            output,
+            error,
+            adapters,
+            workerLifetime,
+            TimeProvider.System,
             cancellationToken);
 
     public static async Task<int> RunAsync(
@@ -39,26 +57,43 @@ public static class Program
         TextWriter error,
         IEnumerable<IDocumentExtractionAdapter> adapters,
         TimeSpan workerLifetime,
+        TimeProvider timeProvider,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(input);
         ArgumentNullException.ThrowIfNull(output);
         ArgumentNullException.ThrowIfNull(error);
         ArgumentNullException.ThrowIfNull(adapters);
+        ArgumentNullException.ThrowIfNull(timeProvider);
+        if (workerLifetime <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(workerLifetime),
+                "The worker lifetime must be positive.");
+        }
 
-        using var deadline = new CancellationTokenSource(workerLifetime);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+        var terminalResponseReserve = GetTerminalResponseReserve(workerLifetime);
+        var operationLifetime = workerLifetime - terminalResponseReserve;
+        using var hardDeadline = new CancellationTokenSource(
+            workerLifetime,
+            timeProvider);
+        using var operationDeadline = new CancellationTokenSource(
+            operationLifetime,
+            timeProvider);
+        using var operationLinked = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
-            deadline.Token);
+            operationDeadline.Token);
 
         DocumentExtractionRequest request;
         try
         {
-            request = await FramedJsonTransport.ReadRequestAsync(input, linked.Token)
+            request = await FramedJsonTransport.ReadRequestAsync(
+                    input,
+                    operationLinked.Token)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (
-            deadline.IsCancellationRequested
+            operationDeadline.IsCancellationRequested
             && !cancellationToken.IsCancellationRequested)
         {
             error.WriteLine("worker:timeout");
@@ -84,24 +119,26 @@ public static class Program
             var processor = new DocumentExtractionProcessor(adapters);
             var response = await processor.ProcessAsync(
                     request,
-                    linked.Token,
+                    operationLinked.Token,
                     cancellationToken,
-                    deadline.Token)
+                    operationDeadline.Token)
                 .ConfigureAwait(false);
 
-            var responseWriteToken = linked.Token;
-            CancellationTokenSource? terminalResponseTimeout = null;
-            if (linked.IsCancellationRequested
-                && response.FailureCode is (
+            CancellationTokenSource? normalResponseLinked = null;
+            var responseWriteToken = hardDeadline.Token;
+            if (!operationLinked.IsCancellationRequested
+                || response.FailureCode is not (
                     DocumentExtractionFailureCode.ExtractionCancelled
                     or DocumentExtractionFailureCode.ExtractionTimedOut))
             {
-                terminalResponseTimeout =
-                    new CancellationTokenSource(TimeSpan.FromSeconds(1));
-                responseWriteToken = terminalResponseTimeout.Token;
+                normalResponseLinked =
+                    CancellationTokenSource.CreateLinkedTokenSource(
+                        cancellationToken,
+                        hardDeadline.Token);
+                responseWriteToken = normalResponseLinked.Token;
             }
 
-            using (terminalResponseTimeout)
+            using (normalResponseLinked)
             {
                 await FramedJsonTransport.WriteResponseAsync(
                         output,
@@ -113,7 +150,7 @@ public static class Program
             return 0;
         }
         catch (OperationCanceledException) when (
-            deadline.IsCancellationRequested
+            hardDeadline.IsCancellationRequested
             && !cancellationToken.IsCancellationRequested)
         {
             error.WriteLine("worker:timeout");
@@ -134,20 +171,35 @@ public static class Program
 
             try
             {
-                using var bestEffortTimeout =
-                    new CancellationTokenSource(TimeSpan.FromSeconds(1));
                 await FramedJsonTransport.WriteResponseAsync(
                         output,
                         response,
-                        bestEffortTimeout.Token)
+                        hardDeadline.Token)
                     .ConfigureAwait(false);
             }
             catch (Exception)
             {
-                // The exit code and fixed diagnostic remain the only reliable channel.
+                // The hard deadline and fixed diagnostic remain the reliable channels.
             }
 
             return 70;
         }
+    }
+
+    private static TimeSpan GetTerminalResponseReserve(TimeSpan workerLifetime)
+    {
+        var maximumReserve = TimeSpan.FromSeconds(1);
+        if (workerLifetime > maximumReserve)
+        {
+            return maximumReserve;
+        }
+
+        var reserveTicks = Math.Max(1, workerLifetime.Ticks / 5);
+        if (reserveTicks >= workerLifetime.Ticks)
+        {
+            reserveTicks = workerLifetime.Ticks / 2;
+        }
+
+        return TimeSpan.FromTicks(reserveTicks);
     }
 }
