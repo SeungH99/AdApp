@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Text.Json;
 
 namespace LocalDocumentOrganizer.Core.Documents;
@@ -7,6 +6,36 @@ public static class DocumentExtractionValidator
 {
     private const ExtractionCapability AllCapabilities =
         ExtractionCapability.EmbeddedText | ExtractionCapability.Ocr;
+
+    private static readonly string[] GrandfatheredLanguageTags =
+    [
+        "art-lojban",
+        "cel-gaulish",
+        "en-GB-oed",
+        "i-ami",
+        "i-bnn",
+        "i-default",
+        "i-enochian",
+        "i-hak",
+        "i-klingon",
+        "i-lux",
+        "i-mingo",
+        "i-navajo",
+        "i-pwn",
+        "i-tao",
+        "i-tay",
+        "i-tsu",
+        "no-bok",
+        "no-nyn",
+        "sgn-BE-FR",
+        "sgn-BE-NL",
+        "sgn-CH-DE",
+        "zh-guoyu",
+        "zh-hakka",
+        "zh-min",
+        "zh-min-nan",
+        "zh-xiang",
+    ];
 
     public static DocumentContractValidationResult ValidateRequest(
         DocumentExtractionRequest request)
@@ -201,26 +230,182 @@ public static class DocumentExtractionValidator
 
     private static bool IsValidLanguageTag(string? language)
     {
-        if (string.IsNullOrWhiteSpace(language)
-            || language.Length > 63
-            || language[0] == '-'
-            || language[^1] == '-'
-            || language.Contains("--", StringComparison.Ordinal)
-            || language.Any(character =>
-                character != '-' && !char.IsAsciiLetterOrDigit(character)))
+        if (string.IsNullOrEmpty(language))
         {
             return false;
         }
 
-        try
+        var subtags = language.Split('-');
+        if (GrandfatheredLanguageTags.Contains(language, StringComparer.Ordinal))
         {
-            _ = CultureInfo.GetCultureInfo(language);
             return true;
         }
-        catch (CultureNotFoundException)
+
+        if (subtags[0] == "x")
+        {
+            return ValidatePrivateUse(subtags, 1);
+        }
+
+        var index = 0;
+        if (IsLowerAsciiLetters(subtags[index], 2, 3))
+        {
+            index++;
+            for (var extlangCount = 0;
+                 extlangCount < 3
+                 && index < subtags.Length
+                 && IsLowerAsciiLetters(subtags[index], 3, 3);
+                 extlangCount++)
+            {
+                index++;
+            }
+        }
+        else if (IsLowerAsciiLetters(subtags[index], 4, 8))
+        {
+            index++;
+        }
+        else
         {
             return false;
         }
+
+        if (index < subtags.Length && subtags[index].Length == 4)
+        {
+            if (!IsNormalizedScript(subtags[index]))
+            {
+                return false;
+            }
+
+            index++;
+        }
+
+        if (index < subtags.Length
+            && (subtags[index].Length == 2 || subtags[index].Length == 3))
+        {
+            var region = subtags[index];
+            if (!IsUpperAsciiLetters(region, 2, 2)
+                && !IsAsciiDigits(region, 3, 3))
+            {
+                return false;
+            }
+
+            index++;
+        }
+
+        var variants = new HashSet<string>(StringComparer.Ordinal);
+        while (index < subtags.Length && IsNormalizedVariant(subtags[index]))
+        {
+            if (!variants.Add(subtags[index]))
+            {
+                return false;
+            }
+
+            index++;
+        }
+
+        var extensionSingletons = new HashSet<char>();
+        while (index < subtags.Length && IsNormalizedExtensionSingleton(subtags[index]))
+        {
+            if (!extensionSingletons.Add(subtags[index][0]))
+            {
+                return false;
+            }
+
+            index++;
+            var extensionStart = index;
+            while (index < subtags.Length
+                   && IsLowerAsciiAlphanumeric(subtags[index], 2, 8))
+            {
+                index++;
+            }
+
+            if (index == extensionStart)
+            {
+                return false;
+            }
+        }
+
+        if (index < subtags.Length && subtags[index] == "x")
+        {
+            return ValidatePrivateUse(subtags, index + 1);
+        }
+
+        return index == subtags.Length;
+    }
+
+    private static bool ValidatePrivateUse(string[] subtags, int startIndex)
+    {
+        if (startIndex >= subtags.Length)
+        {
+            return false;
+        }
+
+        for (var index = startIndex; index < subtags.Length; index++)
+        {
+            if (!IsLowerAsciiAlphanumeric(subtags[index], 1, 8))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsNormalizedScript(string subtag) =>
+        subtag.Length == 4
+        && char.IsAsciiLetterUpper(subtag[0])
+        && subtag.AsSpan(1).IndexOfAnyExceptInRange('a', 'z') < 0;
+
+    private static bool IsNormalizedVariant(string subtag) =>
+        IsLowerAsciiAlphanumeric(subtag, 5, 8)
+        || (subtag.Length == 4
+            && char.IsAsciiDigit(subtag[0])
+            && IsLowerAsciiAlphanumeric(subtag.AsSpan(1), 3, 3));
+
+    private static bool IsNormalizedExtensionSingleton(string subtag) =>
+        subtag.Length == 1
+        && subtag[0] != 'x'
+        && (char.IsAsciiDigit(subtag[0]) || char.IsAsciiLetterLower(subtag[0]));
+
+    private static bool IsLowerAsciiLetters(string value, int minimum, int maximum) =>
+        value.Length >= minimum
+        && value.Length <= maximum
+        && value.AsSpan().IndexOfAnyExceptInRange('a', 'z') < 0;
+
+    private static bool IsUpperAsciiLetters(string value, int minimum, int maximum) =>
+        value.Length >= minimum
+        && value.Length <= maximum
+        && value.AsSpan().IndexOfAnyExceptInRange('A', 'Z') < 0;
+
+    private static bool IsAsciiDigits(string value, int minimum, int maximum) =>
+        value.Length >= minimum
+        && value.Length <= maximum
+        && value.AsSpan().IndexOfAnyExceptInRange('0', '9') < 0;
+
+    private static bool IsLowerAsciiAlphanumeric(
+        string value,
+        int minimum,
+        int maximum) =>
+        IsLowerAsciiAlphanumeric(value.AsSpan(), minimum, maximum);
+
+    private static bool IsLowerAsciiAlphanumeric(
+        ReadOnlySpan<char> value,
+        int minimum,
+        int maximum)
+    {
+        if (value.Length < minimum || value.Length > maximum)
+        {
+            return false;
+        }
+
+        foreach (var character in value)
+        {
+            if (!char.IsAsciiDigit(character) && !char.IsAsciiLetterLower(character))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool IsValidRuntimeMetadata(
@@ -269,6 +454,7 @@ public static class DocumentExtractionValidator
                 || sourcePage.CoordinateSystem != expectedCoordinateSystem
                 || !IsFinitePositive(sourcePage.Width)
                 || !IsFinitePositive(sourcePage.Height)
+                || ExceedsRasterLimits(sourcePage, containerKind)
                 || !indexedPages.TryAdd(sourcePage.SourceIndex, sourcePage))
             {
                 return Invalid(DocumentExtractionFailureCode.InvalidSourceMetadata);
@@ -277,6 +463,15 @@ public static class DocumentExtractionValidator
 
         return new DocumentContractValidationResult(true, DocumentExtractionFailureCode.None);
     }
+
+    private static bool ExceedsRasterLimits(
+        DocumentSourcePage sourcePage,
+        DocumentContainerKind containerKind) =>
+        containerKind == DocumentContainerKind.RasterImage
+        && (sourcePage.Width > DocumentExtractionLimits.MaxRasterDimensionPixels
+            || sourcePage.Height > DocumentExtractionLimits.MaxRasterDimensionPixels
+            || sourcePage.Width
+                > DocumentExtractionLimits.MaxDecodedPixels / sourcePage.Height);
 
     private static DocumentContractValidationResult ValidateFragment(
         TextFragment? fragment,
