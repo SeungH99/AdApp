@@ -592,8 +592,11 @@ public static class ReviewHost
     private static void MapUnsupportedApiMethods(
         WebApplication application)
     {
-        string[] unsupportedMethods =
+        string[] apiMethods =
         [
+            HttpMethods.Get,
+            HttpMethods.Post,
+            HttpMethods.Head,
             HttpMethods.Put,
             HttpMethods.Delete,
             HttpMethods.Patch,
@@ -601,13 +604,20 @@ public static class ReviewHost
             HttpMethods.Trace,
             HttpMethods.Connect,
         ];
-        foreach (var route in new[]
+        foreach (var (route, supportedMethods) in new[]
                  {
-                     "/api/review/next",
-                     "/api/documents/{id}/pages/{index}.png",
-                     "/api/documents/{id}/decisions",
+                     ("/api/review/next", new[] { HttpMethods.Get }),
+                     (
+                         "/api/documents/{id}/pages/{index}.png",
+                         new[] { HttpMethods.Get }),
+                     (
+                         "/api/documents/{id}/decisions",
+                         new[] { HttpMethods.Post }),
                  })
         {
+            var unsupportedMethods = apiMethods
+                .Except(supportedMethods, StringComparer.Ordinal)
+                .ToArray();
             application.MapMethods(
                     route,
                     unsupportedMethods,
