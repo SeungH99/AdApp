@@ -60,8 +60,12 @@ public sealed class WorkbenchException : Exception
 {
     public WorkbenchException(
         WorkbenchFailureCode failureCode,
-        Exception? innerException = null)
-        : base($"Corpus workbench failed: {failureCode}.", innerException) =>
+        Exception? innerException = null,
+        string? detail = null)
+        : base(
+            $"Corpus workbench failed: {failureCode}."
+            + (string.IsNullOrEmpty(detail) ? string.Empty : $" {detail}"),
+            innerException) =>
         FailureCode = failureCode;
 
     public WorkbenchFailureCode FailureCode { get; }
@@ -74,6 +78,19 @@ public sealed record PilotScope(
     ImmutableArray<string> MarketIds,
     int HeldOutTargetPerMarket,
     int DirectReviewTargetPerMarket);
+
+public sealed record ReviewCandidate(
+    string DocumentId,
+    string ContentSha256,
+    string SourceFamilyId,
+    string InputKind,
+    ImmutableArray<string> EdgeCaseTags);
+
+public sealed record ReviewSample(
+    ImmutableArray<string> DocumentIds,
+    ImmutableDictionary<string, int> InputKindCounts,
+    int SourceFamilyCount,
+    ImmutableArray<string> CoveredEdgeCaseTags);
 
 public sealed record EvidenceBox(
     int SourceIndex,
