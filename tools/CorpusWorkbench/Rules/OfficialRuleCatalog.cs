@@ -31,6 +31,9 @@ public static class OfficialRuleCatalog
 
 internal static class OfficialRuleCatalogValidator
 {
+    private const string ExplicitPaymentDeadlineNormalization =
+        "explicit-visibly-printed-calendar-date-labeled-payment-deadline-no-relative-payment-terms-derivation-v1";
+
     private static readonly FrozenSet<string> OfficialHosts =
         new[]
         {
@@ -102,8 +105,10 @@ internal static class OfficialRuleCatalogValidator
         }
 
         var dueDateRule = document.Rules.Single(static rule => rule.FieldId == "payment_due_date");
-        if (!dueDateRule.Normalization.Contains("explicitly visible calendar date", StringComparison.Ordinal) ||
-            !dueDateRule.Normalization.Contains("never derive", StringComparison.Ordinal))
+        if (!string.Equals(
+                dueDateRule.Normalization,
+                ExplicitPaymentDeadlineNormalization,
+                StringComparison.Ordinal))
         {
             throw InvalidState();
         }

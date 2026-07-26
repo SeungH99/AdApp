@@ -57,7 +57,7 @@
     {
       "ruleId": "ko-payment-due-date",
       "fieldId": "payment_due_date",
-      "normalization": "Accept only an explicitly visible calendar date labeled as a payment deadline; never derive a date from relative payment terms.",
+      "normalization": "explicit-visibly-printed-calendar-date-labeled-payment-deadline-no-relative-payment-terms-derivation-v1",
       "acceptedVisibleLabels": ["\uc9c0\uae09\uae30\uc77c", "\uacb0\uc81c\uae30\ud55c", "\ub0a9\ubd80\uae30\ud55c"],
       "sourceIds": ["vat-act-enforcement-decree", "rfc-3339"]
     },

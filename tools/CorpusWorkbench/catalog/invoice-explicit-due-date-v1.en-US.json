@@ -57,7 +57,7 @@
     {
       "ruleId": "us-payment-due-date",
       "fieldId": "payment_due_date",
-      "normalization": "Accept only an explicitly visible calendar date labeled as a payment deadline; never derive a date from relative payment terms. FAR-derived deadlines are outside this contract.",
+      "normalization": "explicit-visibly-printed-calendar-date-labeled-payment-deadline-no-relative-payment-terms-derivation-v1",
       "acceptedVisibleLabels": ["Payment Due Date", "Due Date", "Pay By"],
       "sourceIds": ["far-52-232-25", "rfc-3339"]
     },
