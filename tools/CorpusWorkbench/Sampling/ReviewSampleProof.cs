@@ -10,7 +10,10 @@ public sealed record ReviewSampleProof(
     string CatalogEpoch,
     string ContractId,
     string MarketId,
+    string RuleCatalogSha256,
     ImmutableArray<ReviewCandidate> Candidates,
+    ImmutableDictionary<string, string>
+        CandidateRevisionSha256ByDocument,
     ImmutableArray<string> OrderedDocumentIds,
     ImmutableDictionary<string, int> InputKindCounts,
     int SourceFamilyCount,
@@ -21,8 +24,13 @@ public sealed record ReviewSampleProof(
     public static ReviewSampleProof Create(
         PilotScope scope,
         string marketId,
-        IReadOnlyList<ReviewCandidate> candidates)
+        string ruleCatalogSha256,
+        IReadOnlyList<ReviewCandidate> candidates,
+        IReadOnlyDictionary<string, string>
+            candidateRevisionSha256ByDocument)
     {
+        ArgumentNullException.ThrowIfNull(
+            candidateRevisionSha256ByDocument);
         var sample = ReviewSampleSelector.Select(
             scope,
             marketId,
@@ -37,7 +45,11 @@ public sealed record ReviewSampleProof(
             scope.CatalogEpoch,
             scope.ContractId,
             marketId,
+            ruleCatalogSha256,
             canonicalCandidates,
+            candidateRevisionSha256ByDocument
+                .ToImmutableDictionary(
+                    StringComparer.Ordinal),
             sample.DocumentIds,
             sample.InputKindCounts,
             sample.SourceFamilyCount,
@@ -52,10 +64,15 @@ public sealed record ReviewSampleProof(
 
     public ReviewSample Validate(
         PilotScope scope,
-        IReadOnlyList<ReviewCandidate> candidates)
+        string ruleCatalogSha256,
+        IReadOnlyList<ReviewCandidate> candidates,
+        IReadOnlyDictionary<string, string>
+            candidateRevisionSha256ByDocument)
     {
         ArgumentNullException.ThrowIfNull(scope);
         ArgumentNullException.ThrowIfNull(candidates);
+        ArgumentNullException.ThrowIfNull(
+            candidateRevisionSha256ByDocument);
         ValidateCanonical();
         if (!string.Equals(
                 SchemaVersion,
@@ -72,6 +89,10 @@ public sealed record ReviewSampleProof(
             || !scope.MarketIds.Contains(
                 MarketId,
                 StringComparer.Ordinal)
+            || !IsLowerSha256(ruleCatalogSha256)
+            || !FixedEquals(
+                RuleCatalogSha256,
+                ruleCatalogSha256)
             || !CandidatesEqual(
                 Candidates,
                 candidates
@@ -81,7 +102,10 @@ public sealed record ReviewSampleProof(
                     .ToArray())
             || !FixedEquals(
                 CandidateSetSha256,
-                HashCandidates(candidates)))
+                HashCandidates(candidates))
+            || !RevisionHashesEqual(
+                CandidateRevisionSha256ByDocument,
+                candidateRevisionSha256ByDocument))
         {
             throw InvalidState();
         }
@@ -119,6 +143,7 @@ public sealed record ReviewSampleProof(
             || !PilotCatalog.MarketIds.Contains(
                 MarketId,
                 StringComparer.Ordinal)
+            || !IsLowerSha256(RuleCatalogSha256)
             || Candidates.IsDefaultOrEmpty
             || !CandidatesEqual(
                 Candidates,
@@ -127,6 +152,14 @@ public sealed record ReviewSampleProof(
                         static candidate => candidate.DocumentId,
                         StringComparer.Ordinal)
                     .ToArray())
+            || CandidateRevisionSha256ByDocument is null
+            || CandidateRevisionSha256ByDocument.Count
+                != Candidates.Length
+            || Candidates.Any(candidate =>
+                !CandidateRevisionSha256ByDocument.TryGetValue(
+                    candidate.DocumentId,
+                    out var revisionSha256)
+                || !IsLowerSha256(revisionSha256))
             || OrderedDocumentIds.IsDefault
             || OrderedDocumentIds.Length
                 != PilotCatalog.DirectReviewTargetPerMarket
@@ -188,6 +221,8 @@ public sealed record ReviewSampleProof(
             proof.CatalogEpoch,
             proof.ContractId,
             proof.MarketId,
+            proof.RuleCatalogSha256,
+            proof.CandidateRevisionSha256ByDocument,
             proof.OrderedDocumentIds,
             proof.InputKindCounts,
             proof.SourceFamilyCount,
@@ -262,6 +297,28 @@ public sealed record ReviewSampleProof(
         return true;
     }
 
+    private static bool RevisionHashesEqual(
+        IReadOnlyDictionary<string, string> left,
+        IReadOnlyDictionary<string, string> right)
+    {
+        if (left.Count != right.Count)
+        {
+            return false;
+        }
+
+        foreach (var pair in left)
+        {
+            if (!right.TryGetValue(pair.Key, out var value)
+                || !IsLowerSha256(value)
+                || !FixedEquals(pair.Value, value))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private static WorkbenchException InvalidState() =>
         new(WorkbenchFailureCode.InvalidCheckpoint);
 }
@@ -271,6 +328,9 @@ public sealed record ReviewSampleProofPayload(
     string CatalogEpoch,
     string ContractId,
     string MarketId,
+    string RuleCatalogSha256,
+    ImmutableDictionary<string, string>
+        CandidateRevisionSha256ByDocument,
     ImmutableArray<string> OrderedDocumentIds,
     ImmutableDictionary<string, int> InputKindCounts,
     int SourceFamilyCount,

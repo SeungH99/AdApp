@@ -142,6 +142,35 @@ public static class ReviewHost
     private const string PermissionsPolicy =
         "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), web-share=()";
 
+    public static Task PrepareReviewSamplesAsync(
+        ReviewHostOptions options,
+        IReadOnlyDictionary<
+            string,
+            IReadOnlyList<ReviewCandidate>> candidatesByMarket,
+        CancellationToken cancellationToken) =>
+        PrepareReviewSamplesAsync(
+            options,
+            candidatesByMarket,
+            cancellationToken,
+            workerPackageRoot: null);
+
+    internal static async Task PrepareReviewSamplesAsync(
+        ReviewHostOptions options,
+        IReadOnlyDictionary<
+            string,
+            IReadOnlyList<ReviewCandidate>> candidatesByMarket,
+        CancellationToken cancellationToken,
+        string? workerPackageRoot)
+    {
+        await using var dataSource =
+            await CorpusReviewDataSource.ComposeAsync(
+                    options,
+                    candidatesByMarket,
+                    cancellationToken,
+                    workerPackageRoot: workerPackageRoot)
+                .ConfigureAwait(false);
+    }
+
     public static async Task RunAsync(
         ReviewHostOptions options,
         CancellationToken cancellationToken)
@@ -487,6 +516,7 @@ public static class ReviewHost
                     }
                 })
                 .WithMetadata(ReviewApiPolicy.Mutating);
+            MapUnsupportedApiMethods(application);
 
             await application.StartAsync(cancellationToken)
                 .ConfigureAwait(false);
@@ -557,6 +587,38 @@ public static class ReviewHost
             "/preview-request-state.js",
             "preview-request-state.js",
             "text/javascript; charset=utf-8");
+    }
+
+    private static void MapUnsupportedApiMethods(
+        WebApplication application)
+    {
+        string[] unsupportedMethods =
+        [
+            HttpMethods.Put,
+            HttpMethods.Delete,
+            HttpMethods.Patch,
+            HttpMethods.Options,
+            HttpMethods.Trace,
+            HttpMethods.Connect,
+        ];
+        foreach (var route in new[]
+                 {
+                     "/api/review/next",
+                     "/api/documents/{id}/pages/{index}.png",
+                     "/api/documents/{id}/decisions",
+                 })
+        {
+            application.MapMethods(
+                    route,
+                    unsupportedMethods,
+                    static context =>
+                    {
+                        context.Response.StatusCode =
+                            StatusCodes.Status405MethodNotAllowed;
+                        return Task.CompletedTask;
+                    })
+                .WithMetadata(ReviewApiPolicy.ReadOnly);
+        }
     }
 
     private static void MapStaticAsset(
@@ -958,7 +1020,8 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
     internal static async Task<CorpusReviewDataSource> OpenAsync(
         ReviewHostOptions options,
         CancellationToken cancellationToken,
-        Action<ReviewDecisionFaultPoint>? injectFault = null)
+        Action<ReviewDecisionFaultPoint>? injectFault = null,
+        string? workerPackageRoot = null)
     {
         var vault = CorpusVault.OpenExisting(options.VaultRoot);
         try
@@ -986,21 +1049,18 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
                     WorkbenchFailureCode.WorkerAttestationMismatch);
             }
 
-            var scope = new PilotScope(
-                PilotCatalog.SchemaVersion,
-                CatalogEpoch,
-                PilotCatalog.ContractId,
-                PilotCatalog.MarketIds,
-                PilotCatalog.HeldOutTargetPerMarket,
-                PilotCatalog.DirectReviewTargetPerMarket);
+            var scope = CreateScope();
             var sampleIdsByMarket = await LoadAndValidateSamplesAsync(
                     vault,
                     scope,
                     states,
+                    rules,
                     cancellationToken)
                 .ConfigureAwait(false);
             var packageRoot = Path.TrimEndingDirectorySeparator(
-                Path.GetFullPath(AppContext.BaseDirectory));
+                Path.GetFullPath(
+                    workerPackageRoot
+                    ?? AppContext.BaseDirectory));
             var executablePath = Path.GetFullPath(
                 Path.Combine(
                     packageRoot,
@@ -1070,6 +1130,158 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
             await vault.DisposeAsync().ConfigureAwait(false);
             throw;
         }
+    }
+
+    internal static async Task<CorpusReviewDataSource> ComposeAsync(
+        ReviewHostOptions options,
+        IReadOnlyDictionary<
+            string,
+            IReadOnlyList<ReviewCandidate>> candidatesByMarket,
+        CancellationToken cancellationToken,
+        Action<ReviewDecisionFaultPoint>? injectFault = null,
+        string? workerPackageRoot = null)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(candidatesByMarket);
+        var vault = CorpusVault.OpenExisting(options.VaultRoot);
+        try
+        {
+            var rules = await LoadRulesAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var states = await vault.Store.LoadAllLabelStatesAsync(
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (candidatesByMarket.Count
+                    != PilotCatalog.MarketIds.Length
+                || candidatesByMarket.Keys.Any(market =>
+                    !PilotCatalog.MarketIds.Contains(
+                        market,
+                        StringComparer.Ordinal)))
+            {
+                throw new WorkbenchException(
+                    WorkbenchFailureCode.InvalidArguments);
+            }
+
+            var scope = CreateScope();
+            var proofs = new List<ReviewSampleProof>(
+                PilotCatalog.MarketIds.Length);
+            foreach (var marketId in PilotCatalog.MarketIds)
+            {
+                if (!candidatesByMarket.TryGetValue(
+                        marketId,
+                        out var candidates)
+                    || candidates is null)
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.InvalidArguments);
+                }
+
+                var statesById = states
+                    .Where(state =>
+                        state.PreviousRevision is not null
+                        && string.Equals(
+                            state.Document.MarketId,
+                            marketId,
+                            StringComparison.Ordinal))
+                    .ToDictionary(
+                        static state => state.Document.DocumentId,
+                        StringComparer.Ordinal);
+                if (statesById.Count != candidates.Count)
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.InvalidCheckpoint);
+                }
+
+                var revisionHashes =
+                    ImmutableDictionary.CreateBuilder<
+                        string,
+                        string>(StringComparer.Ordinal);
+                foreach (var candidate in candidates)
+                {
+                    if (!statesById.TryGetValue(
+                            candidate.DocumentId,
+                            out var state)
+                        || !string.Equals(
+                            candidate.ContentSha256,
+                            state.Document.ContentSha256,
+                            StringComparison.Ordinal)
+                        || !string.Equals(
+                            candidate.SourceFamilyId,
+                            state.Document.SourceFamilyId,
+                            StringComparison.Ordinal)
+                        || !string.Equals(
+                            candidate.InputKind,
+                            state.Document.InputKind,
+                            StringComparison.Ordinal))
+                    {
+                        throw new WorkbenchException(
+                            WorkbenchFailureCode.InvalidCheckpoint);
+                    }
+
+                    var revision = state.PreviousRevision!;
+                    if (!FixedHashEquals(
+                            revision.RuleCatalogSha256,
+                            rules[marketId].CatalogSha256))
+                    {
+                        throw new WorkbenchException(
+                            WorkbenchFailureCode.InvalidCheckpoint);
+                    }
+
+                    revisionHashes.Add(
+                        candidate.DocumentId,
+                        revision.RevisionSha256);
+                }
+
+                var proof = ReviewSampleProof.Create(
+                    scope,
+                    marketId,
+                    rules[marketId].CatalogSha256,
+                    candidates,
+                    revisionHashes.ToImmutable());
+                _ = proof.Validate(
+                    scope,
+                    rules[marketId].CatalogSha256,
+                    candidates,
+                    revisionHashes.ToImmutable());
+                proofs.Add(proof);
+            }
+
+            foreach (var proof in proofs)
+            {
+                await vault.Store.SaveReviewSampleProofAsync(
+                        proof,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            await vault.DisposeAsync().ConfigureAwait(false);
+        }
+
+        return await OpenAsync(
+                options,
+                cancellationToken,
+                injectFault,
+                workerPackageRoot)
+            .ConfigureAwait(false);
+    }
+
+    internal ImmutableArray<string>
+        GetReviewSampleDocumentIds(string marketId)
+    {
+        if (!PilotCatalog.MarketIds.Contains(
+                marketId,
+                StringComparer.Ordinal)
+            || !_sampleIdsByMarket.TryGetValue(
+                marketId,
+                out var documentIds))
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.InvalidArguments);
+        }
+
+        return documentIds;
     }
 
     public async Task<ReviewItemView?> GetNextAsync(
@@ -1571,7 +1783,7 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
             cancellationToken);
     }
 
-    private static async Task<ImmutableDictionary<
+    internal static async Task<ImmutableDictionary<
         string,
         OfficialRuleCatalogSnapshot>> LoadRulesAsync(
         CancellationToken cancellationToken)
@@ -1604,6 +1816,9 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
         CorpusVault vault,
         PilotScope scope,
         IReadOnlyList<LabelDraftState> states,
+        IReadOnlyDictionary<
+            string,
+            OfficialRuleCatalogSnapshot> rules,
         CancellationToken cancellationToken)
     {
         var result = ImmutableDictionary.CreateBuilder<
@@ -1640,6 +1855,10 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
             var currentCandidates = ImmutableArray
                 .CreateBuilder<ReviewCandidate>(
                     marketStates.Length);
+            var revisionHashes =
+                ImmutableDictionary.CreateBuilder<
+                    string,
+                    string>(StringComparer.Ordinal);
             foreach (var state in marketStates)
             {
                 if (!candidatesById.TryGetValue(
@@ -1659,16 +1878,86 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
                             state.Document.SourceFamilyId,
                         InputKind = state.Document.InputKind,
                     });
+                var revision = state.PreviousRevision!;
+                if (!FixedHashEquals(
+                        revision.RuleCatalogSha256,
+                        rules[marketId].CatalogSha256))
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.InvalidCheckpoint);
+                }
+
+                if (!proof
+                        .CandidateRevisionSha256ByDocument
+                        .TryGetValue(
+                            state.Document.DocumentId,
+                            out var selectedRevisionSha256))
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.InvalidCheckpoint);
+                }
+
+                if (!FixedHashEquals(
+                        revision.RevisionSha256,
+                        selectedRevisionSha256))
+                {
+                    var checkpoint = await vault.Store
+                        .LoadReviewDecisionCheckpointAsync(
+                            selectedRevisionSha256,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    if (checkpoint is null
+                        || checkpoint.Decision
+                            != ReviewDecisionKind
+                                .CorrectAndApprove
+                        || !string.Equals(
+                            revision.PreviousRevisionSha256,
+                            selectedRevisionSha256,
+                            StringComparison.Ordinal)
+                        || !FixedHashEquals(
+                            checkpoint.RequestSha256,
+                            DecisionHash(
+                                state.Document.DocumentId,
+                                new ReviewDecisionRequest(
+                                    selectedRevisionSha256,
+                                    ReviewDecisionKind
+                                        .CorrectAndApprove,
+                                    revision.Fields)))
+                        || checkpoint.Completed
+                            && !FixedHashEquals(
+                                checkpoint
+                                    .OutcomeRevisionSha256,
+                                revision.RevisionSha256))
+                    {
+                        throw new WorkbenchException(
+                            WorkbenchFailureCode.InvalidCheckpoint);
+                    }
+                }
+
+                revisionHashes.Add(
+                    state.Document.DocumentId,
+                    selectedRevisionSha256);
             }
 
             var sample = proof.Validate(
                 scope,
-                currentCandidates.MoveToImmutable());
+                rules[marketId].CatalogSha256,
+                currentCandidates.MoveToImmutable(),
+                revisionHashes.ToImmutable());
             result.Add(marketId, sample.DocumentIds);
         }
 
         return result.ToImmutable();
     }
+
+    private static PilotScope CreateScope() =>
+        new(
+            PilotCatalog.SchemaVersion,
+            CatalogEpoch,
+            PilotCatalog.ContractId,
+            PilotCatalog.MarketIds,
+            PilotCatalog.HeldOutTargetPerMarket,
+            PilotCatalog.DirectReviewTargetPerMarket);
 
     private static CorpusWorkerPackageIdentity IdentityFrom(
         LabelRevision revision) =>

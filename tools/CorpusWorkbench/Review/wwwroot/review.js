@@ -83,30 +83,21 @@ function renderFields(item) {
   }
 }
 
-function renderEvidence(item, page) {
-  elements.evidence.replaceChildren();
-  if (!item || !elements.preview.naturalWidth || !elements.preview.naturalHeight) {
-    return;
-  }
-
+function createEvidencePresentation(item, page, naturalWidth, naturalHeight) {
   const boxes = item.fields.flatMap((field) =>
     field.evidence
       .filter((box) => box.sourceIndex === page)
       .map((box) => ({ ...box, fieldId: field.fieldId })),
   );
   const widthExtent = Math.max(
-    elements.preview.naturalWidth,
+    naturalWidth,
     ...boxes.map((box) => box.x + box.width),
   );
   const heightExtent = Math.max(
-    elements.preview.naturalHeight,
+    naturalHeight,
     ...boxes.map((box) => box.y + box.height),
   );
-  elements.evidence.setAttribute(
-    "viewBox",
-    `0 0 ${widthExtent} ${heightExtent}`,
-  );
-  elements.evidence.setAttribute("preserveAspectRatio", "none");
+  const overlays = [];
   for (const box of boxes) {
     const overlay = document.createElementNS(
       "http://www.w3.org/2000/svg",
@@ -117,8 +108,13 @@ function renderEvidence(item, page) {
     overlay.setAttribute("y", box.y);
     overlay.setAttribute("width", box.width);
     overlay.setAttribute("height", box.height);
-    elements.evidence.append(overlay);
+    overlays.push(overlay);
   }
+
+  return {
+    viewBox: `0 0 ${widthExtent} ${heightExtent}`,
+    overlays,
+  };
 }
 
 async function loadPreview() {
@@ -131,6 +127,8 @@ async function loadPreview() {
   const context = previewRequestState.begin(item, page);
   elements.previousPage.disabled = true;
   elements.nextPage.disabled = true;
+  let nextUrl = null;
+  let committed = false;
   try {
     const response = await api(
       `/api/documents/${encodeURIComponent(item.documentId)}/pages/${page}.png`,
@@ -145,30 +143,40 @@ async function loadPreview() {
       return;
     }
 
-    const nextUrl = URL.createObjectURL(blob);
-    if (previewUrl) {
-      URL.revokeObjectURL(previewUrl);
+    nextUrl = URL.createObjectURL(blob);
+    const decoded = new Image();
+    decoded.src = nextUrl;
+    await decoded.decode();
+    const evidence = createEvidencePresentation(
+      item,
+      page,
+      decoded.naturalWidth,
+      decoded.naturalHeight,
+    );
+    if (!previewRequestState.isCurrent(context, currentItem, currentPage)) {
+      return;
     }
-    previewUrl = nextUrl;
-    elements.preview.onload = () => {
-      if (
-        previewUrl === nextUrl
-        && previewRequestState.isCurrent(
-          context,
-          currentItem,
-          currentPage,
-        )
-      ) {
-        renderEvidence(item, page);
-      }
-    };
+
+    const previousUrl = previewUrl;
+    elements.preview.onload = null;
     elements.preview.src = nextUrl;
     elements.pageLabel.textContent = `Page ${page + 1} of ${item.pageCount}`;
+    elements.evidence.setAttribute("viewBox", evidence.viewBox);
+    elements.evidence.setAttribute("preserveAspectRatio", "none");
+    elements.evidence.replaceChildren(...evidence.overlays);
+    previewUrl = nextUrl;
+    committed = true;
+    if (previousUrl) {
+      URL.revokeObjectURL(previousUrl);
+    }
   } catch (error) {
     if (error?.name !== "AbortError") {
       throw error;
     }
   } finally {
+    if (nextUrl && !committed) {
+      URL.revokeObjectURL(nextUrl);
+    }
     if (previewRequestState.isCurrent(context, currentItem, currentPage)) {
       elements.previousPage.disabled = page === 0;
       elements.nextPage.disabled = page + 1 >= item.pageCount;
@@ -176,8 +184,21 @@ async function loadPreview() {
   }
 }
 
+function clearPreviewPresentation() {
+  elements.preview.onload = null;
+  elements.preview.removeAttribute("src");
+  elements.pageLabel.textContent = "";
+  elements.evidence.removeAttribute("viewBox");
+  elements.evidence.replaceChildren();
+  if (previewUrl) {
+    URL.revokeObjectURL(previewUrl);
+    previewUrl = null;
+  }
+}
+
 function renderItem(item) {
   previewRequestState.cancel();
+  clearPreviewPresentation();
   currentItem = item;
   currentPage = 0;
   elements.market.textContent = item.market;
@@ -195,6 +216,7 @@ async function loadNext(stale = false) {
   const response = await api("/api/review/next");
   if (response.status === 204) {
     previewRequestState.cancel();
+    clearPreviewPresentation();
     currentItem = null;
     elements.workspace.hidden = true;
     elements.progress.textContent = "No pending review items";

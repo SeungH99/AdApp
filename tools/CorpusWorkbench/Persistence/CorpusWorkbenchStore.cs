@@ -523,7 +523,46 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         return ExecuteApprovalWriteAsync(
             async (connection, transaction) =>
             {
-                if (checkpoint.Decision != ReviewDecisionKind.Defer)
+                if (checkpoint.Decision == ReviewDecisionKind.Defer)
+                {
+                    await using var readTerminal =
+                        connection.CreateCommand();
+                    readTerminal.Transaction = transaction;
+                    readTerminal.CommandText = """
+                        SELECT
+                          checkpoint_id,
+                          scope_sha256,
+                          canonical_json
+                        FROM checkpoints
+                        WHERE checkpoint_id=$checkpoint_id;
+                        """;
+                    readTerminal.Parameters.AddWithValue(
+                        "$checkpoint_id",
+                        ReviewCheckpointId(
+                            checkpoint.ExpectedRevisionSha256,
+                            isSchedule: false));
+                    await using var terminalReader =
+                        await readTerminal.ExecuteReaderAsync(
+                                CancellationToken.None)
+                            .ConfigureAwait(false);
+                    if (await terminalReader.ReadAsync(
+                                CancellationToken.None)
+                            .ConfigureAwait(false))
+                    {
+                        var terminal =
+                            ReadReviewDecisionCheckpoint(
+                                terminalReader);
+                        if (await terminalReader.ReadAsync(
+                                    CancellationToken.None)
+                                .ConfigureAwait(false))
+                        {
+                            throw InvalidState();
+                        }
+
+                        return terminal;
+                    }
+                }
+                else
                 {
                     await using var clearSchedule =
                         connection.CreateCommand();

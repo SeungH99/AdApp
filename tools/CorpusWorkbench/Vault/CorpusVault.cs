@@ -430,8 +430,22 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
         var started = Stopwatch.GetTimestamp();
         var orphanCount = 0;
         long totalBytes = 0;
-        foreach (var name in fileStore.EnumerateVerifiedFileNames(
-                     PreviewStagingRootRelativePath))
+        IReadOnlyList<string> names;
+        try
+        {
+            names = fileStore.EnumerateVerifiedFileNames(
+                PreviewStagingRootRelativePath,
+                MaximumPreviewRecoveryOrphans,
+                MaximumPreviewRecoveryBytes,
+                MaximumPreviewRecoveryDuration);
+        }
+        catch (FileSystemBoundaryException)
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.VaultBoundaryViolation);
+        }
+
+        foreach (var name in names)
         {
             orphanCount = checked(orphanCount + 1);
             ValidatePreviewRecoveryBudget(

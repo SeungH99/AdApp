@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.Win32.SafeHandles;
 
 namespace LocalDocumentOrganizer.Infrastructure.Windows.FileSystem;
@@ -407,7 +408,27 @@ public sealed class ApprovedRootFileStore : IDisposable
 
     public IReadOnlyList<string> EnumerateVerifiedFileNames(
         string relativeDirectory)
+        => EnumerateVerifiedFileNames(
+            relativeDirectory,
+            int.MaxValue,
+            long.MaxValue,
+            Timeout.InfiniteTimeSpan);
+
+    public IReadOnlyList<string> EnumerateVerifiedFileNames(
+        string relativeDirectory,
+        int maximumEntryCount,
+        long maximumTotalBytes,
+        TimeSpan maximumDuration)
     {
+        if (maximumEntryCount < 0
+            || maximumTotalBytes < 0
+            || maximumDuration != Timeout.InfiniteTimeSpan
+                && maximumDuration <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumEntryCount));
+        }
+
         var normalized = NormalizeRelativePath(relativeDirectory);
         lock (_sync)
         {
@@ -417,14 +438,13 @@ public sealed class ApprovedRootFileStore : IDisposable
                 GetAbsolutePath(normalized));
             ValidateDirectoryScope(directory, normalized);
 
-            string[] entries;
+            IEnumerable<string> entries;
             try
             {
                 entries = Directory.EnumerateFileSystemEntries(
                         GetAbsolutePath(normalized),
                         "*",
-                        SearchOption.TopDirectoryOnly)
-                    .ToArray();
+                        SearchOption.TopDirectoryOnly);
             }
             catch (Exception exception) when (
                 exception is IOException
@@ -434,29 +454,78 @@ public sealed class ApprovedRootFileStore : IDisposable
                 throw Boundary();
             }
 
-            var names = new List<string>(entries.Length);
-            foreach (var entry in entries)
+            var started = Stopwatch.GetTimestamp();
+            var entryCount = 0;
+            long totalBytes = 0;
+            var names = new List<string>(
+                Math.Min(maximumEntryCount, 256));
+            try
             {
-                var name = Path.GetFileName(entry);
-                var relative = NormalizeRelativePath(
-                    Path.Combine(normalized, name));
-                using var probe =
-                    WindowsFileSystemNative.OpenBoundaryProbeHandle(
-                        GetAbsolutePath(relative));
-                if (probe is null)
+                foreach (var entry in entries)
                 {
-                    continue;
-                }
+                    entryCount = checked(entryCount + 1);
+                    ValidateEnumerationBudget(
+                        entryCount,
+                        totalBytes,
+                        Stopwatch.GetElapsedTime(started),
+                        maximumEntryCount,
+                        maximumTotalBytes,
+                        maximumDuration);
+                    var name = Path.GetFileName(entry);
+                    var relative = NormalizeRelativePath(
+                        Path.Combine(normalized, name));
+                    using var probe =
+                        WindowsFileSystemNative.OpenBoundaryProbeHandle(
+                            GetAbsolutePath(relative));
+                    if (probe is null)
+                    {
+                        continue;
+                    }
 
-                ValidateFileHandle(
-                    probe,
-                    relative,
-                    expectedLength: null);
-                names.Add(name);
+                    ValidateFileHandle(
+                        probe,
+                        relative,
+                        expectedLength: null);
+                    totalBytes = checked(
+                        totalBytes + RandomAccess.GetLength(probe));
+                    ValidateEnumerationBudget(
+                        entryCount,
+                        totalBytes,
+                        Stopwatch.GetElapsedTime(started),
+                        maximumEntryCount,
+                        maximumTotalBytes,
+                        maximumDuration);
+                    names.Add(name);
+                }
+            }
+            catch (Exception exception) when (
+                exception is IOException
+                    or UnauthorizedAccessException
+                    or OverflowException
+                    or System.Security.SecurityException)
+            {
+                throw Boundary();
             }
 
             RevalidateCore();
             return names;
+        }
+    }
+
+    private static void ValidateEnumerationBudget(
+        int entryCount,
+        long totalBytes,
+        TimeSpan elapsed,
+        int maximumEntryCount,
+        long maximumTotalBytes,
+        TimeSpan maximumDuration)
+    {
+        if (entryCount > maximumEntryCount
+            || totalBytes > maximumTotalBytes
+            || maximumDuration != Timeout.InfiniteTimeSpan
+                && elapsed > maximumDuration)
+        {
+            throw Boundary();
         }
     }
 
