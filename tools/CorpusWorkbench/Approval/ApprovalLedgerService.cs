@@ -21,6 +21,16 @@ public sealed record ApprovalVerificationResult(
     string LedgerHeadSha256,
     ImmutableArray<string> InvalidEntryIds);
 
+public sealed record OwnerApprovedDocument(
+    string DocumentId,
+    string LabelRevisionId,
+    string ApprovalMode,
+    string ApprovalEntryId);
+
+public sealed record OwnerApprovalView(
+    string LedgerHeadSha256,
+    ImmutableArray<OwnerApprovedDocument> Documents);
+
 public sealed record DirectReviewDecision(
     string DocumentId,
     string LabelRevisionId,
@@ -48,6 +58,16 @@ public sealed class ApprovalLedgerService
         "corpus-approval-decision-identity-v1\n";
     private const string BatchSummaryDomain =
         "corpus-approval-batch-summary-v1\n";
+    private const string AnchorCheckpointId =
+        "approval-ledger-anchor-v1";
+    private const string AnchorDomainVersion =
+        "corpus-approval-ledger-anchor-v1";
+    private const string AnchorHashDomain =
+        "corpus-approval-ledger-anchor-hash-v1\n";
+    // Approval evidence predating the product's supported corpus era is
+    // rejected so default/sentinel timestamps cannot enter canonical state.
+    private static readonly DateTimeOffset MinimumDecisionTimeUtc =
+        new(2020, 1, 1, 0, 0, 0, TimeSpan.Zero);
     private static readonly TimeSpan FutureTolerance =
         TimeSpan.FromMinutes(5);
 
@@ -194,11 +214,11 @@ public sealed class ApprovalLedgerService
         return await _store.ExecuteApprovalWriteAsync(
             async (connection, transaction) =>
             {
-                var rows = await ReadRowsAsync(
+                var ledger = await ReadLedgerAsync(
                         connection,
                         transaction)
                     .ConfigureAwait(false);
-                RequireValidChain(rows);
+                RequireValidLedger(ledger);
                 var states =
                     await _store.ReadAllApprovalLabelStatesAsync(
                             connection,
@@ -206,9 +226,13 @@ public sealed class ApprovalLedgerService
                         .ConfigureAwait(false);
                 var selection = SelectBatchBindings(
                     decision.MarketId,
-                    rows,
+                    ledger.Rows,
                     states,
                     requireExactDirectCount: true);
+                RequireBatchDecisionTime(
+                    decision.ApprovedAtUtc,
+                    ledger.Rows,
+                    selection);
                 var actualSummary =
                     ComputeBatchSummarySha256(selection.Delegated);
                 if (!FixedEquals(
@@ -230,7 +254,7 @@ public sealed class ApprovalLedgerService
                 return await AppendAsync(
                         connection,
                         transaction,
-                        rows,
+                        ledger,
                         payload)
                     .ConfigureAwait(false);
             },
@@ -243,42 +267,38 @@ public sealed class ApprovalLedgerService
         await VerifyWorkerAsync(cancellationToken)
             .ConfigureAwait(false);
         var result = await _store.ExecuteApprovalReadAsync(
-            async connection =>
+            async (connection, transaction) =>
             {
-                var rows = await ReadRowsAsync(
+                var ledger = await ReadLedgerAsync(
                         connection,
-                        transaction: null)
+                        transaction)
                     .ConfigureAwait(false);
+                var rows = ledger.Rows;
                 var invalid = FindChainFailures(rows);
-                if (invalid.Count == 0)
+                FindLedgerSemanticFailures(rows, invalid);
+                FindAnchorFailures(ledger, invalid);
+                try
                 {
-                    FindLedgerSemanticFailures(rows, invalid);
+                    var states =
+                        await _store.ReadAllApprovalLabelStatesAsync(
+                                connection,
+                                transaction)
+                            .ConfigureAwait(false);
+                    FindCurrentStateFailures(
+                        rows,
+                        states,
+                        invalid);
                 }
-                if (invalid.Count == 0)
+                catch (WorkbenchException)
                 {
-                    try
-                    {
-                        var states =
-                            await _store.ReadAllApprovalLabelStatesAsync(
-                                    connection,
-                                    transaction: null)
-                                .ConfigureAwait(false);
-                        FindCurrentStateFailures(
-                            rows,
-                            states,
-                            invalid);
-                    }
-                    catch (WorkbenchException)
-                    {
-                        AddAllEntryIds(rows, invalid);
-                    }
-                    catch (Exception exception) when (
-                        exception is JsonException
-                            or FormatException
-                            or CryptographicException)
-                    {
-                        AddAllEntryIds(rows, invalid);
-                    }
+                    AddAllEntryIds(rows, invalid);
+                }
+                catch (Exception exception) when (
+                    exception is JsonException
+                        or FormatException
+                        or CryptographicException)
+                {
+                    AddAllEntryIds(rows, invalid);
                 }
 
                 var ordered = invalid
@@ -293,8 +313,92 @@ public sealed class ApprovalLedgerService
                     ordered.IsEmpty
                         ? null
                         : WorkbenchFailureCode.ApprovalChainInvalid,
-                    LedgerHead(rows),
+                    LedgerHead(ledger),
                     ordered);
+            },
+            cancellationToken).ConfigureAwait(false);
+        await VerifyWorkerAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return result;
+    }
+
+    public async Task<OwnerApprovalView> GetOwnerApprovalViewAsync(
+        CancellationToken cancellationToken)
+    {
+        await VerifyWorkerAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var result = await _store.ExecuteApprovalReadAsync(
+            async (connection, transaction) =>
+            {
+                var ledger = await ReadLedgerAsync(
+                        connection,
+                        transaction)
+                    .ConfigureAwait(false);
+                var rows = ledger.Rows;
+                var invalid = FindChainFailures(rows);
+                FindLedgerSemanticFailures(rows, invalid);
+                FindAnchorFailures(ledger, invalid);
+                var states =
+                    await _store.ReadAllApprovalLabelStatesAsync(
+                            connection,
+                            transaction)
+                        .ConfigureAwait(false);
+                FindCurrentStateFailures(rows, states, invalid);
+                if (invalid.Count != 0)
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.ApprovalChainInvalid);
+                }
+
+                var approved =
+                    new Dictionary<string, OwnerApprovedDocument>(
+                        StringComparer.Ordinal);
+                foreach (var row in LatestDocumentRows(
+                             rows,
+                             ApprovalMode.DirectReview))
+                {
+                    var payload = row.Payload!;
+                    approved[payload.DocumentId!] =
+                        new OwnerApprovedDocument(
+                            payload.DocumentId!,
+                            payload.LabelRevisionId!,
+                            nameof(ApprovalMode.DirectReview),
+                            row.EntryId);
+                }
+
+                foreach (var batch in rows
+                             .Where(static row =>
+                                 row.Payload?.Mode
+                                     == ApprovalMode.BatchApproval)
+                             .GroupBy(
+                                 static row =>
+                                     row.Payload!.MarketId,
+                                 StringComparer.Ordinal)
+                             .Select(static group => group
+                                 .OrderByDescending(
+                                     static row => row.Sequence)
+                                 .First()))
+                {
+                    foreach (var delegated in
+                             batch.Payload!.DelegatedEntries)
+                    {
+                        approved.TryAdd(
+                            delegated.DocumentId,
+                            new OwnerApprovedDocument(
+                                delegated.DocumentId,
+                                delegated.LabelRevisionId,
+                                nameof(ApprovalMode.BatchApproval),
+                                batch.EntryId));
+                    }
+                }
+
+                return new OwnerApprovalView(
+                    LedgerHead(ledger),
+                    [
+                        .. approved.Values.OrderBy(
+                            static item => item.DocumentId,
+                            StringComparer.Ordinal),
+                    ]);
             },
             cancellationToken).ConfigureAwait(false);
         await VerifyWorkerAsync(cancellationToken)
@@ -348,11 +452,11 @@ public sealed class ApprovalLedgerService
         _store.ExecuteApprovalWriteAsync(
             async (connection, transaction) =>
             {
-                var rows = await ReadRowsAsync(
+                var ledger = await ReadLedgerAsync(
                         connection,
                         transaction)
                     .ConfigureAwait(false);
-                RequireValidChain(rows);
+                RequireValidLedger(ledger);
                 var state =
                     await _store.ReadApprovalLabelStateAsync(
                             connection,
@@ -367,6 +471,10 @@ public sealed class ApprovalLedgerService
                         StringComparison.Ordinal))
                 {
                     throw InvalidState();
+                }
+                if (decisionTime < revision.CreatedAtUtc)
+                {
+                    throw InvalidArguments();
                 }
 
                 RequireCurrentBinding(state);
@@ -384,7 +492,7 @@ public sealed class ApprovalLedgerService
                 return await AppendAsync(
                         connection,
                         transaction,
-                        rows,
+                        ledger,
                         payload)
                     .ConfigureAwait(false);
             },
@@ -393,9 +501,10 @@ public sealed class ApprovalLedgerService
     private async Task<ApprovalEntry> AppendAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
-        IReadOnlyList<ApprovalLedgerRow> rows,
+        ApprovalLedgerSnapshot ledger,
         ApprovalDecisionPayload payload)
     {
+        var rows = ledger.Rows;
         var canonical = CanonicalApprovalDecision.Serialize(payload);
         var entryId = CreateEntryId(canonical);
         var exact = rows.SingleOrDefault(
@@ -465,7 +574,25 @@ public sealed class ApprovalLedgerService
         }
 
         _injectFault?.Invoke(
+            ApprovalLedgerFaultPoint.AfterInsertBeforeAnchor);
+        await WriteAnchorAsync(
+                connection,
+                transaction,
+                new ApprovalLedgerAnchor(
+                    "1",
+                    AnchorDomainVersion,
+                    sequence,
+                    rows.Count + 1L,
+                    entryId,
+                    entrySha256))
+            .ConfigureAwait(false);
+        _injectFault?.Invoke(
             ApprovalLedgerFaultPoint.AfterInsertBeforeCommit);
+        var appended = await ReadLedgerAsync(
+                connection,
+                transaction)
+            .ConfigureAwait(false);
+        RequireValidLedger(appended);
         await VerifyWorkerAsync(CancellationToken.None)
             .ConfigureAwait(false);
         return ApprovalLedgerRow.Valid(
@@ -506,7 +633,7 @@ public sealed class ApprovalLedgerService
                     out var state)
                 || !MatchesCurrent(payload, state))
             {
-                invalid.Add(row.EntryId);
+                invalid.Add(row.DiagnosticId);
                 continue;
             }
 
@@ -519,7 +646,7 @@ public sealed class ApprovalLedgerService
             }
             catch (WorkbenchException)
             {
-                invalid.Add(row.EntryId);
+                invalid.Add(row.DiagnosticId);
             }
         }
 
@@ -553,12 +680,12 @@ public sealed class ApprovalLedgerService
                         .SequenceEqual(selected.Direct.AsSpan())
                     || !IsCurrentContext(payload))
                 {
-                    invalid.Add(batch.EntryId);
+                    invalid.Add(batch.DiagnosticId);
                 }
             }
             catch (WorkbenchException)
             {
-                invalid.Add(batch.EntryId);
+                invalid.Add(batch.DiagnosticId);
             }
         }
     }
@@ -646,6 +773,40 @@ public sealed class ApprovalLedgerService
                     StringComparer.Ordinal),
             ]);
     }
+
+    private static void RequireBatchDecisionTime(
+        DateTimeOffset approvedAtUtc,
+        IReadOnlyList<ApprovalLedgerRow> rows,
+        BatchSelection selection)
+    {
+        var referencedIds = selection.Delegated
+            .Concat(selection.Direct)
+            .Select(static item => item.EntryId)
+            .ToHashSet(StringComparer.Ordinal);
+        if (rows.Any(row =>
+                referencedIds.Contains(row.EntryId)
+                && row.Payload is { } payload
+                && approvedAtUtc < payload.ApprovedAtUtc))
+        {
+            throw InvalidArguments();
+        }
+    }
+
+    private static IReadOnlyList<ApprovalLedgerRow>
+        LatestDocumentRows(
+        IReadOnlyList<ApprovalLedgerRow> rows,
+        ApprovalMode mode) =>
+        rows.Where(row => row.Payload?.Mode == mode)
+            .GroupBy(
+                static row => row.Payload!.DocumentId!,
+                StringComparer.Ordinal)
+            .Select(static group =>
+                group.OrderByDescending(static row => row.Sequence)
+                    .First())
+            .OrderBy(
+                static row => row.Payload!.DocumentId,
+                StringComparer.Ordinal)
+            .ToArray();
 
     private static IReadOnlyList<ApprovalLedgerRow>
         LatestDocumentRows(
@@ -897,9 +1058,12 @@ public sealed class ApprovalLedgerService
                    .ConfigureAwait(false))
         {
             var sequence = reader.GetInt64(0);
-            var entryId = reader.GetString(1);
-            var previous = reader.GetString(2);
-            var entryHash = reader.GetString(3);
+            var entryId = reader.GetValue(1) as string
+                ?? string.Empty;
+            var previous = reader.GetValue(2) as string
+                ?? string.Empty;
+            var entryHash = reader.GetValue(3) as string
+                ?? string.Empty;
             if (reader.GetValue(4) is not byte[] canonical)
             {
                 rows.Add(
@@ -943,6 +1107,149 @@ public sealed class ApprovalLedgerService
         return rows;
     }
 
+    private static async Task<ApprovalLedgerSnapshot>
+        ReadLedgerAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction)
+    {
+        var rows = await ReadRowsAsync(connection, transaction)
+            .ConfigureAwait(false);
+        var anchor = await ReadAnchorAsync(connection, transaction)
+            .ConfigureAwait(false);
+        var sequence = await ReadSqliteSequenceAsync(
+                connection,
+                transaction)
+            .ConfigureAwait(false);
+        return new ApprovalLedgerSnapshot(rows, anchor, sequence);
+    }
+
+    private static async Task<ApprovalLedgerAnchorState>
+        ReadAnchorAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT scope_sha256, canonical_json
+            FROM checkpoints
+            WHERE checkpoint_id=$checkpoint_id;
+            """;
+        command.Parameters.AddWithValue(
+            "$checkpoint_id",
+            AnchorCheckpointId);
+        await using var reader =
+            await command.ExecuteReaderAsync(CancellationToken.None)
+                .ConfigureAwait(false);
+        if (!await reader.ReadAsync(CancellationToken.None)
+                .ConfigureAwait(false))
+        {
+            return ApprovalLedgerAnchorState.Missing;
+        }
+
+        var scopeSha256 = reader.GetValue(0) as string ?? string.Empty;
+        var canonical = reader.GetValue(1) as byte[] ?? [];
+        try
+        {
+            return new ApprovalLedgerAnchorState(
+                true,
+                scopeSha256,
+                canonical,
+                CanonicalApprovalLedgerAnchor.Parse(canonical),
+                true);
+        }
+        catch (Exception exception) when (
+            exception is JsonException
+                or NotSupportedException
+                or InvalidOperationException)
+        {
+            return new ApprovalLedgerAnchorState(
+                true,
+                scopeSha256,
+                canonical,
+                null,
+                false);
+        }
+    }
+
+    private static async Task<SqliteSequenceState>
+        ReadSqliteSequenceAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT seq
+            FROM sqlite_sequence
+            WHERE name='approval_entries';
+            """;
+        await using var reader =
+            await command.ExecuteReaderAsync(CancellationToken.None)
+                .ConfigureAwait(false);
+        var count = 0;
+        long? sequence = null;
+        var valuesValid = true;
+        while (await reader.ReadAsync(CancellationToken.None)
+                   .ConfigureAwait(false))
+        {
+            count++;
+            if (reader.GetValue(0) is long value)
+            {
+                sequence = value;
+            }
+            else
+            {
+                valuesValid = false;
+            }
+        }
+
+        return new SqliteSequenceState(
+            count,
+            sequence,
+            valuesValid);
+    }
+
+    private static async Task WriteAnchorAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ApprovalLedgerAnchor anchor)
+    {
+        var canonical =
+            CanonicalApprovalLedgerAnchor.Serialize(anchor);
+        var scopeSha256 = HashAnchor(canonical);
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO checkpoints(
+              checkpoint_id,
+              scope_sha256,
+              canonical_json)
+            VALUES(
+              $checkpoint_id,
+              $scope_sha256,
+              $canonical_json)
+            ON CONFLICT(checkpoint_id) DO UPDATE SET
+              scope_sha256=excluded.scope_sha256,
+              canonical_json=excluded.canonical_json;
+            """;
+        command.Parameters.AddWithValue(
+            "$checkpoint_id",
+            AnchorCheckpointId);
+        command.Parameters.AddWithValue(
+            "$scope_sha256",
+            scopeSha256);
+        var canonicalParameter = command.Parameters.Add(
+            "$canonical_json",
+            SqliteType.Blob);
+        canonicalParameter.Value = canonical;
+        if (await command.ExecuteNonQueryAsync(CancellationToken.None)
+                .ConfigureAwait(false) != 1)
+        {
+            throw InvalidState();
+        }
+    }
+
     private static HashSet<string> FindChainFailures(
         IReadOnlyList<ApprovalLedgerRow> rows)
     {
@@ -976,7 +1283,7 @@ public sealed class ApprovalLedgerService
 
             if (!valid)
             {
-                invalid.Add(row.EntryId);
+                invalid.Add(row.DiagnosticId);
             }
 
             expectedPrevious = row.EntrySha256;
@@ -988,19 +1295,67 @@ public sealed class ApprovalLedgerService
         return invalid;
     }
 
-    private static void RequireValidChain(
-        IReadOnlyList<ApprovalLedgerRow> rows)
+    private void RequireValidLedger(
+        ApprovalLedgerSnapshot ledger)
     {
-        var invalid = FindChainFailures(rows);
-        if (invalid.Count == 0)
-        {
-            FindLedgerSemanticFailures(rows, invalid);
-        }
+        var invalid = FindChainFailures(ledger.Rows);
+        FindLedgerSemanticFailures(ledger.Rows, invalid);
+        FindAnchorFailures(ledger, invalid);
         if (invalid.Count != 0)
         {
             throw new WorkbenchException(
                 WorkbenchFailureCode.ApprovalChainInvalid);
         }
+    }
+
+    private static void FindAnchorFailures(
+        ApprovalLedgerSnapshot ledger,
+        ISet<string> invalid)
+    {
+        var rows = ledger.Rows;
+        var anchor = ledger.Anchor;
+        var sequence = ledger.SqliteSequence;
+        if (rows.Count == 0
+            && !anchor.Exists
+            && sequence.RowCount == 0)
+        {
+            return;
+        }
+
+        var valid = rows.Count != 0
+            && anchor.Exists
+            && anchor.CanonicalValid
+            && anchor.Value is { } value
+            && value.SchemaVersion == "1"
+            && string.Equals(
+                value.DomainVersion,
+                AnchorDomainVersion,
+                StringComparison.Ordinal)
+            && value.TerminalSequence == rows[^1].Sequence
+            && value.EntryCount == rows.Count
+            && string.Equals(
+                value.TerminalEntryId,
+                rows[^1].EntryId,
+                StringComparison.Ordinal)
+            && FixedEquals(
+                value.TerminalEntrySha256,
+                rows[^1].EntrySha256)
+            && IsSafeEntryId(value.TerminalEntryId)
+            && FixedEquals(
+                anchor.ScopeSha256,
+                HashAnchor(anchor.Canonical))
+            && sequence.RowCount == 1
+            && sequence.ValuesValid
+            && sequence.Sequence == rows[^1].Sequence;
+        if (valid)
+        {
+            return;
+        }
+
+        invalid.Add(
+            rows.Count == 0
+                ? ApprovalLedgerDiagnostics.AnchorIdentifier
+                : rows[^1].DiagnosticId);
     }
 
     private static bool IsValidPayload(
@@ -1020,6 +1375,7 @@ public sealed class ApprovalLedgerService
                     payload.WorkerIdentity)
             || !IsSafeActor(payload.ReviewerId)
             || payload.ApprovedAtUtc.Offset != TimeSpan.Zero
+            || payload.ApprovedAtUtc < MinimumDecisionTimeUtc
             || payload.Fields.IsDefault
             || payload.DelegatedEntries.IsDefault
             || payload.DirectReviewEntries.IsDefault)
@@ -1070,7 +1426,9 @@ public sealed class ApprovalLedgerService
             || !IsLowerSha256(payload.DocumentSha256)
             || !IsLowerSha256(payload.LabelRevisionSha256)
             || payload.LabelRevisionCreatedAtUtc.Value.Offset
-                != TimeSpan.Zero)
+                != TimeSpan.Zero
+            || payload.ApprovedAtUtc
+                < payload.LabelRevisionCreatedAtUtc.Value)
         {
             return false;
         }
@@ -1117,15 +1475,27 @@ public sealed class ApprovalLedgerService
                                 item.WorkerExecutableSha256)));
     }
 
-    private static void FindLedgerSemanticFailures(
+    private void FindLedgerSemanticFailures(
         IReadOnlyList<ApprovalLedgerRow> rows,
         ISet<string> invalid)
     {
         var byId = rows
-            .Where(static row => row.CanonicalValid)
+            .Where(static row =>
+                row.CanonicalValid
+                && IsSafeEntryId(row.EntryId))
             .ToDictionary(
                 static row => row.EntryId,
                 StringComparer.Ordinal);
+        foreach (var row in rows.Where(static row =>
+                     row.Payload is not null))
+        {
+            if (!IsDecisionTimeWithinPolicy(
+                    row.Payload!.ApprovedAtUtc))
+            {
+                invalid.Add(row.DiagnosticId);
+            }
+        }
+
         foreach (var batch in rows.Where(static row =>
                      row.Payload?.Mode
                          == ApprovalMode.BatchApproval))
@@ -1146,7 +1516,7 @@ public sealed class ApprovalLedgerService
                     batch.Sequence,
                     byId))
             {
-                invalid.Add(batch.EntryId);
+                invalid.Add(batch.DiagnosticId);
             }
         }
     }
@@ -1175,6 +1545,8 @@ public sealed class ApprovalLedgerService
                     row.Payload.PilotEpoch,
                     batch.PilotEpoch,
                     StringComparison.Ordinal)
+                || batch.ApprovedAtUtc
+                    < row.Payload.ApprovedAtUtc
                 || row.ToReference() != reference)
             {
                 return false;
@@ -1186,12 +1558,19 @@ public sealed class ApprovalLedgerService
 
     private void ValidateDecisionTime(DateTimeOffset value)
     {
-        var now = _timeProvider.GetUtcNow().ToUniversalTime();
-        if (value.Offset != TimeSpan.Zero
-            || value > now + FutureTolerance)
+        if (!IsDecisionTimeWithinPolicy(value))
         {
             throw InvalidArguments();
         }
+    }
+
+    private bool IsDecisionTimeWithinPolicy(
+        DateTimeOffset value)
+    {
+        var now = _timeProvider.GetUtcNow().ToUniversalTime();
+        return value.Offset == TimeSpan.Zero
+            && value >= MinimumDecisionTimeUtc
+            && value <= now + FutureTolerance;
     }
 
     private static void ValidateActor(string value)
@@ -1237,6 +1616,9 @@ public sealed class ApprovalLedgerService
         hash.AppendData(canonical);
         return Convert.ToHexStringLower(hash.GetHashAndReset());
     }
+
+    private static string HashAnchor(byte[] canonical) =>
+        DomainHash(AnchorHashDomain, canonical);
 
     private static string DomainHash(
         string domain,
@@ -1315,17 +1697,37 @@ public sealed class ApprovalLedgerService
     }
 
     private static string LedgerHead(
-        IReadOnlyList<ApprovalLedgerRow> rows) =>
-        rows.Count == 0 ? GenesisSha256 : rows[^1].EntrySha256;
+        ApprovalLedgerSnapshot ledger)
+    {
+        if (ledger.Anchor.CanonicalValid
+            && FixedEquals(
+                ledger.Anchor.ScopeSha256,
+                HashAnchor(ledger.Anchor.Canonical))
+            && ledger.Anchor.Value is { } anchor
+            && IsLowerSha256(anchor.TerminalEntrySha256))
+        {
+            return anchor.TerminalEntrySha256;
+        }
+
+        return ledger.Rows.Count != 0
+            && IsLowerSha256(ledger.Rows[^1].EntrySha256)
+                ? ledger.Rows[^1].EntrySha256
+                : GenesisSha256;
+    }
 
     private static long EntrySequence(
         IReadOnlyList<ApprovalLedgerRow> rows,
         string entryId) =>
-        rows.FirstOrDefault(row => string.Equals(
-                row.EntryId,
+        string.Equals(
+            entryId,
+            ApprovalLedgerDiagnostics.AnchorIdentifier,
+            StringComparison.Ordinal)
+            ? 0
+            : rows.FirstOrDefault(row => string.Equals(
+                row.DiagnosticId,
                 entryId,
                 StringComparison.Ordinal))
-            ?.Sequence ?? long.MaxValue;
+                ?.Sequence ?? long.MaxValue;
 
     private static void AddAllEntryIds(
         IEnumerable<ApprovalLedgerRow> rows,
@@ -1333,7 +1735,7 @@ public sealed class ApprovalLedgerService
     {
         foreach (var row in rows)
         {
-            invalid.Add(row.EntryId);
+            invalid.Add(row.DiagnosticId);
         }
     }
 
@@ -1379,6 +1781,35 @@ public sealed class ApprovalLedgerService
     private static WorkbenchException InvalidState() =>
         new(WorkbenchFailureCode.InvalidState);
 }
+
+internal sealed record ApprovalLedgerAnchor(
+    string SchemaVersion,
+    string DomainVersion,
+    long TerminalSequence,
+    long EntryCount,
+    string TerminalEntryId,
+    string TerminalEntrySha256);
+
+internal sealed record ApprovalLedgerAnchorState(
+    bool Exists,
+    string ScopeSha256,
+    byte[] Canonical,
+    ApprovalLedgerAnchor? Value,
+    bool CanonicalValid)
+{
+    internal static ApprovalLedgerAnchorState Missing { get; } =
+        new(false, string.Empty, [], null, false);
+}
+
+internal sealed record SqliteSequenceState(
+    int RowCount,
+    long? Sequence,
+    bool ValuesValid);
+
+internal sealed record ApprovalLedgerSnapshot(
+    IReadOnlyList<ApprovalLedgerRow> Rows,
+    ApprovalLedgerAnchorState Anchor,
+    SqliteSequenceState SqliteSequence);
 
 internal sealed record ApprovalDecisionPayload(
     string SchemaVersion,
@@ -1529,6 +1960,32 @@ internal static class CanonicalApprovalDecision
     }
 }
 
+internal static class CanonicalApprovalLedgerAnchor
+{
+    internal static byte[] Serialize(
+        ApprovalLedgerAnchor anchor) =>
+        WorkbenchJson.Serialize(
+            anchor,
+            ApprovalJsonContext.Default.ApprovalLedgerAnchor);
+
+    internal static ApprovalLedgerAnchor Parse(byte[] canonical)
+    {
+        var anchor = WorkbenchJson.Parse(
+            canonical,
+            ApprovalJsonContext.Default.ApprovalLedgerAnchor);
+        var expected = Serialize(anchor);
+        if (!CryptographicOperations.FixedTimeEquals(
+                canonical,
+                expected))
+        {
+            throw new JsonException(
+                "Approval anchor payload is not canonical.");
+        }
+
+        return anchor;
+    }
+}
+
 internal sealed record ApprovalLedgerRow(
     long Sequence,
     string EntryId,
@@ -1538,6 +1995,9 @@ internal sealed record ApprovalLedgerRow(
     ApprovalDecisionPayload? Payload,
     bool CanonicalValid)
 {
+    internal string DiagnosticId =>
+        ApprovalLedgerDiagnostics.Identifier(Sequence, EntryId);
+
     internal static ApprovalLedgerRow Valid(
         long sequence,
         string entryId,
@@ -1624,6 +2084,50 @@ internal sealed record ApprovalLedgerRow(
             payload.WorkerExecutableRelativePath,
             payload.WorkerExecutableSha256);
     }
+}
+
+internal static class ApprovalLedgerDiagnostics
+{
+    private const string SurrogateDomain =
+        "corpus-approval-invalid-entry-id-v1\n";
+
+    internal static string AnchorIdentifier { get; } =
+        Identifier(0, "approval-ledger-anchor");
+
+    internal static string Identifier(
+        long sequence,
+        string? entryId)
+    {
+        if (IsSafeEntryId(entryId))
+        {
+            return entryId!;
+        }
+
+        using var hash =
+            IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        hash.AppendData(Encoding.UTF8.GetBytes(SurrogateDomain));
+        hash.AppendData(
+            Encoding.UTF8.GetBytes(
+                sequence.ToString(
+                    CultureInfo.InvariantCulture)));
+        hash.AppendData([0]);
+        hash.AppendData(
+            Encoding.UTF8.GetBytes(entryId ?? string.Empty));
+        var digest = Convert.ToHexStringLower(
+            hash.GetHashAndReset());
+        return string.Create(
+            CultureInfo.InvariantCulture,
+            $"invalid-entry-{sequence}-{digest[..16]}");
+    }
+
+    private static bool IsSafeEntryId(string? value) =>
+        value is not null
+        && value.StartsWith("approval-", StringComparison.Ordinal)
+        && value.Length == "approval-".Length + 64
+        && value["approval-".Length..].All(
+            static character =>
+                character is >= '0' and <= '9'
+                    or >= 'a' and <= 'f');
 }
 
 internal sealed record BatchSelection(
@@ -1796,6 +2300,7 @@ internal sealed record ApprovalLedgerContext(
 internal enum ApprovalLedgerFaultPoint
 {
     BeforeInsert,
+    AfterInsertBeforeAnchor,
     AfterInsertBeforeCommit,
 }
 
@@ -1805,5 +2310,6 @@ internal enum ApprovalLedgerFaultPoint
     UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
     WriteIndented = false)]
 [JsonSerializable(typeof(ApprovalDecisionPayload))]
+[JsonSerializable(typeof(ApprovalLedgerAnchor))]
 internal sealed partial class ApprovalJsonContext
     : JsonSerializerContext;

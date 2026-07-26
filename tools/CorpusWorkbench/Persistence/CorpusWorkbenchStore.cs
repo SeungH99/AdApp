@@ -322,18 +322,44 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
     }
 
     internal async Task<T> ExecuteApprovalReadAsync<T>(
-        Func<SqliteConnection, Task<T>> operation,
+        Func<SqliteConnection, SqliteTransaction, Task<T>> operation,
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(operation);
+        cancellationToken.ThrowIfCancellationRequested();
         await using var connection =
             await OpenConnectionAsync(cancellationToken)
                 .ConfigureAwait(false);
-        ValidateSchema(connection, transaction: null);
-        var result = await operation(connection).ConfigureAwait(false);
-        RevalidateDatabaseSet();
-        return result;
+        cancellationToken.ThrowIfCancellationRequested();
+        await using var transaction =
+            connection.BeginTransaction(deferred: false);
+        try
+        {
+            RevalidateDatabaseSet();
+            ValidateSchema(connection, transaction);
+            var result = await operation(connection, transaction)
+                .ConfigureAwait(false);
+            ValidateSchema(connection, transaction);
+            RevalidateDatabaseSet();
+            await transaction.CommitAsync(CancellationToken.None)
+                .ConfigureAwait(false);
+            return result;
+        }
+        catch
+        {
+            try
+            {
+                await transaction.RollbackAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // The primary transaction failure remains canonical.
+            }
+
+            throw;
+        }
     }
 
     internal async Task<LabelRevision> PersistLabelRevisionAsync(
