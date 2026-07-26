@@ -37,9 +37,11 @@ internal static class WindowsFileSystemNative
     private const int ErrorFileNotFound = 2;
     private const int ErrorPathNotFound = 3;
     private const int ErrorAccessDenied = 5;
+    private const int ErrorFileExists = 80;
     private const int ErrorInvalidFunction = 1;
     private const int ErrorNotSupported = 50;
     private const int ErrorInvalidParameter = 87;
+    private const int ErrorAlreadyExists = 183;
     private const int ErrorIoIncomplete = 996;
     private const uint InvalidFileAttributes = uint.MaxValue;
 
@@ -78,6 +80,89 @@ internal static class WindowsFileSystemNative
             handle.Dispose();
             throw;
         }
+    }
+
+    internal static SafeFileHandle OpenNewVerifiedFileHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            GenericRead | GenericWrite | Delete,
+            shareMode: 0,
+            IntPtr.Zero,
+            CreateNew,
+            FileFlagOpenReparsePoint | FileFlagSequentialScan,
+            IntPtr.Zero);
+        if (!handle.IsInvalid)
+        {
+            return handle;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        handle.Dispose();
+        if (error is ErrorFileExists or ErrorAlreadyExists)
+        {
+            throw new FileStoreEntryAlreadyExistsException();
+        }
+
+        throw CreateNativeException(error);
+    }
+
+    internal static SafeFileHandle OpenVerifiedMutableFileHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            GenericRead,
+            FileShareRead | FileShareWrite,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        try
+        {
+            var information = GetAttributeTagInfo(handle);
+            if ((information.FileAttributes
+                    & (FileAttributeDirectory
+                        | FileAttributeReparsePoint)) != 0)
+            {
+                throw new FileSystemBoundaryException(
+                    "The mutable entry is not an approved regular file.");
+            }
+
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    internal static void EnsureDirectoryEntry(string canonicalPath)
+    {
+        RequireWindows();
+        if (CreateDirectory(ToExtendedPath(canonicalPath), IntPtr.Zero))
+        {
+            return;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        if (error is ErrorFileExists or ErrorAlreadyExists)
+        {
+            return;
+        }
+
+        throw CreateNativeException(error);
     }
 
     internal static SafeFileHandle OpenNewCrossVolumeDestinationHandle(
@@ -492,6 +577,65 @@ internal static class WindowsFileSystemNative
         return information;
     }
 
+    internal static string GetFinalPath(SafeFileHandle handle)
+    {
+        RequireUsableHandle(handle);
+        var buffer = new StringBuilder(512);
+        var length = GetFinalPathNameByHandle(
+            handle,
+            buffer,
+            checked((uint)buffer.Capacity),
+            flags: 0);
+        if (length == 0)
+        {
+            throw CreateNativeException(Marshal.GetLastPInvokeError());
+        }
+
+        if (length >= buffer.Capacity)
+        {
+            buffer = new StringBuilder(checked((int)length + 1));
+            length = GetFinalPathNameByHandle(
+                handle,
+                buffer,
+                checked((uint)buffer.Capacity),
+                flags: 0);
+            if (length == 0 || length >= buffer.Capacity)
+            {
+                throw CreateNativeException(Marshal.GetLastPInvokeError());
+            }
+        }
+
+        var path = RemoveExtendedPrefix(buffer.ToString());
+        string canonical;
+        try
+        {
+            canonical = Path.GetFullPath(path);
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException
+                or NotSupportedException
+                or PathTooLongException)
+        {
+            throw new FileSystemBoundaryException(
+                "A file handle reported an invalid physical path.",
+                exception);
+        }
+
+        var root = Path.GetPathRoot(canonical);
+        if (string.IsNullOrEmpty(root))
+        {
+            throw new FileSystemBoundaryException(
+                "A file handle reported an invalid physical root.");
+        }
+
+        return string.Equals(
+                canonical,
+                root,
+                StringComparison.OrdinalIgnoreCase)
+            ? root
+            : Path.TrimEndingDirectorySeparator(canonical);
+    }
+
     internal static StableSourceSnapshot GetStableSourceSnapshot(
         SafeFileHandle handle)
     {
@@ -689,6 +833,64 @@ internal static class WindowsFileSystemNative
         }
     }
 
+    internal static void MarkDeleteOnClose(SafeFileHandle handle)
+    {
+        RequireUsableHandle(handle);
+        var extended = new FILE_DISPOSITION_INFO_EX
+        {
+            Flags = FILE_DISPOSITION_DELETE
+                | FILE_DISPOSITION_ON_CLOSE
+                | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
+        };
+        var extendedSize = Marshal.SizeOf<FILE_DISPOSITION_INFO_EX>();
+        var buffer = Marshal.AllocHGlobal(extendedSize);
+        try
+        {
+            Marshal.StructureToPtr(extended, buffer, fDeleteOld: false);
+            if (SetFileInformationByHandle(
+                    handle,
+                    FileInfoByHandleClass.FileDispositionInfoEx,
+                    buffer,
+                    checked((uint)extendedSize)))
+            {
+                return;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            if (error is not ErrorInvalidParameter and not ErrorNotSupported)
+            {
+                throw CreateNativeException(error);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+
+        var legacy = new FILE_DISPOSITION_INFO
+        {
+            DeleteFile = true,
+        };
+        var legacySize = Marshal.SizeOf<FILE_DISPOSITION_INFO>();
+        buffer = Marshal.AllocHGlobal(legacySize);
+        try
+        {
+            Marshal.StructureToPtr(legacy, buffer, fDeleteOld: false);
+            if (!SetFileInformationByHandle(
+                    handle,
+                    FileInfoByHandleClass.FileDispositionInfo,
+                    buffer,
+                    checked((uint)legacySize)))
+            {
+                throw CreateNativeException(Marshal.GetLastPInvokeError());
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
     internal static string ToExtendedPath(string canonicalPath)
     {
         if (canonicalPath.StartsWith(@"\\?\", StringComparison.Ordinal))
@@ -696,6 +898,20 @@ internal static class WindowsFileSystemNative
         if (canonicalPath.StartsWith(@"\\", StringComparison.Ordinal))
             return @"\\?\UNC\" + canonicalPath[2..];
         return @"\\?\" + canonicalPath;
+    }
+
+    private static string RemoveExtendedPrefix(string path)
+    {
+        const string uncPrefix = @"\\?\UNC\";
+        const string extendedPrefix = @"\\?\";
+        if (path.StartsWith(uncPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return @"\\" + path[uncPrefix.Length..];
+        }
+
+        return path.StartsWith(extendedPrefix, StringComparison.Ordinal)
+            ? path[extendedPrefix.Length..]
+            : path;
     }
 
     private static void RequireUsableHandle(SafeFileHandle handle)
@@ -729,6 +945,27 @@ internal static class WindowsFileSystemNative
         uint creationDisposition,
         uint flagsAndAttributes,
         IntPtr templateFile);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "CreateDirectoryW",
+        CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateDirectory(
+        string path,
+        IntPtr securityAttributes);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "GetFinalPathNameByHandleW",
+        CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandle(
+        SafeFileHandle file,
+        StringBuilder filePath,
+        uint filePathLength,
+        uint flags);
 
     [DllImport(
         "kernel32.dll",

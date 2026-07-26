@@ -341,6 +341,12 @@ internal sealed class PinnedDirectoryPathScope : IDisposable
 
     internal WindowsFileSystemNative.FILE_ID_INFO FinalIdentity { get; }
 
+    internal SafeFileHandle FinalHandle =>
+        _handles.Count != 0
+            ? _handles[^1]
+            : throw new ObjectDisposedException(
+                nameof(PinnedDirectoryPathScope));
+
     public void Dispose() => DisposeHandles(_handles);
 
     internal static void DisposeHandles(List<SafeFileHandle> handles)

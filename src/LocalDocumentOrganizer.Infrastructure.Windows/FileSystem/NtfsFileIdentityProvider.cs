@@ -358,4 +358,8 @@ public sealed class NtfsFileIdentityProvider
 
     public VerifiedStableSource OpenVerifiedSource(string path)
         => _pathGuard.OpenVerifiedSource(path);
+
+    public VerifiedStableSource OpenVerifiedSourceFromApprovedRoot(
+        string path) =>
+        _pathGuard.OpenVerifiedSourceFromApprovedRoot(path);
 }
