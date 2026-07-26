@@ -321,6 +321,10 @@ public sealed class DocumentExtractionClient
                     timeout.Token);
                 try
                 {
+                    await ReadWorkerReadinessAsync(
+                            activeWorker.StandardOutput,
+                            linked.Token)
+                        .ConfigureAwait(false);
                     await WriteRequestFrameAsync(
                             activeWorker.StandardInput,
                             request,
@@ -696,6 +700,40 @@ public sealed class DocumentExtractionClient
         finally
         {
             CryptographicOperations.ZeroMemory(payload);
+        }
+    }
+
+    private static async Task ReadWorkerReadinessAsync(
+        Stream input,
+        CancellationToken cancellationToken)
+    {
+        var expected =
+            DocumentExtractionProtocol.WorkerReadinessPreamble.ToArray();
+        var actual = new byte[expected.Length];
+        try
+        {
+            try
+            {
+                await ReadExactlyAsync(input, actual, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (FrameException exception)
+            {
+                throw new DocumentExtractionException(
+                    DocumentExtractionFailureCode.WorkerTerminated,
+                    exception);
+            }
+
+            if (!CryptographicOperations.FixedTimeEquals(expected, actual))
+            {
+                throw new DocumentExtractionException(
+                    DocumentExtractionFailureCode.WorkerTerminated);
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(expected);
+            CryptographicOperations.ZeroMemory(actual);
         }
     }
 

@@ -8,16 +8,24 @@ namespace LocalDocumentOrganizer.DocumentExtractionWorker;
 
 public static class Program
 {
-    public static Task<int> Main() =>
-        RunAsync(
-            Console.OpenStandardInput(),
-            Console.OpenStandardOutput(),
-            Console.Error,
-            ProductionDocumentExtractionAdapters.Create(),
-            TimeSpan.FromMilliseconds(
-                DocumentExtractionLimits.ExtractionTimeoutMilliseconds),
-            TimeProvider.System,
-            CancellationToken.None);
+    public static async Task<int> Main()
+    {
+        var adapters = ProductionDocumentExtractionAdapters.Create();
+        var output = Console.OpenStandardOutput();
+        output.Write(DocumentExtractionProtocol.WorkerReadinessPreamble);
+        await output.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+
+        return await RunAsync(
+                Console.OpenStandardInput(),
+                output,
+                Console.Error,
+                adapters,
+                TimeSpan.FromMilliseconds(
+                    DocumentExtractionLimits.ExtractionTimeoutMilliseconds),
+                TimeProvider.System,
+                CancellationToken.None)
+            .ConfigureAwait(false);
+    }
 
     public static Task<int> RunAsync(
         Stream input,

@@ -5,6 +5,9 @@ namespace LocalDocumentOrganizer.Core.Documents;
 public static class DocumentExtractionProtocol
 {
     public const int CurrentVersion = 1;
+
+    public static ReadOnlySpan<byte> WorkerReadinessPreamble =>
+        "LDOX-READY/1\n"u8;
 }
 
 public static class DocumentExtractionLimits
