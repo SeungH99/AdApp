@@ -326,12 +326,34 @@ public sealed class DocumentExtractionClient
 
             deadline.ThrowIfCancellationRequested();
             source.RequireSingleLink();
+            if (descriptor.DeclaredLength != source.Length)
+            {
+                throw new DocumentExtractionException(
+                    DocumentExtractionFailureCode.InvalidSourceLength);
+            }
+
+            if (descriptor.Sha256.IsDefault
+                || descriptor.Sha256.Length != SHA256.HashSizeInBytes)
+            {
+                throw new DocumentExtractionException(
+                    DocumentExtractionFailureCode.InvalidSourceFingerprint);
+            }
+
             initialHash = await _sourceHasher.ComputeSha256Async(
                     source.Handle,
                     source.Length,
                     deadline.Token)
                 .ConfigureAwait(false);
             deadline.ThrowIfCancellationRequested();
+            if (initialHash.Length != SHA256.HashSizeInBytes
+                || !CryptographicOperations.FixedTimeEquals(
+                    initialHash,
+                    descriptor.Sha256.AsSpan()))
+            {
+                throw new DocumentExtractionException(
+                    DocumentExtractionFailureCode.InvalidSourceFingerprint);
+            }
+
             DocumentWorkerSessionLease? worker = null;
             Exception? primaryException = null;
             try

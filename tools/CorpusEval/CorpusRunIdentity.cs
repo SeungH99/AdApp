@@ -58,13 +58,9 @@ public sealed record CorpusRunIdentity(
         ArgumentNullException.ThrowIfNull(manifest);
         ArgumentNullException.ThrowIfNull(runtimes);
         ArgumentNullException.ThrowIfNull(workerPackageIdentity);
-        if (!IsSha256(workerPackageIdentity.Sha256)
-            || empirical
-                && (workerPackageIdentity.ManifestId
-                        != CorpusWorkerPackageIdentity.CanonicalManifestId
-                    || workerPackageIdentity.ManifestVersion
-                        != CorpusWorkerPackageIdentity
-                            .CanonicalManifestVersion)
+        if (empirical
+                && !CorpusWorkerPackageManifest
+                    .IsCanonicalExecutionIdentity(workerPackageIdentity)
             || !empirical
                 && workerPackageIdentity
                     != CorpusWorkerPackageIdentity.Synthetic)
@@ -151,9 +147,6 @@ public sealed record CorpusRunIdentity(
                 payload,
                 CorpusJson.Options));
     }
-
-    private static bool IsSha256(string value) =>
-        value.Length == 64 && value.All(Uri.IsHexDigit);
 }
 
 public static class CorpusHashing

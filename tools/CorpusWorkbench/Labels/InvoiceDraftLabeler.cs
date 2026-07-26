@@ -223,8 +223,9 @@ public sealed class InvoiceDraftLabeler
                 inferred.Add(
                     new Candidate(
                         value,
-                        value is not null,
-                        totalAmount.Evidence,
+                        value is not null
+                            && !totalAmount.InferenceEvidence.IsEmpty,
+                        totalAmount.InferenceEvidence,
                         totalAmount.Order,
                         rawValue));
             }
@@ -264,7 +265,7 @@ public sealed class InvoiceDraftLabeler
                 }
 
                 combined.Append(fragments[end].Text);
-                var detected = false;
+                var addedValidCandidate = false;
                 foreach (var label in labels)
                 {
                     if (!TryGetLabeledValue(
@@ -275,7 +276,6 @@ public sealed class InvoiceDraftLabeler
                         continue;
                     }
 
-                    detected = true;
                     if (rawValue.Length == 0)
                     {
                         continue;
@@ -298,13 +298,12 @@ public sealed class InvoiceDraftLabeler
                             rawValue));
                     if (normalized is not null)
                     {
+                        addedValidCandidate = true;
                         break;
                     }
                 }
 
-                if (detected
-                    && candidates.Count > 0
-                    && candidates[^1].IsValid)
+                if (addedValidCandidate)
                 {
                     break;
                 }
@@ -335,7 +334,8 @@ public sealed class InvoiceDraftLabeler
                 UncertainValue,
                 ImmutableArray<EvidenceBox>.Empty,
                 rejected.Order,
-                rejected.RawValue);
+                rejected.RawValue,
+                rejected.Evidence);
         }
 
         if (valid.Select(static candidate => candidate.Value)
@@ -351,7 +351,8 @@ public sealed class InvoiceDraftLabeler
             selected.Value!,
             selected.Evidence,
             selected.Order,
-            selected.RawValue);
+            selected.RawValue,
+            selected.Evidence);
     }
 
     private static string? NormalizeCandidate(
@@ -700,20 +701,23 @@ public sealed class InvoiceDraftLabeler
         string Value,
         ImmutableArray<EvidenceBox> Evidence,
         CandidateOrder Order,
-        string? RawValue)
+        string? RawValue,
+        ImmutableArray<EvidenceBox> InferenceEvidence)
     {
         internal static CandidateResolution Absent { get; } =
             new(
                 AbsentValue,
                 ImmutableArray<EvidenceBox>.Empty,
                 default,
-                null);
+                null,
+                ImmutableArray<EvidenceBox>.Empty);
 
         internal static CandidateResolution Uncertain { get; } =
             new(
                 UncertainValue,
                 ImmutableArray<EvidenceBox>.Empty,
                 default,
-                null);
+                null,
+                ImmutableArray<EvidenceBox>.Empty);
     }
 }

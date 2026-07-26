@@ -10,7 +10,9 @@ namespace LocalDocumentOrganizer.CorpusEval;
 public sealed record CorpusWorkerPackageIdentity(
     string ManifestId,
     string ManifestVersion,
-    string Sha256)
+    string Sha256,
+    string ExecutableRelativePath,
+    string ExecutableSha256)
 {
     public const string CanonicalManifestId =
         "ordinal-relative-path-length-sha256-lf";
@@ -21,10 +23,21 @@ public sealed record CorpusWorkerPackageIdentity(
             "synthetic-corpus-observation",
             "1",
             CorpusHashing.Sha256(
-                "synthetic-corpus-observation|1\n"));
+                "synthetic-corpus-observation|1\n"),
+            "synthetic-observation",
+            CorpusHashing.Sha256(
+                "synthetic-corpus-observation|executable\n"));
 
-    internal static CorpusWorkerPackageIdentity Canonical(string sha256) =>
-        new(CanonicalManifestId, CanonicalManifestVersion, sha256);
+    internal static CorpusWorkerPackageIdentity Canonical(
+        string sha256,
+        string executableRelativePath,
+        string executableSha256) =>
+        new(
+            CanonicalManifestId,
+            CanonicalManifestVersion,
+            sha256,
+            executableRelativePath,
+            executableSha256);
 }
 
 public sealed record CorpusWorkerPackageEntry(
@@ -35,10 +48,12 @@ public sealed record CorpusWorkerPackageEntry(
 public static class CorpusWorkerPackageManifest
 {
     public static CorpusWorkerPackageIdentity ComputeIdentity(
-        IReadOnlyList<CorpusWorkerPackageEntry> entries)
+        IReadOnlyList<CorpusWorkerPackageEntry> entries,
+        string executableRelativePath)
     {
         ArgumentNullException.ThrowIfNull(entries);
-        if (entries.Count == 0)
+        if (entries.Count == 0
+            || !IsSafeRelativePath(executableRelativePath))
         {
             throw new CorpusWorkerAttestationException();
         }
@@ -47,6 +62,7 @@ public static class CorpusWorkerPackageManifest
         var caseFolded = new HashSet<string>(
             StringComparer.OrdinalIgnoreCase);
         var lines = new List<string>(entries.Count);
+        CorpusWorkerPackageEntry? executable = null;
         foreach (var entry in entries)
         {
             if (!IsSafeRelativePath(entry.RelativePath)
@@ -61,14 +77,43 @@ public static class CorpusWorkerPackageManifest
             lines.Add(
                 $"{entry.RelativePath}|{entry.Length}"
                 + $"|{entry.Sha256.ToLowerInvariant()}");
+            if (string.Equals(
+                    entry.RelativePath,
+                    executableRelativePath,
+                    StringComparison.Ordinal))
+            {
+                executable = entry;
+            }
+        }
+
+        if (executable is null)
+        {
+            throw new CorpusWorkerAttestationException();
         }
 
         lines.Sort(StringComparer.Ordinal);
         var bytes = Encoding.UTF8.GetBytes(
             string.Join('\n', lines) + "\n");
         return CorpusWorkerPackageIdentity.Canonical(
-            CorpusHashing.Sha256(bytes));
+            CorpusHashing.Sha256(bytes),
+            executableRelativePath,
+            executable.Sha256.ToLowerInvariant());
     }
+
+    public static bool IsCanonicalExecutionIdentity(
+        CorpusWorkerPackageIdentity identity) =>
+        identity is not null
+        && string.Equals(
+            identity.ManifestId,
+            CorpusWorkerPackageIdentity.CanonicalManifestId,
+            StringComparison.Ordinal)
+        && string.Equals(
+            identity.ManifestVersion,
+            CorpusWorkerPackageIdentity.CanonicalManifestVersion,
+            StringComparison.Ordinal)
+        && IsLowerSha256(identity.Sha256)
+        && IsSafeRelativePath(identity.ExecutableRelativePath)
+        && IsLowerSha256(identity.ExecutableSha256);
 
     private static bool IsSafeRelativePath(string value) =>
         !string.IsNullOrWhiteSpace(value)
@@ -91,6 +136,14 @@ public static class CorpusWorkerPackageManifest
         value is not null
         && value.Length == 64
         && value.All(Uri.IsHexDigit);
+
+    private static bool IsLowerSha256(string value) =>
+        value is not null
+        && value.Length == 64
+        && value.All(
+            static character =>
+                character is >= '0' and <= '9'
+                    or >= 'a' and <= 'f');
 }
 
 public sealed class CorpusWorkerPackageSnapshot
@@ -129,12 +182,15 @@ public sealed class CorpusWorkerPackageSnapshot
         var pinned = new List<PinnedPackageEntry>();
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var root = RequireRegularRoot(packageRoot);
             var executable = RequireContainedFile(
                 root,
                 workerExecutablePath);
             var guard = new ApprovedRootPathGuard(root);
-            var paths = EnumerateRegularFiles(root);
+            var paths = EnumerateRegularFiles(
+                root,
+                cancellationToken);
             var exact = new HashSet<string>(StringComparer.Ordinal);
             var caseFolded = new HashSet<string>(
                 StringComparer.OrdinalIgnoreCase);
@@ -197,10 +253,11 @@ public sealed class CorpusWorkerPackageSnapshot
                 .ToArray();
             RequireSameMemberSet(
                 ordered.Select(static item => item.Entry.RelativePath),
-                EnumerateRegularFiles(root)
+                EnumerateRegularFiles(root, cancellationToken)
                     .Select(path => NormalizeRelativePath(root, path)));
             var identity = CorpusWorkerPackageManifest.ComputeIdentity(
-                ordered.Select(static item => item.Entry).ToArray());
+                ordered.Select(static item => item.Entry).ToArray(),
+                executableRelativePath);
             return new CorpusWorkerPackageSnapshot(
                 root,
                 executableRelativePath,
@@ -268,7 +325,7 @@ public sealed class CorpusWorkerPackageSnapshot
         {
             RequireSameMemberSet(
                 Entries.Select(static item => item.RelativePath),
-                EnumerateRegularFiles(Root)
+                EnumerateRegularFiles(Root, cancellationToken)
                     .Select(path => NormalizeRelativePath(Root, path)));
             foreach (var pinned in _pinnedEntries)
             {
@@ -344,19 +401,22 @@ public sealed class CorpusWorkerPackageSnapshot
     }
 
     private static IReadOnlyList<string> EnumerateRegularFiles(
-        string root)
+        string root,
+        CancellationToken cancellationToken)
     {
         var files = new List<string>();
         var pending = new Stack<string>();
         pending.Push(root);
         while (pending.Count > 0)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var directory = pending.Pop();
             foreach (var path in Directory.EnumerateFileSystemEntries(
                          directory,
                          "*",
                          SearchOption.TopDirectoryOnly))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var attributes = File.GetAttributes(path);
                 if ((attributes & FileAttributes.ReparsePoint) != 0)
                 {
@@ -503,6 +563,7 @@ public sealed class CorpusWorkerPackageLease
             Path.GetFullPath(stageParent));
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             protectedRoots.Revalidate();
             var fullPackageRoot = Path.TrimEndingDirectorySeparator(
                 Path.GetFullPath(packageRoot));
@@ -521,6 +582,7 @@ public sealed class CorpusWorkerPackageLease
 
             Directory.CreateDirectory(stageParent);
             _ = new ApprovedRootPathGuard(stageParent);
+            cancellationToken.ThrowIfCancellationRequested();
             stageRoot = Path.Combine(
                 stageParent,
                 StageDirectoryPrefix + Guid.NewGuid().ToString("N"));
@@ -530,6 +592,7 @@ public sealed class CorpusWorkerPackageLease
                 .ConfigureAwait(false);
             foreach (var entry in source.Entries)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var path = Path.Combine(
                     stageRoot,
                     entry.RelativePath.Replace(
@@ -540,6 +603,7 @@ public sealed class CorpusWorkerPackageLease
                     File.GetAttributes(path) | FileAttributes.ReadOnly);
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             var stagedExecutable = Path.Combine(
                 stageRoot,
                 source.ExecutableRelativePath.Replace(
@@ -558,7 +622,9 @@ public sealed class CorpusWorkerPackageLease
                 throw new CorpusWorkerAttestationException();
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             SealStageDirectory(stageRoot);
+            cancellationToken.ThrowIfCancellationRequested();
             await source.DisposeAsync().ConfigureAwait(false);
             source = null;
             var lease = new CorpusWorkerPackageLease(
@@ -626,10 +692,27 @@ public sealed class CorpusWorkerPackageLease
     {
         await _stagedSnapshot.VerifyCurrentAsync(cancellationToken)
             .ConfigureAwait(false);
-        if (!CorpusHashing.FixedTimeEquals(
+        var current = CorpusWorkerPackageManifest.ComputeIdentity(
+            _stagedSnapshot.Entries,
+            _stagedSnapshot.ExecutableRelativePath);
+        if (!string.Equals(
+                Identity.ManifestId,
+                current.ManifestId,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                Identity.ManifestVersion,
+                current.ManifestVersion,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                Identity.ExecutableRelativePath,
+                current.ExecutableRelativePath,
+                StringComparison.Ordinal)
+            || !CorpusHashing.FixedTimeEquals(
                 Identity.Sha256,
-                CorpusWorkerPackageManifest.ComputeIdentity(
-                    _stagedSnapshot.Entries).Sha256))
+                current.Sha256)
+            || !CorpusHashing.FixedTimeEquals(
+                Identity.ExecutableSha256,
+                current.ExecutableSha256))
         {
             throw new CorpusWorkerAttestationException();
         }

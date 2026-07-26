@@ -192,7 +192,8 @@ public sealed class DraftLabelService
         if (createdAtUtc.Offset != TimeSpan.Zero
             || !IsLowerSha256(document.ContentSha256)
             || !IsLowerSha256(rules.CatalogSha256)
-            || !IsLowerSha256(workerIdentity.Sha256)
+            || !CorpusWorkerPackageManifest
+                .IsCanonicalExecutionIdentity(workerIdentity)
             || previousRevision is not null
             && (!string.Equals(
                     previousRevision.DocumentId,
@@ -226,6 +227,8 @@ public sealed class DraftLabelService
             workerIdentity.ManifestId,
             workerIdentity.ManifestVersion,
             workerIdentity.Sha256,
+            workerIdentity.ExecutableRelativePath,
+            workerIdentity.ExecutableSha256,
             canonicalFields,
             revisionSha256,
             createdAtUtc);
@@ -271,6 +274,14 @@ public sealed class DraftLabelService
                 revision.WorkerPackageSha256,
                 workerIdentity.Sha256,
                 StringComparison.Ordinal)
+            && string.Equals(
+                revision.WorkerExecutableRelativePath,
+                workerIdentity.ExecutableRelativePath,
+                StringComparison.Ordinal)
+            && string.Equals(
+                revision.WorkerExecutableSha256,
+                workerIdentity.ExecutableSha256,
+                StringComparison.Ordinal)
             && FieldsEqual(revision.Fields, canonicalFields);
     }
 
@@ -297,7 +308,15 @@ public sealed class DraftLabelService
         var identity = new CorpusWorkerPackageIdentity(
             revision.WorkerPackageManifestId,
             revision.WorkerPackageManifestVersion,
-            revision.WorkerPackageSha256);
+            revision.WorkerPackageSha256,
+            revision.WorkerExecutableRelativePath,
+            revision.WorkerExecutableSha256);
+        if (!CorpusWorkerPackageManifest
+                .IsCanonicalExecutionIdentity(identity))
+        {
+            return false;
+        }
+
         var payload = SerializeRevisionPayload(
             document,
             revision.Fields,
@@ -579,6 +598,12 @@ public sealed class DraftLabelService
             writer.WriteString(
                 "workerPackageSha256",
                 workerIdentity.Sha256);
+            writer.WriteString(
+                "workerExecutableRelativePath",
+                workerIdentity.ExecutableRelativePath);
+            writer.WriteString(
+                "workerExecutableSha256",
+                workerIdentity.ExecutableSha256);
             writer.WritePropertyName("fields");
             writer.WriteStartArray();
             foreach (var field in fields)

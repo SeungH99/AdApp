@@ -124,6 +124,8 @@ public sealed record LabelRevision(
     string WorkerPackageManifestId,
     string WorkerPackageManifestVersion,
     string WorkerPackageSha256,
+    string WorkerExecutableRelativePath,
+    string WorkerExecutableSha256,
     ImmutableArray<LabeledField> Fields,
     string RevisionSha256,
     DateTimeOffset CreatedAtUtc);
