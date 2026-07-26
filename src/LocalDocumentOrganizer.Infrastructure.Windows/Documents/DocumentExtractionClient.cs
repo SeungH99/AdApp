@@ -336,20 +336,27 @@ public sealed class DocumentExtractionClient
             Exception? primaryException = null;
             try
             {
-                var launch = LaunchWithOwnedSourceAsync(
-                    source.Handle,
-                    deadline);
                 IDocumentWorkerSession activeWorker;
-                try
+                Task<IDocumentWorkerSession> launch;
+                using (var launchSource = DuplicateReadOnly(source.Handle))
                 {
-                    activeWorker = await launch
-                        .WaitAsync(deadline.Token)
-                        .ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    ObserveLateLaunch(launch);
-                    throw;
+                    deadline.ThrowIfCancellationRequested();
+                    launch = _workerLauncher.LaunchAsync(
+                        _workerExecutablePath,
+                        _workerArguments,
+                        launchSource,
+                        deadline.Capture());
+                    try
+                    {
+                        activeWorker = await launch
+                            .WaitAsync(deadline.Token)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        ObserveLateLaunch(launch);
+                        throw;
+                    }
                 }
 
                 worker = new DocumentWorkerSessionLease(
@@ -545,27 +552,6 @@ public sealed class DocumentExtractionClient
         }
     }
 
-    private async Task<IDocumentWorkerSession> LaunchWithOwnedSourceAsync(
-        SafeFileHandle source,
-        IDocumentExtractionDeadline deadline)
-    {
-        using var launchSource = DuplicateReadOnly(source);
-        deadline.ThrowIfCancellationRequested();
-        var remainingBudget = deadline.Remaining;
-        if (remainingBudget <= TimeSpan.Zero)
-        {
-            deadline.ThrowIfCancellationRequested();
-            throw new OperationCanceledException(deadline.Token);
-        }
-
-        return await _workerLauncher.LaunchAsync(
-                _workerExecutablePath,
-                _workerArguments,
-                launchSource,
-                remainingBudget)
-            .ConfigureAwait(false);
-    }
-
     private void ObserveLateLaunch(
         Task<IDocumentWorkerSession> launch)
     {
@@ -581,12 +567,9 @@ public sealed class DocumentExtractionClient
                 await launch.ConfigureAwait(false),
                 _cleanupDiagnostics);
             worker.Abort();
-            await Task.Run(
-                    async () =>
-                        await worker.CleanupAsync(
-                                new OperationCanceledException(
-                                    "The launch completed after its deadline."))
-                            .ConfigureAwait(false))
+            await worker.CleanupAsync(
+                    new OperationCanceledException(
+                        "The launch completed after its deadline."))
                 .ConfigureAwait(false);
         }
         catch (Exception)
@@ -609,10 +592,7 @@ public sealed class DocumentExtractionClient
             worker.Abort();
         }
 
-        var cleanup = Task.Run(
-            async () =>
-                await worker.CleanupAsync(primaryException)
-                    .ConfigureAwait(false));
+        var cleanup = worker.CleanupAsync(primaryException).AsTask();
         try
         {
             deadline.ThrowIfCancellationRequested();
@@ -646,7 +626,7 @@ public sealed class DocumentExtractionClient
         }
     }
 
-    private static SafeFileHandle DuplicateReadOnly(SafeFileHandle source)
+    internal static SafeFileHandle DuplicateReadOnly(SafeFileHandle source)
     {
         if (source.IsAsync)
         {

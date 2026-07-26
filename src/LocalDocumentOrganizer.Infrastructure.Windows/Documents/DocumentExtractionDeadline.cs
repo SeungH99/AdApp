@@ -14,6 +14,8 @@ internal interface IDocumentExtractionDeadline : IDisposable
 
     TimeSpan Remaining { get; }
 
+    DocumentWorkerDeadlineStamp Capture();
+
     void ThrowIfCancellationRequested();
 }
 
@@ -22,10 +24,12 @@ internal sealed class MonotonicDocumentExtractionDeadlineFactory
 {
     private readonly TimeSpan _budget;
     private readonly TimeProvider _timeProvider;
+    private readonly DedicatedMonotonicDeadlineScheduler _scheduler;
 
     internal MonotonicDocumentExtractionDeadlineFactory(
         TimeSpan budget,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        DedicatedMonotonicDeadlineScheduler? scheduler = null)
     {
         if (budget <= TimeSpan.Zero)
         {
@@ -35,6 +39,8 @@ internal sealed class MonotonicDocumentExtractionDeadlineFactory
         _budget = budget;
         _timeProvider = timeProvider
             ?? throw new ArgumentNullException(nameof(timeProvider));
+        _scheduler = scheduler
+            ?? DedicatedMonotonicDeadlineScheduler.Shared;
     }
 
     public IDocumentExtractionDeadline Start(
@@ -42,47 +48,51 @@ internal sealed class MonotonicDocumentExtractionDeadlineFactory
         new MonotonicDocumentExtractionDeadline(
             _budget,
             _timeProvider,
+            _scheduler,
             callerCancellation);
 }
 
 internal sealed class MonotonicDocumentExtractionDeadline
     : IDocumentExtractionDeadline
 {
-    private readonly TimeSpan _budget;
-    private readonly TimeProvider _timeProvider;
-    private readonly long _startedAt;
     private readonly CancellationTokenSource _timeout;
     private readonly CancellationTokenSource _linked;
+    private readonly DocumentWorkerDeadlineStamp _deadline;
+    private readonly IDedicatedDeadlineRegistration _registration;
 
     internal MonotonicDocumentExtractionDeadline(
         TimeSpan budget,
         TimeProvider timeProvider,
+        DedicatedMonotonicDeadlineScheduler scheduler,
         CancellationToken callerCancellation)
     {
-        _budget = budget;
-        _timeProvider = timeProvider;
-        _startedAt = timeProvider.GetTimestamp();
-        _timeout = new CancellationTokenSource(budget, timeProvider);
+        _timeout = new CancellationTokenSource();
         _linked = CancellationTokenSource.CreateLinkedTokenSource(
             callerCancellation,
             _timeout.Token);
+        _deadline = DocumentWorkerDeadlineStamp.FromNow(
+            budget,
+            _linked.Token,
+            timeProvider);
+        _registration = scheduler.Schedule(
+            _deadline,
+            _ =>
+            {
+                try
+                {
+                    _timeout.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            });
     }
 
     public CancellationToken Token => _linked.Token;
 
-    public TimeSpan Remaining
-    {
-        get
-        {
-            var elapsed = _timeProvider.GetElapsedTime(
-                _startedAt,
-                _timeProvider.GetTimestamp());
-            var remaining = _budget - elapsed;
-            return remaining > TimeSpan.Zero
-                ? remaining
-                : TimeSpan.Zero;
-        }
-    }
+    public TimeSpan Remaining => _deadline.Remaining;
+
+    public DocumentWorkerDeadlineStamp Capture() => _deadline;
 
     public void ThrowIfCancellationRequested()
     {
@@ -98,6 +108,7 @@ internal sealed class MonotonicDocumentExtractionDeadline
 
     public void Dispose()
     {
+        _registration.Dispose();
         _linked.Dispose();
         _timeout.Dispose();
     }
@@ -117,7 +128,7 @@ internal interface IDocumentWorkerSessionLauncher
         string executablePath,
         IReadOnlyList<string> arguments,
         SafeFileHandle source,
-        TimeSpan remainingBudget);
+        DocumentWorkerDeadlineStamp deadline);
 }
 
 internal interface IDocumentWorkerSession
@@ -190,27 +201,39 @@ internal sealed class AppContainerDocumentWorkerSessionLauncher
 {
     private readonly IWorkerLaunchFaultInjector _faultInjector;
     private readonly IDocumentWorkerCleanupDiagnostics _cleanupDiagnostics;
+    private readonly DocumentWorkerExecutionLanes _executionLanes;
 
     internal AppContainerDocumentWorkerSessionLauncher(
         IWorkerLaunchFaultInjector faultInjector,
-        IDocumentWorkerCleanupDiagnostics cleanupDiagnostics)
+        IDocumentWorkerCleanupDiagnostics cleanupDiagnostics,
+        DocumentWorkerExecutionLanes? executionLanes = null)
     {
         _faultInjector = faultInjector;
         _cleanupDiagnostics = cleanupDiagnostics;
+        _executionLanes = executionLanes
+            ?? DocumentWorkerExecutionLanes.Shared;
     }
 
     public Task<IDocumentWorkerSession> LaunchAsync(
         string executablePath,
         IReadOnlyList<string> arguments,
         SafeFileHandle source,
-        TimeSpan remainingBudget) =>
-        Task.Run<IDocumentWorkerSession>(
-            () => Launch(executablePath, arguments, source));
+        DocumentWorkerDeadlineStamp deadline) =>
+        _executionLanes.LaunchAsync<IDocumentWorkerSession>(
+            deadline,
+            source,
+            (nativeSource, cleanup) =>
+                Launch(
+                    executablePath,
+                    arguments,
+                    nativeSource,
+                    cleanup));
 
     private IDocumentWorkerSession Launch(
         string executablePath,
         IReadOnlyList<string> arguments,
-        SafeFileHandle source)
+        SafeFileHandle source,
+        DocumentWorkerCleanupReservation cleanup)
     {
         var profile = AppContainerProfile.OpenOrCreate();
         try
@@ -225,7 +248,8 @@ internal sealed class AppContainerDocumentWorkerSessionLauncher
             return new AppContainerDocumentWorkerSession(
                 worker,
                 profile,
-                _cleanupDiagnostics);
+                _cleanupDiagnostics,
+                cleanup);
         }
         catch
         {
@@ -256,16 +280,19 @@ internal sealed class AppContainerDocumentWorkerSession
     private readonly LaunchedAppContainerProcess _worker;
     private readonly AppContainerProfile _profile;
     private readonly IDocumentWorkerCleanupDiagnostics _cleanupDiagnostics;
+    private readonly DocumentWorkerCleanupReservation _cleanupReservation;
     private Task? _cleanup;
 
     internal AppContainerDocumentWorkerSession(
         LaunchedAppContainerProcess worker,
         AppContainerProfile profile,
-        IDocumentWorkerCleanupDiagnostics cleanupDiagnostics)
+        IDocumentWorkerCleanupDiagnostics cleanupDiagnostics,
+        DocumentWorkerCleanupReservation cleanupReservation)
     {
         _worker = worker;
         _profile = profile;
         _cleanupDiagnostics = cleanupDiagnostics;
+        _cleanupReservation = cleanupReservation;
     }
 
     public Stream StandardInput => _worker.StandardInput;
@@ -288,18 +315,20 @@ internal sealed class AppContainerDocumentWorkerSession
     {
         lock (_cleanupLock)
         {
-            _cleanup ??= CleanupCoreAsync(primaryException);
+            _cleanup ??= _cleanupReservation.ExecuteAsync(
+                    () => CleanupCore(primaryException))
+                .AsTask();
             return new ValueTask(_cleanup);
         }
     }
 
-    private async Task CleanupCoreAsync(Exception? primaryException)
+    private void CleanupCore(Exception? primaryException)
     {
         var cleanupFailed = false;
         var workerTerminationUnconfirmed = false;
         try
         {
-            await _worker.DisposeAsync().ConfigureAwait(false);
+            _worker.Dispose();
         }
         catch (Exception exception) when (
             exception is AppContainerLaunchException

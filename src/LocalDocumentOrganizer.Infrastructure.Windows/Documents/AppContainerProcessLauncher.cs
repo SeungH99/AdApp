@@ -661,10 +661,16 @@ public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
 
     public void Dispose()
     {
-        DisposeAsync().AsTask().GetAwaiter().GetResult();
+        DisposeCore();
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
+    {
+        DisposeCore();
+        return ValueTask.CompletedTask;
+    }
+
+    private void DisposeCore()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
@@ -703,7 +709,7 @@ public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
 
             try
             {
-                await StandardOutput.DisposeAsync().ConfigureAwait(false);
+                StandardOutput.Dispose();
             }
             catch (Exception exception)
             {
