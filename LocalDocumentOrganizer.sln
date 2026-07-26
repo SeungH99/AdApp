@@ -18,6 +18,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DocumentAdapterBench", "too
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LocalDocumentOrganizer.CorpusEval", "tools\CorpusEval\LocalDocumentOrganizer.CorpusEval.csproj", "{CB1E3B40-0215-4E8F-9DA0-EF9C58D2B754}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LocalDocumentOrganizer.CorpusWorkbench", "tools\CorpusWorkbench\LocalDocumentOrganizer.CorpusWorkbench.csproj", "{0ACB9629-1BC7-482B-94AE-98004D9FD752}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -56,5 +58,9 @@ Global
 		{CB1E3B40-0215-4E8F-9DA0-EF9C58D2B754}.Debug|x64.Build.0 = Debug|Any CPU
 		{CB1E3B40-0215-4E8F-9DA0-EF9C58D2B754}.Release|x64.ActiveCfg = Release|Any CPU
 		{CB1E3B40-0215-4E8F-9DA0-EF9C58D2B754}.Release|x64.Build.0 = Release|Any CPU
+		{0ACB9629-1BC7-482B-94AE-98004D9FD752}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{0ACB9629-1BC7-482B-94AE-98004D9FD752}.Debug|x64.Build.0 = Debug|Any CPU
+		{0ACB9629-1BC7-482B-94AE-98004D9FD752}.Release|x64.ActiveCfg = Release|Any CPU
+		{0ACB9629-1BC7-482B-94AE-98004D9FD752}.Release|x64.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal
