@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
@@ -5,6 +6,7 @@ using LocalDocumentOrganizer.CorpusWorkbench.Approval;
 using LocalDocumentOrganizer.CorpusWorkbench.Contracts;
 using LocalDocumentOrganizer.CorpusWorkbench.Labels;
 using LocalDocumentOrganizer.CorpusWorkbench.Review;
+using LocalDocumentOrganizer.CorpusWorkbench.Sampling;
 
 namespace LocalDocumentOrganizer.CorpusWorkbench.Serialization;
 
@@ -28,6 +30,9 @@ namespace LocalDocumentOrganizer.CorpusWorkbench.Serialization;
 [JsonSerializable(typeof(ReviewDecisionOutcome))]
 [JsonSerializable(typeof(ReviewError))]
 [JsonSerializable(typeof(ReviewDecisionCheckpoint))]
+[JsonSerializable(typeof(ReviewSampleProof))]
+[JsonSerializable(typeof(ReviewSampleProofPayload))]
+[JsonSerializable(typeof(ImmutableArray<ReviewCandidate>))]
 public sealed partial class WorkbenchJsonContext : JsonSerializerContext;
 
 public static class WorkbenchJson

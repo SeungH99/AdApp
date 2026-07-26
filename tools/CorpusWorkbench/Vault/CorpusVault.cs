@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using LocalDocumentOrganizer.CorpusWorkbench.Contracts;
 using LocalDocumentOrganizer.CorpusWorkbench.Persistence;
@@ -19,6 +20,11 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
         "objects\\.staging";
     private const string PreviewStagingRootRelativePath =
         "previews\\.staging";
+    private const int MaximumPreviewRecoveryOrphans = 256;
+    private const long MaximumPreviewRecoveryBytes =
+        64L * 1024 * 1024;
+    private static readonly TimeSpan MaximumPreviewRecoveryDuration =
+        TimeSpan.FromSeconds(2);
 
     private readonly ConcurrentDictionary<string, SemaphoreSlim>
         _importGates = new(StringComparer.Ordinal);
@@ -421,9 +427,17 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
     private void RecoverPreviewStagingOrphans()
     {
         var fileStore = GetFileStore();
+        var started = Stopwatch.GetTimestamp();
+        var orphanCount = 0;
+        long totalBytes = 0;
         foreach (var name in fileStore.EnumerateVerifiedFileNames(
                      PreviewStagingRootRelativePath))
         {
+            orphanCount = checked(orphanCount + 1);
+            ValidatePreviewRecoveryBudget(
+                orphanCount,
+                totalBytes,
+                Stopwatch.GetElapsedTime(started));
             if (!IsPreviewStagingName(name))
             {
                 throw new WorkbenchException(
@@ -440,10 +454,41 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
                 continue;
             }
 
+            try
+            {
+                totalBytes = checked(totalBytes + orphan.Length);
+            }
+            catch (OverflowException)
+            {
+                throw new WorkbenchException(
+                    WorkbenchFailureCode.VaultBoundaryViolation);
+            }
+
+            ValidatePreviewRecoveryBudget(
+                orphanCount,
+                totalBytes,
+                Stopwatch.GetElapsedTime(started));
             fileStore.DeleteOwnedOnClose(
                 orphan,
                 relative,
                 orphan.Length);
+        }
+    }
+
+    internal static void ValidatePreviewRecoveryBudget(
+        int orphanCount,
+        long totalBytes,
+        TimeSpan elapsed)
+    {
+        if (orphanCount < 0
+            || orphanCount > MaximumPreviewRecoveryOrphans
+            || totalBytes < 0
+            || totalBytes > MaximumPreviewRecoveryBytes
+            || elapsed < TimeSpan.Zero
+            || elapsed > MaximumPreviewRecoveryDuration)
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.VaultBoundaryViolation);
         }
     }
 

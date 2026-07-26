@@ -7,6 +7,7 @@ using LocalDocumentOrganizer.CorpusWorkbench.Labels;
 using LocalDocumentOrganizer.CorpusWorkbench.Rules;
 using LocalDocumentOrganizer.CorpusWorkbench.Review;
 using LocalDocumentOrganizer.CorpusWorkbench.Serialization;
+using LocalDocumentOrganizer.CorpusWorkbench.Sampling;
 using LocalDocumentOrganizer.CorpusWorkbench.Vault;
 using LocalDocumentOrganizer.Infrastructure.Windows.FileSystem;
 using Microsoft.Data.Sqlite;
@@ -253,6 +254,24 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         LoadReviewDecisionCheckpointAsync(
         string expectedRevisionSha256,
         CancellationToken cancellationToken)
+        => LoadReviewCheckpointAsync(
+            expectedRevisionSha256,
+            isSchedule: false,
+            cancellationToken);
+
+    internal Task<ReviewDecisionCheckpoint?>
+        LoadReviewScheduleCheckpointAsync(
+        string expectedRevisionSha256,
+        CancellationToken cancellationToken)
+        => LoadReviewCheckpointAsync(
+            expectedRevisionSha256,
+            isSchedule: true,
+            cancellationToken);
+
+    private Task<ReviewDecisionCheckpoint?> LoadReviewCheckpointAsync(
+        string expectedRevisionSha256,
+        bool isSchedule,
+        CancellationToken cancellationToken)
     {
         ValidateLowerSha256(expectedRevisionSha256);
         return ExecuteApprovalReadAsync(
@@ -272,7 +291,8 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                 command.Parameters.AddWithValue(
                     "$checkpoint_id",
                     ReviewCheckpointId(
-                        expectedRevisionSha256));
+                        expectedRevisionSha256,
+                        isSchedule));
                 await using var reader =
                     await command.ExecuteReaderAsync(
                             CancellationToken.None)
@@ -298,8 +318,148 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             cancellationToken);
     }
 
+    internal Task<ReviewSampleProof?> LoadReviewSampleProofAsync(
+        string marketId,
+        CancellationToken cancellationToken)
+    {
+        ValidateMarketId(marketId);
+        return ExecuteApprovalReadAsync(
+            async (connection, transaction) =>
+            {
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = """
+                    SELECT
+                      checkpoint_id,
+                      scope_sha256,
+                      canonical_json
+                    FROM checkpoints
+                    WHERE checkpoint_id=$checkpoint_id;
+                    """;
+                command.Parameters.AddWithValue(
+                    "$checkpoint_id",
+                    ReviewSampleCheckpointId(marketId));
+                await using var reader = await command
+                    .ExecuteReaderAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+                if (!await reader.ReadAsync(CancellationToken.None)
+                        .ConfigureAwait(false))
+                {
+                    return null;
+                }
+
+                var proof = ReadReviewSampleProof(reader);
+                if (await reader.ReadAsync(CancellationToken.None)
+                        .ConfigureAwait(false))
+                {
+                    throw InvalidState();
+                }
+
+                return proof;
+            },
+            cancellationToken);
+    }
+
+    internal Task<ReviewSampleProof> SaveReviewSampleProofAsync(
+        ReviewSampleProof proof,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(proof);
+        proof.ValidateCanonical();
+        var canonical = WorkbenchJson.Serialize(
+            proof,
+            WorkbenchJsonContext.Default.ReviewSampleProof);
+        var scopeSha256 = Convert.ToHexStringLower(
+            SHA256.HashData(canonical));
+        var checkpointId = ReviewSampleCheckpointId(
+            proof.MarketId);
+        return ExecuteApprovalWriteAsync(
+            async (connection, transaction) =>
+            {
+                await using (var read = connection.CreateCommand())
+                {
+                    read.Transaction = transaction;
+                    read.CommandText = """
+                        SELECT
+                          checkpoint_id,
+                          scope_sha256,
+                          canonical_json
+                        FROM checkpoints
+                        WHERE checkpoint_id=$checkpoint_id;
+                        """;
+                    read.Parameters.AddWithValue(
+                        "$checkpoint_id",
+                        checkpointId);
+                    await using var reader = await read
+                        .ExecuteReaderAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+                    if (await reader.ReadAsync(
+                                CancellationToken.None)
+                            .ConfigureAwait(false))
+                    {
+                        var existing = ReadReviewSampleProof(
+                            reader);
+                        if (!FixedHashEquals(
+                                existing.SampleSha256,
+                                proof.SampleSha256))
+                        {
+                            throw InvalidState();
+                        }
+
+                        return existing;
+                    }
+                }
+
+                await using var insert = connection.CreateCommand();
+                insert.Transaction = transaction;
+                insert.CommandText = """
+                    INSERT INTO checkpoints(
+                      checkpoint_id,
+                      scope_sha256,
+                      canonical_json)
+                    VALUES(
+                      $checkpoint_id,
+                      $scope_sha256,
+                      $canonical_json);
+                    """;
+                insert.Parameters.AddWithValue(
+                    "$checkpoint_id",
+                    checkpointId);
+                insert.Parameters.AddWithValue(
+                    "$scope_sha256",
+                    scopeSha256);
+                insert.Parameters.Add(
+                    "$canonical_json",
+                    SqliteType.Blob).Value = canonical;
+                if (await insert.ExecuteNonQueryAsync(
+                            CancellationToken.None)
+                        .ConfigureAwait(false) != 1)
+                {
+                    throw InvalidState();
+                }
+
+                return proof;
+            },
+            cancellationToken);
+    }
+
     internal Task<IReadOnlyList<ReviewDecisionCheckpoint>>
         LoadReviewDecisionCheckpointsAsync(
+        CancellationToken cancellationToken) =>
+        LoadReviewCheckpointsAsync(
+            isSchedule: false,
+            cancellationToken);
+
+    internal Task<IReadOnlyList<ReviewDecisionCheckpoint>>
+        LoadReviewScheduleCheckpointsAsync(
+        CancellationToken cancellationToken) =>
+        LoadReviewCheckpointsAsync(
+            isSchedule: true,
+            cancellationToken);
+
+    private Task<IReadOnlyList<ReviewDecisionCheckpoint>>
+        LoadReviewCheckpointsAsync(
+        bool isSchedule,
         CancellationToken cancellationToken) =>
         ExecuteApprovalReadAsync(
             async (connection, transaction) =>
@@ -309,7 +469,17 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                 await using var command =
                     connection.CreateCommand();
                 command.Transaction = transaction;
-                command.CommandText = """
+                command.CommandText = isSchedule
+                    ? """
+                    SELECT
+                      checkpoint_id,
+                      scope_sha256,
+                      canonical_json
+                    FROM checkpoints
+                    WHERE checkpoint_id LIKE 'review-schedule-%'
+                    ORDER BY checkpoint_id;
+                    """
+                    : """
                     SELECT
                       checkpoint_id,
                       scope_sha256,
@@ -348,10 +518,30 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         var scopeSha256 = Convert.ToHexStringLower(
             SHA256.HashData(canonical));
         var checkpointId = ReviewCheckpointId(
-            checkpoint.ExpectedRevisionSha256);
+            checkpoint.ExpectedRevisionSha256,
+            checkpoint.Decision == ReviewDecisionKind.Defer);
         return ExecuteApprovalWriteAsync(
             async (connection, transaction) =>
             {
+                if (checkpoint.Decision != ReviewDecisionKind.Defer)
+                {
+                    await using var clearSchedule =
+                        connection.CreateCommand();
+                    clearSchedule.Transaction = transaction;
+                    clearSchedule.CommandText = """
+                        DELETE FROM checkpoints
+                        WHERE checkpoint_id=$checkpoint_id;
+                        """;
+                    clearSchedule.Parameters.AddWithValue(
+                        "$checkpoint_id",
+                        ReviewCheckpointId(
+                            checkpoint.ExpectedRevisionSha256,
+                            isSchedule: true));
+                    await clearSchedule.ExecuteNonQueryAsync(
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+
                 await using (var read =
                              connection.CreateCommand())
                 {
@@ -378,14 +568,48 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                         var existing =
                             ReadReviewDecisionCheckpoint(
                                 reader);
-                        if (!SameReviewDecisionCheckpoint(
+                        if (!SameReviewDecisionRequest(
                                 existing,
                                 checkpoint))
                         {
                             throw InvalidState();
                         }
 
-                        return existing;
+                        if (existing.Completed
+                            || !checkpoint.Completed)
+                        {
+                            return existing;
+                        }
+
+                        await reader.DisposeAsync()
+                            .ConfigureAwait(false);
+                        await using var update =
+                            connection.CreateCommand();
+                        update.Transaction = transaction;
+                        update.CommandText = """
+                            UPDATE checkpoints
+                            SET
+                              scope_sha256=$scope_sha256,
+                              canonical_json=$canonical_json
+                            WHERE checkpoint_id=$checkpoint_id;
+                            """;
+                        update.Parameters.AddWithValue(
+                            "$scope_sha256",
+                            scopeSha256);
+                        update.Parameters.Add(
+                            "$canonical_json",
+                            SqliteType.Blob).Value = canonical;
+                        update.Parameters.AddWithValue(
+                            "$checkpoint_id",
+                            checkpointId);
+                        if (await update.ExecuteNonQueryAsync(
+                                    CancellationToken.None)
+                                .ConfigureAwait(false) != 1)
+                        {
+                            throw InvalidState();
+                        }
+
+                        return checkpoint;
                     }
                 }
 
@@ -425,6 +649,36 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             },
             cancellationToken);
     }
+
+    /*
+     * Terminal checkpoints may move exactly once from pending to complete.
+     * The request identity and its first accepted timestamp never change.
+     */
+    private static bool SameReviewDecisionRequest(
+        ReviewDecisionCheckpoint left,
+        ReviewDecisionCheckpoint right) =>
+        string.Equals(
+            left.SchemaVersion,
+            right.SchemaVersion,
+            StringComparison.Ordinal)
+        && string.Equals(
+            left.DocumentId,
+            right.DocumentId,
+            StringComparison.Ordinal)
+        && string.Equals(
+            left.ExpectedRevisionSha256,
+            right.ExpectedRevisionSha256,
+            StringComparison.Ordinal)
+        && string.Equals(
+            left.RequestSha256,
+            right.RequestSha256,
+            StringComparison.Ordinal)
+        && left.Decision == right.Decision
+        && (!(left.Completed && right.Completed)
+            || string.Equals(
+                left.OutcomeRevisionSha256,
+                right.OutcomeRevisionSha256,
+                StringComparison.Ordinal));
 
     internal Task<LabelDraftState> ReadApprovalLabelStateAsync(
         SqliteConnection connection,
@@ -2136,7 +2390,8 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
 
         ValidateReviewDecisionCheckpoint(checkpoint);
         var expectedId = ReviewCheckpointId(
-            checkpoint.ExpectedRevisionSha256);
+            checkpoint.ExpectedRevisionSha256,
+            checkpoint.Decision == ReviewDecisionKind.Defer);
         var expectedScope = Convert.ToHexStringLower(
             SHA256.HashData(canonical));
         if (!string.Equals(
@@ -2158,6 +2413,53 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         }
 
         return checkpoint;
+    }
+
+    private static ReviewSampleProof ReadReviewSampleProof(
+        SqliteDataReader reader)
+    {
+        var checkpointId = reader.GetString(0);
+        var persistedScope = reader.GetString(1);
+        if (reader.GetValue(2) is not byte[] canonical)
+        {
+            throw InvalidState();
+        }
+
+        ReviewSampleProof proof;
+        try
+        {
+            proof = WorkbenchJson.Parse(
+                canonical,
+                WorkbenchJsonContext.Default.ReviewSampleProof);
+            proof.ValidateCanonical();
+        }
+        catch (Exception exception) when (
+            exception is System.Text.Json.JsonException
+                or NotSupportedException
+                or WorkbenchException)
+        {
+            throw InvalidState();
+        }
+
+        var expectedScope = Convert.ToHexStringLower(
+            SHA256.HashData(canonical));
+        if (!string.Equals(
+                checkpointId,
+                ReviewSampleCheckpointId(proof.MarketId),
+                StringComparison.Ordinal)
+            || !IsLowerSha256(persistedScope)
+            || !FixedHashEquals(persistedScope, expectedScope)
+            || !CryptographicOperations.FixedTimeEquals(
+                canonical,
+                WorkbenchJson.Serialize(
+                    proof,
+                    WorkbenchJsonContext.Default
+                        .ReviewSampleProof)))
+        {
+            throw InvalidState();
+        }
+
+        return proof;
     }
 
     private static void ValidateReviewDecisionCheckpoint(
@@ -2189,40 +2491,44 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                     0,
                     0,
                     0,
-                    TimeSpan.Zero))
+                    TimeSpan.Zero)
+            || checkpoint.RecordedAtUtc
+                > DateTimeOffset.UtcNow.AddMinutes(5)
+            || checkpoint.Decision == ReviewDecisionKind.Defer
+                && !checkpoint.Completed)
         {
             throw InvalidState();
         }
     }
 
-    private static bool SameReviewDecisionCheckpoint(
-        ReviewDecisionCheckpoint left,
-        ReviewDecisionCheckpoint right) =>
-        string.Equals(
-            left.SchemaVersion,
-            right.SchemaVersion,
-            StringComparison.Ordinal)
-        && string.Equals(
-            left.DocumentId,
-            right.DocumentId,
-            StringComparison.Ordinal)
-        && string.Equals(
-            left.ExpectedRevisionSha256,
-            right.ExpectedRevisionSha256,
-            StringComparison.Ordinal)
-        && string.Equals(
-            left.RequestSha256,
-            right.RequestSha256,
-            StringComparison.Ordinal)
-        && left.Decision == right.Decision
-        && string.Equals(
-            left.OutcomeRevisionSha256,
-            right.OutcomeRevisionSha256,
-            StringComparison.Ordinal);
-
     private static string ReviewCheckpointId(
-        string expectedRevisionSha256) =>
-        "review-decision-" + expectedRevisionSha256;
+        string expectedRevisionSha256,
+        bool isSchedule) =>
+        (isSchedule
+            ? "review-schedule-"
+            : "review-decision-")
+        + expectedRevisionSha256;
+
+    private static string ReviewSampleCheckpointId(
+        string marketId) =>
+        "review-sample-" + marketId;
+
+    private static void ValidateMarketId(string marketId)
+    {
+        if (!PilotCatalog.MarketIds.Contains(
+                marketId,
+                StringComparer.Ordinal))
+        {
+            throw InvalidState();
+        }
+    }
+
+    private static bool FixedHashEquals(
+        string left,
+        string right) =>
+        CryptographicOperations.FixedTimeEquals(
+            Convert.FromHexString(left),
+            Convert.FromHexString(right));
 
     private static void ValidateLowerSha256(string value)
     {

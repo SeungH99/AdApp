@@ -1,3 +1,5 @@
+import { PreviewRequestState } from "/preview-request-state.js";
+
 const fragment = window.location.hash.slice(1);
 const validToken = /^[0-9a-f]{64}$/.test(fragment);
 history.replaceState(null, "", window.location.pathname);
@@ -32,6 +34,7 @@ const elements = {
 let currentItem = null;
 let currentPage = 0;
 let previewUrl = null;
+const previewRequestState = new PreviewRequestState();
 
 function showNotice(message) {
   elements.notice.textContent = message;
@@ -80,15 +83,15 @@ function renderFields(item) {
   }
 }
 
-function renderEvidence() {
+function renderEvidence(item, page) {
   elements.evidence.replaceChildren();
-  if (!currentItem || !elements.preview.naturalWidth || !elements.preview.naturalHeight) {
+  if (!item || !elements.preview.naturalWidth || !elements.preview.naturalHeight) {
     return;
   }
 
-  const boxes = currentItem.fields.flatMap((field) =>
+  const boxes = item.fields.flatMap((field) =>
     field.evidence
-      .filter((box) => box.sourceIndex === currentPage)
+      .filter((box) => box.sourceIndex === page)
       .map((box) => ({ ...box, fieldId: field.fieldId })),
   );
   const widthExtent = Math.max(
@@ -123,25 +126,58 @@ async function loadPreview() {
     return;
   }
 
-  const response = await api(
-    `/api/documents/${encodeURIComponent(currentItem.documentId)}/pages/${currentPage}.png`,
-  );
-  if (!response.ok || response.headers.get("content-type") !== "image/png") {
-    throw new Error("preview");
-  }
+  const item = currentItem;
+  const page = currentPage;
+  const context = previewRequestState.begin(item, page);
+  elements.previousPage.disabled = true;
+  elements.nextPage.disabled = true;
+  try {
+    const response = await api(
+      `/api/documents/${encodeURIComponent(item.documentId)}/pages/${page}.png`,
+      { signal: context.signal },
+    );
+    if (!response.ok || response.headers.get("content-type") !== "image/png") {
+      throw new Error("preview");
+    }
 
-  const blob = await response.blob();
-  if (previewUrl) {
-    URL.revokeObjectURL(previewUrl);
+    const blob = await response.blob();
+    if (!previewRequestState.isCurrent(context, currentItem, currentPage)) {
+      return;
+    }
+
+    const nextUrl = URL.createObjectURL(blob);
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl);
+    }
+    previewUrl = nextUrl;
+    elements.preview.onload = () => {
+      if (
+        previewUrl === nextUrl
+        && previewRequestState.isCurrent(
+          context,
+          currentItem,
+          currentPage,
+        )
+      ) {
+        renderEvidence(item, page);
+      }
+    };
+    elements.preview.src = nextUrl;
+    elements.pageLabel.textContent = `Page ${page + 1} of ${item.pageCount}`;
+  } catch (error) {
+    if (error?.name !== "AbortError") {
+      throw error;
+    }
+  } finally {
+    if (previewRequestState.isCurrent(context, currentItem, currentPage)) {
+      elements.previousPage.disabled = page === 0;
+      elements.nextPage.disabled = page + 1 >= item.pageCount;
+    }
   }
-  previewUrl = URL.createObjectURL(blob);
-  elements.preview.src = previewUrl;
-  elements.pageLabel.textContent = `Page ${currentPage + 1} of ${currentItem.pageCount}`;
-  elements.previousPage.disabled = currentPage === 0;
-  elements.nextPage.disabled = currentPage + 1 >= currentItem.pageCount;
 }
 
 function renderItem(item) {
+  previewRequestState.cancel();
   currentItem = item;
   currentPage = 0;
   elements.market.textContent = item.market;
@@ -158,6 +194,7 @@ async function loadNext(stale = false) {
   clearNotice();
   const response = await api("/api/review/next");
   if (response.status === 204) {
+    previewRequestState.cancel();
     currentItem = null;
     elements.workspace.hidden = true;
     elements.progress.textContent = "No pending review items";
@@ -215,17 +252,24 @@ async function submitDecision(decision) {
   }
 }
 
-elements.preview.addEventListener("load", renderEvidence);
 elements.previousPage.addEventListener("click", async () => {
   if (currentPage > 0) {
     currentPage -= 1;
-    await loadPreview();
+    try {
+      await loadPreview();
+    } catch {
+      showNotice("The requested preview page could not be loaded.");
+    }
   }
 });
 elements.nextPage.addEventListener("click", async () => {
   if (currentItem && currentPage + 1 < currentItem.pageCount) {
     currentPage += 1;
-    await loadPreview();
+    try {
+      await loadPreview();
+    } catch {
+      showNotice("The requested preview page could not be loaded.");
+    }
   }
 });
 elements.form.addEventListener("submit", async (event) => {
@@ -253,6 +297,7 @@ if (!sessionToken) {
 }
 
 window.addEventListener("pagehide", () => {
+  previewRequestState.cancel();
   if (previewUrl) {
     URL.revokeObjectURL(previewUrl);
   }

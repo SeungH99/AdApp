@@ -13,6 +13,7 @@ using LocalDocumentOrganizer.CorpusWorkbench.Contracts;
 using LocalDocumentOrganizer.CorpusWorkbench.Labels;
 using LocalDocumentOrganizer.CorpusWorkbench.Persistence;
 using LocalDocumentOrganizer.CorpusWorkbench.Rules;
+using LocalDocumentOrganizer.CorpusWorkbench.Sampling;
 using LocalDocumentOrganizer.CorpusWorkbench.Serialization;
 using LocalDocumentOrganizer.CorpusWorkbench.Vault;
 using Microsoft.AspNetCore.Builder;
@@ -111,7 +112,8 @@ public sealed record ReviewDecisionCheckpoint(
     string RequestSha256,
     ReviewDecisionKind Decision,
     string OutcomeRevisionSha256,
-    DateTimeOffset RecordedAtUtc);
+    DateTimeOffset RecordedAtUtc,
+    bool Completed = true);
 
 internal interface IReviewDataSource : IAsyncDisposable
 {
@@ -188,7 +190,8 @@ public static class ReviewHost
     {
         ValidateOptions(options);
         ArgumentNullException.ThrowIfNull(dataSource);
-        var secret = RandomNumberGenerator.GetBytes(32);
+        var sessionState = new ReviewSessionState(
+            RandomNumberGenerator.GetBytes(32));
         WebApplication? application = null;
         try
         {
@@ -220,6 +223,7 @@ public static class ReviewHost
             string? origin = null;
             string? expectedHost = null;
 
+            application.UseRouting();
             application.Use(async (context, next) =>
             {
                 ApplySecurityHeaders(context.Response);
@@ -265,9 +269,9 @@ public static class ReviewHost
 
             application.Use(async (context, next) =>
             {
-                if (!context.Request.Path.StartsWithSegments(
-                        "/api",
-                        StringComparison.Ordinal))
+                var policy = context.GetEndpoint()?.Metadata
+                    .GetMetadata<ReviewApiPolicy>();
+                if (policy is null)
                 {
                     await next(context).ConfigureAwait(false);
                     return;
@@ -275,7 +279,7 @@ public static class ReviewHost
 
                 if (!HasExactSession(
                         context.Request.Headers,
-                        secret))
+                        sessionState))
                 {
                     context.Response.StatusCode =
                         StatusCodes.Status401Unauthorized;
@@ -284,7 +288,7 @@ public static class ReviewHost
                     return;
                 }
 
-                if (HttpMethods.IsPost(context.Request.Method)
+                if (policy.RequiresOrigin
                     && (origin is null
                         || !HasExactHeader(
                             context.Request.Headers,
@@ -322,7 +326,8 @@ public static class ReviewHost
                             WorkbenchJsonContext.Default.ReviewItemView,
                             context.RequestAborted)
                         .ConfigureAwait(false);
-                });
+                })
+                .WithMetadata(ReviewApiPolicy.ReadOnly);
             application.MapGet(
                 "/api/documents/{id}/pages/{index}.png",
                 async context =>
@@ -381,7 +386,8 @@ public static class ReviewHost
                         await WriteErrorAsync(context.Response)
                             .ConfigureAwait(false);
                     }
-                });
+                })
+                .WithMetadata(ReviewApiPolicy.ReadOnly);
             application.MapPost(
                 "/api/documents/{id}/decisions",
                 async context =>
@@ -479,7 +485,8 @@ public static class ReviewHost
                         await WriteErrorAsync(context.Response)
                             .ConfigureAwait(false);
                     }
-                });
+                })
+                .WithMetadata(ReviewApiPolicy.Mutating);
 
             await application.StartAsync(cancellationToken)
                 .ConfigureAwait(false);
@@ -500,19 +507,20 @@ public static class ReviewHost
                 $"http://localhost:{bound.Port.ToString(CultureInfo.InvariantCulture)}";
             expectedHost =
                 $"localhost:{bound.Port.ToString(CultureInfo.InvariantCulture)}";
-            var token = Convert.ToHexStringLower(secret);
+            sessionState.Activate();
+            var token = sessionState.GetNavigationToken();
             var navigation = new Uri(origin + "/#" + token);
             return new ReviewHostSession(
                 application,
                 dataSource,
-                secret,
+                sessionState,
                 IPAddress.Loopback,
                 origin,
                 navigation);
         }
         catch
         {
-            CryptographicOperations.ZeroMemory(secret);
+            sessionState.Deactivate();
             if (application is not null)
             {
                 await application.DisposeAsync()
@@ -520,6 +528,7 @@ public static class ReviewHost
             }
 
             await dataSource.DisposeAsync().ConfigureAwait(false);
+            sessionState.ZeroSecret();
             throw;
         }
     }
@@ -542,6 +551,11 @@ public static class ReviewHost
             application,
             "/review.js",
             "review.js",
+            "text/javascript; charset=utf-8");
+        MapStaticAsset(
+            application,
+            "/preview-request-state.js",
+            "preview-request-state.js",
             "text/javascript; charset=utf-8");
     }
 
@@ -586,7 +600,7 @@ public static class ReviewHost
 
     private static bool HasExactSession(
         IHeaderDictionary headers,
-        byte[] expected)
+        ReviewSessionState sessionState)
     {
         if (!headers.TryGetValue(
                 SessionHeaderName,
@@ -603,10 +617,7 @@ public static class ReviewHost
         var supplied = Convert.FromHexString(value);
         try
         {
-            return supplied.Length == expected.Length
-                && CryptographicOperations.FixedTimeEquals(
-                    supplied,
-                    expected);
+            return sessionState.HasExactToken(supplied);
         }
         finally
         {
@@ -747,19 +758,19 @@ internal sealed class ReviewHostSession : IAsyncDisposable
 {
     private WebApplication? _application;
     private IReviewDataSource? _dataSource;
-    private byte[]? _secret;
+    private ReviewSessionState? _sessionState;
 
     internal ReviewHostSession(
         WebApplication application,
         IReviewDataSource dataSource,
-        byte[] secret,
+        ReviewSessionState sessionState,
         IPAddress boundAddress,
         string origin,
         Uri navigationUri)
     {
         _application = application;
         _dataSource = dataSource;
-        _secret = secret;
+        _sessionState = sessionState;
         BoundAddress = boundAddress;
         Origin = origin;
         NavigationUri = navigationUri;
@@ -781,19 +792,22 @@ internal sealed class ReviewHostSession : IAsyncDisposable
             .ConfigureAwait(false);
     }
 
+    internal void BeginShutdown() =>
+        Volatile.Read(ref _sessionState)?.Deactivate();
+
     public async ValueTask DisposeAsync()
     {
+        BeginShutdown();
         var application = Interlocked.Exchange(
             ref _application,
             null);
         var dataSource = Interlocked.Exchange(
             ref _dataSource,
             null);
-        var secret = Interlocked.Exchange(ref _secret, null);
-        if (secret is not null)
-        {
-            CryptographicOperations.ZeroMemory(secret);
-        }
+        var sessionState = Interlocked.Exchange(
+            ref _sessionState,
+            null);
+        sessionState?.Deactivate();
 
         try
         {
@@ -822,6 +836,77 @@ internal sealed class ReviewHostSession : IAsyncDisposable
                 await dataSource.DisposeAsync()
                     .ConfigureAwait(false);
             }
+
+            sessionState?.ZeroSecret();
+        }
+    }
+}
+
+internal sealed record ReviewApiPolicy(bool RequiresOrigin)
+{
+    internal static ReviewApiPolicy ReadOnly { get; } = new(false);
+
+    internal static ReviewApiPolicy Mutating { get; } = new(true);
+}
+
+internal enum ReviewDecisionFaultPoint
+{
+    AfterPendingCheckpoint,
+    AfterCorrectionPersisted,
+    AfterApprovalRecorded,
+}
+
+internal sealed class ReviewSessionState
+{
+    private byte[]? _secret;
+    private int _active;
+
+    internal ReviewSessionState(byte[] secret)
+    {
+        ArgumentNullException.ThrowIfNull(secret);
+        if (secret.Length != 32)
+        {
+            throw new ArgumentException(nameof(secret));
+        }
+
+        _secret = secret;
+    }
+
+    internal void Activate() => Volatile.Write(ref _active, 1);
+
+    internal void Deactivate() => Interlocked.Exchange(ref _active, 0);
+
+    internal bool HasExactToken(ReadOnlySpan<byte> supplied)
+    {
+        if (Volatile.Read(ref _active) == 0)
+        {
+            return false;
+        }
+
+        var secret = Volatile.Read(ref _secret);
+        return secret is { Length: 32 }
+            && supplied.Length == secret.Length
+            && CryptographicOperations.FixedTimeEquals(
+                supplied,
+                secret)
+            && Volatile.Read(ref _active) != 0;
+    }
+
+    internal string GetNavigationToken()
+    {
+        var secret = Volatile.Read(ref _secret)
+            ?? throw new ObjectDisposedException(
+                nameof(ReviewSessionState));
+        return Convert.ToHexStringLower(secret);
+    }
+
+    internal void ZeroSecret()
+    {
+        Deactivate();
+        var secret = Interlocked.Exchange(ref _secret, null);
+        if (secret is not null)
+        {
+            CryptographicOperations.ZeroMemory(secret);
         }
     }
 }
@@ -838,6 +923,10 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
         OfficialRuleCatalogSnapshot> _rules;
     private CorpusWorkerPackageWorkspace? _workerWorkspace;
     private readonly CorpusWorkerPackageIdentity _workerIdentity;
+    private readonly ImmutableDictionary<
+        string,
+        ImmutableArray<string>> _sampleIdsByMarket;
+    private readonly Action<ReviewDecisionFaultPoint>? _injectFault;
     private CorpusVault? _vault;
     private DocumentPreviewService? _preview;
 
@@ -849,7 +938,11 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
             OfficialRuleCatalogSnapshot> rules,
         CorpusWorkerPackageWorkspace workerWorkspace,
         CorpusWorkerPackageIdentity workerIdentity,
-        ApprovalLedgerService approval)
+        ApprovalLedgerService approval,
+        ImmutableDictionary<
+            string,
+            ImmutableArray<string>> sampleIdsByMarket,
+        Action<ReviewDecisionFaultPoint>? injectFault)
     {
         _vault = vault;
         _reviewerId = reviewerId;
@@ -857,12 +950,15 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
         _workerWorkspace = workerWorkspace;
         _workerIdentity = workerIdentity;
         _approval = approval;
+        _sampleIdsByMarket = sampleIdsByMarket;
+        _injectFault = injectFault;
         _preview = new DocumentPreviewService(vault);
     }
 
     internal static async Task<CorpusReviewDataSource> OpenAsync(
         ReviewHostOptions options,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<ReviewDecisionFaultPoint>? injectFault = null)
     {
         var vault = CorpusVault.OpenExisting(options.VaultRoot);
         try
@@ -897,6 +993,12 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
                 PilotCatalog.MarketIds,
                 PilotCatalog.HeldOutTargetPerMarket,
                 PilotCatalog.DirectReviewTargetPerMarket);
+            var sampleIdsByMarket = await LoadAndValidateSamplesAsync(
+                    vault,
+                    scope,
+                    states,
+                    cancellationToken)
+                .ConfigureAwait(false);
             var packageRoot = Path.TrimEndingDirectorySeparator(
                 Path.GetFullPath(AppContext.BaseDirectory));
             var executablePath = Path.GetFullPath(
@@ -946,7 +1048,9 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
                     rules,
                     workerWorkspace,
                     identity,
-                    approval);
+                    approval,
+                    sampleIdsByMarket,
+                    injectFault);
             }
             catch
             {
@@ -983,6 +1087,10 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
             .LoadReviewDecisionCheckpointsAsync(
                 cancellationToken)
             .ConfigureAwait(false);
+        var schedules = await vault.Store
+            .LoadReviewScheduleCheckpointsAsync(
+                cancellationToken)
+            .ConfigureAwait(false);
         var approvedIds = approved.Documents
             .Select(static item => item.DocumentId)
             .ToHashSet(StringComparer.Ordinal);
@@ -997,20 +1105,25 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
                         static item => item.RecordedAtUtc)
                     .First(),
                 StringComparer.Ordinal);
-        var sample = states
-            .Where(state =>
-                state.PreviousRevision is not null)
-            .OrderBy(
-                static state => state.Document.MarketId,
-                StringComparer.Ordinal)
-            .ThenBy(
-                static state => state.Document.DocumentId,
-                StringComparer.Ordinal)
+        var currentScheduleByDocument = schedules
             .GroupBy(
-                static state => state.Document.MarketId,
+                static item => item.DocumentId,
                 StringComparer.Ordinal)
-            .SelectMany(group => group.Take(
-                PilotCatalog.DirectReviewTargetPerMarket))
+            .ToDictionary(
+                static group => group.Key,
+                static group => group.Single(),
+                StringComparer.Ordinal);
+        var stateById = states.ToDictionary(
+            static state => state.Document.DocumentId,
+            StringComparer.Ordinal);
+        var sample = PilotCatalog.MarketIds
+            .SelectMany(market =>
+                _sampleIdsByMarket[market])
+            .Select(documentId =>
+                stateById.TryGetValue(documentId, out var state)
+                    ? state
+                    : throw new WorkbenchException(
+                        WorkbenchFailureCode.InvalidCheckpoint))
             .ToArray();
         var pending = sample
             .Where(state =>
@@ -1038,13 +1151,8 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
             .OrderBy(state =>
                 IsCurrentDefer(
                     state,
-                    currentDecisionByDocument))
-            .ThenBy(
-                static state => state.Document.MarketId,
-                StringComparer.Ordinal)
-            .ThenBy(
-                static state => state.Document.DocumentId,
-                StringComparer.Ordinal)
+                    currentScheduleByDocument))
+            .ThenBy(state => Array.IndexOf(sample, state))
             .ToArray();
         if (pending.Length == 0)
         {
@@ -1069,16 +1177,13 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
                 selected.Document.DocumentId,
                 cancellationToken)
             .ConfigureAwait(false);
-        ValidateReviewFields(revision.Fields, pageCount);
         var rules = _rules[selected.Document.MarketId];
-        if (!FixedHashEquals(
-                revision.RuleCatalogSha256,
-                rules.CatalogSha256)
-            || IdentityFrom(revision) != _workerIdentity)
-        {
-            throw new WorkbenchException(
-                WorkbenchFailureCode.StaleRuleSet);
-        }
+        CurrentRevisionValidator.Validate(
+            selected.Document,
+            revision,
+            rules,
+            _workerIdentity,
+            pageCount);
 
         var source = SelectOfficialSource(rules);
         return new ReviewItemView(
@@ -1118,182 +1223,133 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
             .ConfigureAwait(false);
         try
         {
-            var replayKey =
-                await RequireVault().Store
+            var store = RequireVault().Store;
+            var replayKey = await store
                     .LoadReviewDecisionCheckpointAsync(
                         request.LabelRevisionSha256,
                         cancellationToken)
                     .ConfigureAwait(false);
             if (replayKey is not null)
             {
-                if (!CryptographicOperations.FixedTimeEquals(
-                        Convert.FromHexString(
-                            replayKey.RequestSha256),
-                        Convert.FromHexString(requestHash)))
+                RequireMatchingReplay(replayKey, requestHash);
+                if (!replayKey.Completed)
                 {
-                    throw new ReviewDecisionConflictException();
-                }
-
-                if (replayKey.Decision
-                    is ReviewDecisionKind.ApproveExact
-                        or ReviewDecisionKind.CorrectAndApprove)
-                {
-                    var approved =
-                        await _approval.GetOwnerApprovalViewAsync(
+                    var recovered =
+                        await CompletePendingDecisionAsync(
+                                documentId,
+                                request,
+                                replayKey,
                                 cancellationToken)
                             .ConfigureAwait(false);
-                    if (!approved.Documents.Any(item =>
-                            string.Equals(
-                                item.DocumentId,
-                                replayKey.DocumentId,
-                                StringComparison.Ordinal)
-                            && string.Equals(
-                                item.LabelRevisionId,
-                                "revision-"
-                                    + replayKey
-                                        .OutcomeRevisionSha256,
-                                StringComparison.Ordinal)))
-                    {
-                        throw new ReviewDecisionConflictException();
-                    }
+                    await store.SaveReviewDecisionCheckpointAsync(
+                            replayKey with
+                            {
+                                OutcomeRevisionSha256 =
+                                    recovered
+                                        .LabelRevisionSha256,
+                                Completed = true,
+                            },
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    return recovered;
                 }
 
+                await RequireCompletedApprovalAsync(
+                        replayKey,
+                        cancellationToken)
+                    .ConfigureAwait(false);
                 return new ReviewDecisionOutcome(
                     false,
                     replayKey.OutcomeRevisionSha256);
             }
 
-            var vault = RequireVault();
-            var state = await vault.Store.LoadLabelStateAsync(
+            if (request.Decision == ReviewDecisionKind.Defer)
+            {
+                replayKey = await store
+                    .LoadReviewScheduleCheckpointAsync(
+                        request.LabelRevisionSha256,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (replayKey is not null)
+                {
+                    RequireMatchingReplay(replayKey, requestHash);
+                    return new ReviewDecisionOutcome(
+                        false,
+                        replayKey.OutcomeRevisionSha256);
+                }
+            }
+
+            var state = await store.LoadLabelStateAsync(
                     documentId,
                     cancellationToken)
                 .ConfigureAwait(false);
             var current = state.PreviousRevision
                 ?? throw new WorkbenchException(
                     WorkbenchFailureCode.InvalidState);
+            var pageCount = await RequirePreview()
+                .GetPageCountAsync(
+                    documentId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            CurrentRevisionValidator.Validate(
+                state.Document,
+                current,
+                _rules[state.Document.MarketId],
+                _workerIdentity,
+                pageCount);
             if (!FixedHashEquals(
                     current.RevisionSha256,
                     request.LabelRevisionSha256))
             {
-                if (request.Decision
-                        == ReviewDecisionKind.CorrectAndApprove
-                    && string.Equals(
-                        current.PreviousRevisionSha256,
-                        request.LabelRevisionSha256,
-                        StringComparison.Ordinal)
-                    && FieldsEqual(
-                        current.Fields,
-                        request.CorrectedFields))
-                {
-                    ValidateReviewFields(
-                        current.Fields,
-                        await RequirePreview()
-                            .GetPageCountAsync(
-                                documentId,
-                                cancellationToken)
-                            .ConfigureAwait(false));
-                    await RecordReviewAsync(
-                            current,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    var recovered =
-                        new ReviewDecisionOutcome(
-                            false,
-                            current.RevisionSha256);
-                    await SaveCheckpointAsync(
-                            documentId,
-                            request,
-                            requestHash,
-                            recovered,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    return recovered;
-                }
-
                 return new ReviewDecisionOutcome(
                     true,
                     current.RevisionSha256);
             }
 
-            ValidateReviewFields(
-                current.Fields,
-                await RequirePreview()
-                    .GetPageCountAsync(
-                        documentId,
-                        cancellationToken)
-                    .ConfigureAwait(false));
-            ReviewDecisionOutcome outcome;
-            switch (request.Decision)
+            var acceptedAtUtc = TimeProvider.System.GetUtcNow()
+                .ToUniversalTime();
+            if (acceptedAtUtc < current.CreatedAtUtc)
             {
-                case ReviewDecisionKind.ApproveExact:
-                    await RecordReviewAsync(
-                            current,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    outcome = new ReviewDecisionOutcome(
-                        false,
-                        current.RevisionSha256);
-                    break;
-                case ReviewDecisionKind.CorrectAndApprove:
-                    var corrected = await CorrectAsync(
-                            state,
-                            request.CorrectedFields,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    try
-                    {
-                        await RecordReviewAsync(
-                                corrected,
-                                cancellationToken)
-                            .ConfigureAwait(false);
-                    }
-                    catch (WorkbenchException)
-                    {
-                        var latest = await vault.Store
-                            .LoadLabelStateAsync(
-                                documentId,
-                                cancellationToken)
-                            .ConfigureAwait(false);
-                        if (latest.PreviousRevision is null
-                            || !FixedHashEquals(
-                                latest.PreviousRevision
-                                    .RevisionSha256,
-                                corrected.RevisionSha256))
-                        {
-                            return new ReviewDecisionOutcome(
-                                true,
-                                latest.PreviousRevision
-                                    ?.RevisionSha256
-                                ?? current.RevisionSha256);
-                        }
-
-                        throw;
-                    }
-
-                    outcome = new ReviewDecisionOutcome(
-                        false,
-                        corrected.RevisionSha256);
-                    break;
-                case ReviewDecisionKind.RejectDocument:
-                    outcome = new ReviewDecisionOutcome(
-                        false,
-                        current.RevisionSha256);
-                    break;
-                case ReviewDecisionKind.Defer:
-                    outcome = new ReviewDecisionOutcome(
-                        false,
-                        current.RevisionSha256);
-                    break;
-                default:
-                    throw new WorkbenchException(
-                        WorkbenchFailureCode.InvalidArguments);
+                acceptedAtUtc = current.CreatedAtUtc;
             }
 
-            await SaveCheckpointAsync(
+            var pending = await store
+                .SaveReviewDecisionCheckpointAsync(
+                    new ReviewDecisionCheckpoint(
+                        PilotCatalog.SchemaVersion,
+                        documentId,
+                        request.LabelRevisionSha256,
+                        requestHash,
+                        request.Decision,
+                        current.RevisionSha256,
+                        acceptedAtUtc,
+                        Completed:
+                            request.Decision
+                                == ReviewDecisionKind.Defer),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (request.Decision == ReviewDecisionKind.Defer)
+            {
+                return new ReviewDecisionOutcome(
+                    false,
+                    current.RevisionSha256);
+            }
+
+            _injectFault?.Invoke(
+                ReviewDecisionFaultPoint.AfterPendingCheckpoint);
+            var outcome = await CompletePendingDecisionAsync(
                     documentId,
                     request,
-                    requestHash,
-                    outcome,
+                    pending,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            await store.SaveReviewDecisionCheckpointAsync(
+                    pending with
+                    {
+                        OutcomeRevisionSha256 =
+                            outcome.LabelRevisionSha256,
+                        Completed = true,
+                    },
                     cancellationToken)
                 .ConfigureAwait(false);
             return outcome;
@@ -1301,6 +1357,154 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
         finally
         {
             _mutation.Release();
+        }
+    }
+
+    private async Task<ReviewDecisionOutcome>
+        CompletePendingDecisionAsync(
+        string documentId,
+        ReviewDecisionRequest request,
+        ReviewDecisionCheckpoint checkpoint,
+        CancellationToken cancellationToken)
+    {
+        var state = await RequireVault().Store.LoadLabelStateAsync(
+                documentId,
+                cancellationToken)
+            .ConfigureAwait(false);
+        var current = state.PreviousRevision
+            ?? throw new ReviewDecisionConflictException();
+        var pageCount = await RequirePreview().GetPageCountAsync(
+                documentId,
+                cancellationToken)
+            .ConfigureAwait(false);
+        CurrentRevisionValidator.Validate(
+            state.Document,
+            current,
+            _rules[state.Document.MarketId],
+            _workerIdentity,
+            pageCount);
+
+        LabelRevision outcomeRevision;
+        switch (checkpoint.Decision)
+        {
+            case ReviewDecisionKind.ApproveExact:
+                if (!FixedHashEquals(
+                        current.RevisionSha256,
+                        checkpoint.ExpectedRevisionSha256))
+                {
+                    throw new ReviewDecisionConflictException();
+                }
+
+                outcomeRevision = current;
+                await RecordReviewAsync(
+                        outcomeRevision,
+                        checkpoint.RecordedAtUtc,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                _injectFault?.Invoke(
+                    ReviewDecisionFaultPoint.AfterApprovalRecorded);
+                break;
+            case ReviewDecisionKind.CorrectAndApprove:
+                if (FixedHashEquals(
+                        current.RevisionSha256,
+                        checkpoint.ExpectedRevisionSha256))
+                {
+                    outcomeRevision = await CorrectAsync(
+                            state,
+                            request.CorrectedFields,
+                            checkpoint.RecordedAtUtc,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    _injectFault?.Invoke(
+                        ReviewDecisionFaultPoint
+                            .AfterCorrectionPersisted);
+                }
+                else if (string.Equals(
+                             current.PreviousRevisionSha256,
+                             checkpoint.ExpectedRevisionSha256,
+                             StringComparison.Ordinal)
+                         && FieldsEqual(
+                             current.Fields,
+                             request.CorrectedFields))
+                {
+                    outcomeRevision = current;
+                }
+                else
+                {
+                    throw new ReviewDecisionConflictException();
+                }
+
+                CurrentRevisionValidator.Validate(
+                    state.Document,
+                    outcomeRevision,
+                    _rules[state.Document.MarketId],
+                    _workerIdentity,
+                    pageCount);
+                await RecordReviewAsync(
+                        outcomeRevision,
+                        checkpoint.RecordedAtUtc,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                _injectFault?.Invoke(
+                    ReviewDecisionFaultPoint.AfterApprovalRecorded);
+                break;
+            case ReviewDecisionKind.RejectDocument:
+                if (!FixedHashEquals(
+                        current.RevisionSha256,
+                        checkpoint.ExpectedRevisionSha256))
+                {
+                    throw new ReviewDecisionConflictException();
+                }
+
+                outcomeRevision = current;
+                break;
+            default:
+                throw new ReviewDecisionConflictException();
+        }
+
+        return new ReviewDecisionOutcome(
+            false,
+            outcomeRevision.RevisionSha256);
+    }
+
+    private async Task RequireCompletedApprovalAsync(
+        ReviewDecisionCheckpoint checkpoint,
+        CancellationToken cancellationToken)
+    {
+        if (checkpoint.Decision is not (
+                ReviewDecisionKind.ApproveExact
+                or ReviewDecisionKind.CorrectAndApprove))
+        {
+            return;
+        }
+
+        var approved = await _approval.GetOwnerApprovalViewAsync(
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!approved.Documents.Any(item =>
+                string.Equals(
+                    item.DocumentId,
+                    checkpoint.DocumentId,
+                    StringComparison.Ordinal)
+                && string.Equals(
+                    item.LabelRevisionId,
+                    "revision-"
+                        + checkpoint.OutcomeRevisionSha256,
+                    StringComparison.Ordinal)))
+        {
+            throw new ReviewDecisionConflictException();
+        }
+    }
+
+    private static void RequireMatchingReplay(
+        ReviewDecisionCheckpoint checkpoint,
+        string requestHash)
+    {
+        if (!CryptographicOperations.FixedTimeEquals(
+                Convert.FromHexString(checkpoint.RequestSha256),
+                Convert.FromHexString(requestHash)))
+        {
+            throw new ReviewDecisionConflictException();
         }
     }
 
@@ -1333,6 +1537,7 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
     private async Task<LabelRevision> CorrectAsync(
         LabelDraftState state,
         ImmutableArray<LabeledField> correctedFields,
+        DateTimeOffset createdAtUtc,
         CancellationToken cancellationToken)
     {
         var current = state.PreviousRevision
@@ -1347,14 +1552,14 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
                 new LabelDraft(correctedFields),
                 rules,
                 _workerIdentity,
-                TimeProvider.System.GetUtcNow()
-                    .ToUniversalTime(),
+                createdAtUtc,
                 cancellationToken)
             .ConfigureAwait(false);
     }
 
     private Task<ApprovalEntry> RecordReviewAsync(
         LabelRevision revision,
+        DateTimeOffset approvedAtUtc,
         CancellationToken cancellationToken)
     {
         return _approval.RecordDirectReviewAsync(
@@ -1362,27 +1567,9 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
                 revision.DocumentId,
                 revision.RevisionId,
                 _reviewerId,
-                revision.CreatedAtUtc),
+                approvedAtUtc),
             cancellationToken);
     }
-
-    private Task<ReviewDecisionCheckpoint> SaveCheckpointAsync(
-        string documentId,
-        ReviewDecisionRequest request,
-        string requestHash,
-        ReviewDecisionOutcome outcome,
-        CancellationToken cancellationToken) =>
-        RequireVault().Store.SaveReviewDecisionCheckpointAsync(
-            new ReviewDecisionCheckpoint(
-                PilotCatalog.SchemaVersion,
-                documentId,
-                request.LabelRevisionSha256,
-                requestHash,
-                request.Decision,
-                outcome.LabelRevisionSha256,
-                TimeProvider.System.GetUtcNow()
-                    .ToUniversalTime()),
-            cancellationToken);
 
     private static async Task<ImmutableDictionary<
         string,
@@ -1409,6 +1596,78 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
         }
 
         return builder.ToImmutable();
+    }
+
+    private static async Task<ImmutableDictionary<
+        string,
+        ImmutableArray<string>>> LoadAndValidateSamplesAsync(
+        CorpusVault vault,
+        PilotScope scope,
+        IReadOnlyList<LabelDraftState> states,
+        CancellationToken cancellationToken)
+    {
+        var result = ImmutableDictionary.CreateBuilder<
+            string,
+            ImmutableArray<string>>(StringComparer.Ordinal);
+        foreach (var marketId in PilotCatalog.MarketIds)
+        {
+            var proof = await vault.Store
+                .LoadReviewSampleProofAsync(
+                    marketId,
+                    cancellationToken)
+                .ConfigureAwait(false)
+                ?? throw new WorkbenchException(
+                    WorkbenchFailureCode.InvalidCheckpoint);
+            var candidatesById = proof.Candidates.ToDictionary(
+                static candidate => candidate.DocumentId,
+                StringComparer.Ordinal);
+            var marketStates = states.Where(state =>
+                    state.PreviousRevision is not null
+                    && string.Equals(
+                        state.Document.MarketId,
+                        marketId,
+                        StringComparison.Ordinal))
+                .OrderBy(
+                    static state => state.Document.DocumentId,
+                    StringComparer.Ordinal)
+                .ToArray();
+            if (marketStates.Length != proof.Candidates.Length)
+            {
+                throw new WorkbenchException(
+                    WorkbenchFailureCode.InvalidCheckpoint);
+            }
+
+            var currentCandidates = ImmutableArray
+                .CreateBuilder<ReviewCandidate>(
+                    marketStates.Length);
+            foreach (var state in marketStates)
+            {
+                if (!candidatesById.TryGetValue(
+                        state.Document.DocumentId,
+                        out var persisted))
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.InvalidCheckpoint);
+                }
+
+                currentCandidates.Add(
+                    persisted with
+                    {
+                        ContentSha256 =
+                            state.Document.ContentSha256,
+                        SourceFamilyId =
+                            state.Document.SourceFamilyId,
+                        InputKind = state.Document.InputKind,
+                    });
+            }
+
+            var sample = proof.Validate(
+                scope,
+                currentCandidates.MoveToImmutable());
+            result.Add(marketId, sample.DocumentIds);
+        }
+
+        return result.ToImmutable();
     }
 
     private static CorpusWorkerPackageIdentity IdentityFrom(
@@ -1530,20 +1789,6 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
         }
 
         return true;
-    }
-
-    private static void ValidateReviewFields(
-        ImmutableArray<LabeledField> fields,
-        int pageCount)
-    {
-        if (fields.Length != PilotCatalog.RequiredFieldIds.Length
-            || fields.Any(field =>
-                field.Evidence.Any(evidence =>
-                    evidence.SourceIndex >= pageCount)))
-        {
-            throw new WorkbenchException(
-                WorkbenchFailureCode.MissingEvidence);
-        }
     }
 
     private static string DecisionHash(

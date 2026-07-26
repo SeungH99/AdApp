@@ -496,10 +496,13 @@ public sealed class ApprovalLedgerService
                 }
 
                 RequireCurrentBinding(state);
-                RequireReviewCoverage(
+                CurrentRevisionValidator.Validate(
+                    state.Document,
                     revision,
-                    _context.RuleIdsByMarket[
-                        state.Document.MarketId]);
+                    _context.RuleSnapshots[
+                        state.Document.MarketId],
+                    _context.WorkerIdentity,
+                    pageCount: null);
                 var payload = ApprovalDecisionPayload.Document(
                     mode,
                     actorId,
@@ -657,10 +660,13 @@ public sealed class ApprovalLedgerService
 
             try
             {
-                RequireReviewCoverage(
+                CurrentRevisionValidator.Validate(
+                    state.Document,
                     state.PreviousRevision!,
-                    _context.RuleIdsByMarket[
-                        state.Document.MarketId]);
+                    _context.RuleSnapshots[
+                        state.Document.MarketId],
+                    _context.WorkerIdentity,
+                    pageCount: null);
             }
             catch (WorkbenchException)
             {
@@ -722,9 +728,12 @@ public sealed class ApprovalLedgerService
 
         try
         {
-            RequireReviewCoverage(
+            CurrentRevisionValidator.Validate(
+                state.Document,
                 state.PreviousRevision!,
-                _context.RuleIdsByMarket[state.Document.MarketId]);
+                _context.RuleSnapshots[state.Document.MarketId],
+                _context.WorkerIdentity,
+                pageCount: null);
             return true;
         }
         catch (WorkbenchException)
@@ -805,9 +814,12 @@ public sealed class ApprovalLedgerService
                     WorkbenchFailureCode.InsufficientDirectReview);
             }
 
-            RequireReviewCoverage(
+            CurrentRevisionValidator.Validate(
+                state.Document,
                 state.PreviousRevision!,
-                _context.RuleIdsByMarket[marketId]);
+                _context.RuleSnapshots[marketId],
+                _context.WorkerIdentity,
+                pageCount: null);
             direct.Add(row.ToReference());
         }
 
@@ -1054,57 +1066,11 @@ public sealed class ApprovalLedgerService
 
     private static void RequireReviewCoverage(
         LabelRevision revision,
-        IReadOnlyDictionary<string, string>? ruleIds = null)
-    {
-        if (revision.Fields.IsDefault
-            || revision.Fields.Length
-                != PilotCatalog.RequiredFieldIds.Length
-            || !revision.Fields
-                .Select(static field => field.FieldId)
-                .SequenceEqual(
-                    PilotCatalog.RequiredFieldIds,
-                    StringComparer.Ordinal))
-        {
-            throw new WorkbenchException(
-                WorkbenchFailureCode.ReviewCoverageInsufficient);
-        }
-
-        foreach (var field in revision.Fields)
-        {
-            var absent = string.Equals(
-                field.NormalizedValue,
-                InvoiceDraftLabeler.AbsentValue,
-                StringComparison.Ordinal);
-            if (string.IsNullOrWhiteSpace(field.NormalizedValue)
-                || string.IsNullOrWhiteSpace(field.RuleId)
-                || ruleIds is not null
-                && (!ruleIds.TryGetValue(
-                        field.FieldId,
-                        out var expectedRuleId)
-                    || !string.Equals(
-                        field.RuleId,
-                        expectedRuleId,
-                        StringComparison.Ordinal))
-                || field.Evidence.IsDefault
-                || absent && !field.Evidence.IsEmpty
-                || !absent && field.Evidence.IsEmpty
-                || field.Evidence.Any(
-                    static evidence =>
-                        evidence.SourceIndex < 0
-                        || !double.IsFinite(evidence.X)
-                        || !double.IsFinite(evidence.Y)
-                        || !double.IsFinite(evidence.Width)
-                        || !double.IsFinite(evidence.Height)
-                        || evidence.X < 0
-                        || evidence.Y < 0
-                        || evidence.Width <= 0
-                        || evidence.Height <= 0))
-            {
-                throw new WorkbenchException(
-                    WorkbenchFailureCode.MissingEvidence);
-            }
-        }
-    }
+        IReadOnlyDictionary<string, string>? ruleIds = null) =>
+        CurrentRevisionValidator.ValidateFields(
+            revision.Fields,
+            ruleIds,
+            pageCount: null);
 
     private static async Task<IReadOnlyList<ApprovalLedgerRow>>
         ReadRowsAsync(
@@ -2212,6 +2178,9 @@ internal sealed record ApprovalLedgerContext(
     ImmutableDictionary<string, string> RuleCatalogs,
     ImmutableDictionary<
         string,
+        OfficialRuleCatalogSnapshot> RuleSnapshots,
+    ImmutableDictionary<
+        string,
         ImmutableDictionary<string, string>> RuleIdsByMarket,
     CorpusWorkerPackageIdentity WorkerIdentity)
 {
@@ -2253,6 +2222,11 @@ internal sealed record ApprovalLedgerContext(
                 string,
                 ImmutableDictionary<string, string>>(
                 StringComparer.Ordinal);
+        var snapshotBuilder =
+            ImmutableDictionary.CreateBuilder<
+                string,
+                OfficialRuleCatalogSnapshot>(
+                StringComparer.Ordinal);
         foreach (var rule in rules)
         {
             if (rule is null
@@ -2269,6 +2243,9 @@ internal sealed record ApprovalLedgerContext(
                 || !builder.TryAdd(
                     rule.Document.MarketId,
                     rule.CatalogSha256)
+                || !snapshotBuilder.TryAdd(
+                    rule.Document.MarketId,
+                    rule)
                 || !ruleIdsBuilder.TryAdd(
                     rule.Document.MarketId,
                     rule.Document.Rules.ToImmutableDictionary(
@@ -2290,6 +2267,7 @@ internal sealed record ApprovalLedgerContext(
         return new ApprovalLedgerContext(
             scope,
             builder.ToImmutable(),
+            snapshotBuilder.ToImmutable(),
             ruleIdsBuilder.ToImmutable(),
             workerIdentity);
     }
