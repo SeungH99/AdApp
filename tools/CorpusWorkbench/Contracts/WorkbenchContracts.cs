@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Collections.Frozen;
 
 namespace LocalDocumentOrganizer.CorpusWorkbench.Contracts;
 
@@ -158,3 +159,29 @@ public sealed record PilotReportEnvelope(
     ImmutableArray<WorkbenchFailureCode> BlockingReasons,
     ImmutableArray<PilotMarketSummary> Markets,
     string ReportSha256);
+
+public sealed record OfficialRuleSource(
+    string Id,
+    string Uri,
+    string Publisher,
+    DateOnly? PublishedOrRevisedOn,
+    DateOnly VerifiedOn);
+
+public sealed record OfficialFieldRule(
+    string RuleId,
+    string FieldId,
+    string Normalization,
+    ImmutableArray<string> AcceptedVisibleLabels,
+    ImmutableArray<string> SourceIds);
+
+public sealed record OfficialRuleCatalogDocument(
+    string SchemaVersion,
+    string MarketId,
+    string ContractId,
+    ImmutableArray<OfficialRuleSource> Sources,
+    ImmutableArray<OfficialFieldRule> Rules);
+
+public sealed record OfficialRuleCatalogSnapshot(
+    OfficialRuleCatalogDocument Document,
+    string CatalogSha256,
+    FrozenDictionary<string, OfficialFieldRule> RulesByFieldId);

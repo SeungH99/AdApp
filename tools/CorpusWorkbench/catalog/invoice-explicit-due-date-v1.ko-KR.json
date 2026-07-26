@@ -1,0 +1,79 @@
+{
+  "schemaVersion": "1",
+  "marketId": "ko-KR",
+  "contractId": "invoice-explicit-due-date-v1",
+  "sources": [
+    {
+      "id": "vat-act-article-32",
+      "uri": "https://www.law.go.kr/lsLinkCommonInfo.do?lsJoLnkSeq=1031739479",
+      "publisher": "Korea Ministry of Government Legislation",
+      "publishedOrRevisedOn": null,
+      "verifiedOn": "2026-07-26"
+    },
+    {
+      "id": "vat-act-enforcement-decree",
+      "uri": "https://www.law.go.kr/LSW/lsInfoP.do?efYd=20230516&lsiSeq=251039",
+      "publisher": "Korea Ministry of Government Legislation",
+      "publishedOrRevisedOn": "2023-05-16",
+      "verifiedOn": "2026-07-26"
+    },
+    {
+      "id": "iso-4217",
+      "uri": "https://www.iso.org/iso-4217-currency-codes.html",
+      "publisher": "International Organization for Standardization",
+      "publishedOrRevisedOn": null,
+      "verifiedOn": "2026-07-26"
+    },
+    {
+      "id": "rfc-3339",
+      "uri": "https://www.rfc-editor.org/rfc/rfc3339",
+      "publisher": "RFC Editor",
+      "publishedOrRevisedOn": null,
+      "verifiedOn": "2026-07-26"
+    }
+  ],
+  "rules": [
+    {
+      "ruleId": "ko-issuer-name",
+      "fieldId": "issuer_name",
+      "normalization": "Trim visibly printed supplier or issuer name; preserve the displayed legal name without inference.",
+      "acceptedVisibleLabels": ["\uacf5\uae09\uc790", "\uc0c1\ud638", "\uc131\uba85"],
+      "sourceIds": ["vat-act-article-32", "vat-act-enforcement-decree"]
+    },
+    {
+      "ruleId": "ko-invoice-number",
+      "fieldId": "invoice_number",
+      "normalization": "Trim the visibly printed invoice or tax-invoice identifier; do not construct an identifier from other fields.",
+      "acceptedVisibleLabels": ["\uc138\uae08\uacc4\uc0b0\uc11c\ubc88\ud638", "\uad00\ub9ac\ubc88\ud638", "\uc2b9\uc778\ubc88\ud638"],
+      "sourceIds": ["vat-act-article-32", "vat-act-enforcement-decree"]
+    },
+    {
+      "ruleId": "ko-issue-date",
+      "fieldId": "issue_date",
+      "normalization": "Emit the visibly printed issue date as RFC 3339 full-date YYYY-MM-DD.",
+      "acceptedVisibleLabels": ["\uc791\uc131\uc77c\uc790", "\ubc1c\ud589\uc77c", "\uacf5\uae09\uc77c\uc790"],
+      "sourceIds": ["vat-act-article-32", "rfc-3339"]
+    },
+    {
+      "ruleId": "ko-payment-due-date",
+      "fieldId": "payment_due_date",
+      "normalization": "Accept only an explicitly visible calendar date labeled as a payment deadline; never derive a date from relative payment terms.",
+      "acceptedVisibleLabels": ["\uc9c0\uae09\uae30\uc77c", "\uacb0\uc81c\uae30\ud55c", "\ub0a9\ubd80\uae30\ud55c"],
+      "sourceIds": ["vat-act-enforcement-decree", "rfc-3339"]
+    },
+    {
+      "ruleId": "ko-total-amount",
+      "fieldId": "total_amount",
+      "normalization": "Trim the visibly printed total payable amount; do not calculate totals from component amounts.",
+      "acceptedVisibleLabels": ["\ud569\uacc4\uae08\uc561", "\ucd1d\uc561", "\uccad\uad6c\uae08\uc561"],
+      "sourceIds": ["vat-act-article-32", "vat-act-enforcement-decree"]
+    },
+    {
+      "ruleId": "ko-currency",
+      "fieldId": "currency",
+      "normalization": "Emit the visibly printed currency as an ISO 4217 alphabetic code when explicitly stated.",
+      "acceptedVisibleLabels": ["\ud1b5\ud654", "\ud654\ud3d0\ub2e8\uc704"],
+      "sourceIds": ["iso-4217"]
+    }
+  ]
+}

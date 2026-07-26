@@ -1,0 +1,79 @@
+{
+  "schemaVersion": "1",
+  "marketId": "en-US",
+  "contractId": "invoice-explicit-due-date-v1",
+  "sources": [
+    {
+      "id": "far-32-905",
+      "uri": "https://www.acquisition.gov/far/32.905",
+      "publisher": "Acquisition.gov",
+      "publishedOrRevisedOn": null,
+      "verifiedOn": "2026-07-26"
+    },
+    {
+      "id": "far-52-232-25",
+      "uri": "https://www.acquisition.gov/far/52.232-25",
+      "publisher": "Acquisition.gov",
+      "publishedOrRevisedOn": null,
+      "verifiedOn": "2026-07-26"
+    },
+    {
+      "id": "iso-4217",
+      "uri": "https://www.iso.org/iso-4217-currency-codes.html",
+      "publisher": "International Organization for Standardization",
+      "publishedOrRevisedOn": null,
+      "verifiedOn": "2026-07-26"
+    },
+    {
+      "id": "rfc-3339",
+      "uri": "https://www.rfc-editor.org/rfc/rfc3339",
+      "publisher": "RFC Editor",
+      "publishedOrRevisedOn": null,
+      "verifiedOn": "2026-07-26"
+    }
+  ],
+  "rules": [
+    {
+      "ruleId": "us-issuer-name",
+      "fieldId": "issuer_name",
+      "normalization": "Trim the visibly printed vendor or issuer name; preserve the displayed legal name without inference.",
+      "acceptedVisibleLabels": ["Vendor", "Seller", "From"],
+      "sourceIds": ["far-32-905"]
+    },
+    {
+      "ruleId": "us-invoice-number",
+      "fieldId": "invoice_number",
+      "normalization": "Trim the visibly printed invoice number; do not construct an identifier from other fields.",
+      "acceptedVisibleLabels": ["Invoice Number", "Invoice #", "Invoice No."],
+      "sourceIds": ["far-32-905"]
+    },
+    {
+      "ruleId": "us-issue-date",
+      "fieldId": "issue_date",
+      "normalization": "Emit the visibly printed invoice or issue date as RFC 3339 full-date YYYY-MM-DD.",
+      "acceptedVisibleLabels": ["Invoice Date", "Issue Date", "Date"],
+      "sourceIds": ["far-32-905", "rfc-3339"]
+    },
+    {
+      "ruleId": "us-payment-due-date",
+      "fieldId": "payment_due_date",
+      "normalization": "Accept only an explicitly visible calendar date labeled as a payment deadline; never derive a date from relative payment terms. FAR-derived deadlines are outside this contract.",
+      "acceptedVisibleLabels": ["Payment Due Date", "Due Date", "Pay By"],
+      "sourceIds": ["far-52-232-25", "rfc-3339"]
+    },
+    {
+      "ruleId": "us-total-amount",
+      "fieldId": "total_amount",
+      "normalization": "Trim the visibly printed total payable amount; do not calculate totals from component amounts.",
+      "acceptedVisibleLabels": ["Total Amount", "Invoice Total", "Amount Due"],
+      "sourceIds": ["far-32-905"]
+    },
+    {
+      "ruleId": "us-currency",
+      "fieldId": "currency",
+      "normalization": "Emit the visibly printed currency as an ISO 4217 alphabetic code when explicitly stated.",
+      "acceptedVisibleLabels": ["Currency", "Currency Code"],
+      "sourceIds": ["iso-4217"]
+    }
+  ]
+}
