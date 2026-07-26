@@ -12,8 +12,10 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.Documents;
 
 internal enum WorkerLaunchFaultPoint
 {
+    BeforeProcessCreation,
     BeforeJobAssignment,
     BeforeThreadResume,
+    AfterThreadResume,
     BeforeOutputStreamConstruction,
     BeforeTerminationWait,
 }
@@ -58,6 +60,89 @@ public sealed class AppContainerLaunchException : Exception
             Marshal.GetExceptionForHR(result));
 }
 
+internal sealed class DocumentWorkerResumeGate : IDisposable
+{
+    private readonly object _gate = new();
+    private readonly DocumentWorkerDeadlineStamp _deadline;
+    private readonly CancellationTokenRegistration _cancellationRegistration;
+    private ResumeState _state;
+
+    internal DocumentWorkerResumeGate(
+        DocumentWorkerDeadlineStamp deadline)
+    {
+        _deadline = deadline;
+        _cancellationRegistration =
+            deadline.CancellationToken.UnsafeRegister(
+                static state =>
+                    ((DocumentWorkerResumeGate)state!).Expire(),
+                this);
+    }
+
+    internal void ThrowIfExpired()
+    {
+        lock (_gate)
+        {
+            ThrowIfExpiredUnderLock();
+        }
+    }
+
+    internal uint Resume(Func<uint> resume)
+    {
+        ArgumentNullException.ThrowIfNull(resume);
+        lock (_gate)
+        {
+            if (_state == ResumeState.Committed)
+            {
+                throw new InvalidOperationException(
+                    "The worker resume was already committed.");
+            }
+
+            ThrowIfExpiredUnderLock();
+            _state = ResumeState.Committed;
+            return resume();
+        }
+    }
+
+    public void Dispose() => _cancellationRegistration.Dispose();
+
+    private void Expire()
+    {
+        lock (_gate)
+        {
+            if (_state == ResumeState.Open)
+            {
+                _state = ResumeState.Expired;
+            }
+        }
+    }
+
+    private void ThrowIfExpiredUnderLock()
+    {
+        if (_state == ResumeState.Expired)
+        {
+            throw new OperationCanceledException(
+                _deadline.CancellationToken);
+        }
+
+        try
+        {
+            _deadline.ThrowIfExpired();
+        }
+        catch (OperationCanceledException)
+        {
+            _state = ResumeState.Expired;
+            throw;
+        }
+    }
+
+    private enum ResumeState
+    {
+        Open,
+        Expired,
+        Committed,
+    }
+}
+
 public sealed class AppContainerProcessLauncher
 {
     private readonly AppContainerProfile _profile;
@@ -80,7 +165,32 @@ public sealed class AppContainerProcessLauncher
     public LaunchedAppContainerProcess Start(
         string executablePath,
         IReadOnlyList<string> arguments,
-        SafeFileHandle source)
+        SafeFileHandle source) =>
+        StartCore(
+            executablePath,
+            arguments,
+            source,
+            deadline: null);
+
+    internal LaunchedAppContainerProcess Start(
+        string executablePath,
+        IReadOnlyList<string> arguments,
+        SafeFileHandle source,
+        DocumentWorkerDeadlineStamp deadline)
+    {
+        using var resumeGate = new DocumentWorkerResumeGate(deadline);
+        return StartCore(
+            executablePath,
+            arguments,
+            source,
+            resumeGate);
+    }
+
+    private LaunchedAppContainerProcess StartCore(
+        string executablePath,
+        IReadOnlyList<string> arguments,
+        SafeFileHandle source,
+        DocumentWorkerResumeGate? deadline)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(executablePath);
         ArgumentNullException.ThrowIfNull(arguments);
@@ -97,6 +207,7 @@ public sealed class AppContainerProcessLauncher
                 "The pinned source handle is unavailable.");
         }
 
+        deadline?.ThrowIfExpired();
         SafeFileHandle? childInput = null;
         SafeFileHandle? parentInput = null;
         SafeFileHandle? parentOutput = null;
@@ -205,6 +316,10 @@ public sealed class AppContainerProcessLauncher
                 BuildCommandLine(executablePath, arguments));
             environmentPointer = CreateMinimalEnvironmentBlock();
             job = new DocumentWorkerJob();
+            _faultInjector.ThrowIfRequested(
+                WorkerLaunchFaultPoint.BeforeProcessCreation,
+                processId);
+            deadline?.ThrowIfExpired();
             if (!WorkerNativeMethods.CreateProcessW(
                     executablePath,
                     commandLine,
@@ -225,14 +340,20 @@ public sealed class AppContainerProcessLauncher
             process = new SafeKernelHandle(processInformation.Process);
             thread = new SafeKernelHandle(processInformation.Thread);
             processId = processInformation.ProcessId;
+            deadline?.ThrowIfExpired();
             _faultInjector.ThrowIfRequested(
                 WorkerLaunchFaultPoint.BeforeJobAssignment,
                 processId);
+            deadline?.ThrowIfExpired();
             job.Assign(process);
+            deadline?.ThrowIfExpired();
             _faultInjector.ThrowIfRequested(
                 WorkerLaunchFaultPoint.BeforeThreadResume,
                 processId);
-            var previousSuspendCount = WorkerNativeMethods.ResumeThread(thread);
+            var previousSuspendCount = deadline is null
+                ? WorkerNativeMethods.ResumeThread(thread)
+                : deadline.Resume(
+                    () => WorkerNativeMethods.ResumeThread(thread));
             if (previousSuspendCount == uint.MaxValue)
             {
                 ThrowLastWin32("Suspended worker resume");
@@ -244,6 +365,9 @@ public sealed class AppContainerProcessLauncher
                     "The worker primary thread had an unexpected suspend count.");
             }
 
+            _faultInjector.ThrowIfRequested(
+                WorkerLaunchFaultPoint.AfterThreadResume,
+                processId);
             thread.Dispose();
             thread = null;
             childInput.Dispose();
@@ -304,7 +428,8 @@ public sealed class AppContainerProcessLauncher
                 }
             }
 
-            if (exception is AppContainerLaunchException)
+            if (exception is AppContainerLaunchException
+                or OperationCanceledException)
             {
                 ExceptionDispatchInfo.Capture(exception).Throw();
             }

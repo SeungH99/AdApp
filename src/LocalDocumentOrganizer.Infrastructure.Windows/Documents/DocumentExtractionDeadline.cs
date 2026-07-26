@@ -227,24 +227,29 @@ internal sealed class AppContainerDocumentWorkerSessionLauncher
                     executablePath,
                     arguments,
                     nativeSource,
-                    cleanup));
+                    cleanup,
+                    deadline));
 
     private IDocumentWorkerSession Launch(
         string executablePath,
         IReadOnlyList<string> arguments,
         SafeFileHandle source,
-        DocumentWorkerCleanupReservation cleanup)
+        DocumentWorkerCleanupReservation cleanup,
+        DocumentWorkerDeadlineStamp deadline)
     {
+        deadline.ThrowIfExpired();
         var profile = AppContainerProfile.OpenOrCreate();
         try
         {
+            deadline.ThrowIfExpired();
             var launcher = new AppContainerProcessLauncher(
                 profile,
                 _faultInjector);
             var worker = launcher.Start(
                 executablePath,
                 arguments,
-                source);
+                source,
+                deadline);
             return new AppContainerDocumentWorkerSession(
                 worker,
                 profile,
