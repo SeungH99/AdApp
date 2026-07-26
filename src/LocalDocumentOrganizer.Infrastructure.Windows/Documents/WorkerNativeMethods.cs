@@ -18,6 +18,7 @@ internal static class WorkerNativeMethods
     internal const uint FileShareRead = 0x00000001;
     internal const uint FileShareDelete = 0x00000004;
     internal const uint FileFlagSequentialScan = 0x08000000;
+    internal const uint FileNoIntermediateBuffering = 0x00000008;
     internal const uint WaitObject0 = 0;
     internal const uint WaitTimeout = 258;
     internal const uint WaitFailed = uint.MaxValue;
@@ -126,6 +127,28 @@ internal static class WorkerNativeMethods
         uint desiredAccess,
         uint shareMode,
         uint flagsAndAttributes);
+
+    internal static bool TryGetFileMode(
+        SafeFileHandle handle,
+        out uint mode)
+    {
+        var status = NtQueryInformationFile(
+            handle,
+            out _,
+            out var information,
+            (uint)Marshal.SizeOf<FileModeInformation>(),
+            fileInformationClass: 16);
+        mode = information.Mode;
+        return status >= 0;
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtQueryInformationFile(
+        SafeFileHandle handle,
+        out IoStatusBlock ioStatusBlock,
+        out FileModeInformation fileInformation,
+        uint length,
+        int fileInformationClass);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     internal static extern SafeKernelHandle CreateJobObjectW(
@@ -314,6 +337,19 @@ internal static class WorkerNativeMethods
     {
         AssociateCompletionPortInformation = 7,
         ExtendedLimitInformation = 9,
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoStatusBlock
+    {
+        internal IntPtr Status;
+        internal IntPtr Information;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileModeInformation
+    {
+        internal uint Mode;
     }
 }
 

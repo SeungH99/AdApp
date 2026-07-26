@@ -90,13 +90,26 @@ public static class DocumentExtractionValidator
             return Invalid(DocumentExtractionFailureCode.InvalidRequestedCapabilities);
         }
 
-        if (request.RequestedLanguages.IsDefault)
+        var languageValidation =
+            ValidateRequestedLanguages(request.RequestedLanguages);
+        if (!languageValidation.IsValid)
+        {
+            return languageValidation;
+        }
+
+        return new DocumentContractValidationResult(true, DocumentExtractionFailureCode.None);
+    }
+
+    public static DocumentContractValidationResult ValidateRequestedLanguages(
+        System.Collections.Immutable.ImmutableArray<string> requestedLanguages)
+    {
+        if (requestedLanguages.IsDefault)
         {
             return Invalid(DocumentExtractionFailureCode.InvalidLanguageTag);
         }
 
         var languages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var language in request.RequestedLanguages)
+        foreach (var language in requestedLanguages)
         {
             if (!IsValidLanguageTag(language))
             {
@@ -109,7 +122,9 @@ public static class DocumentExtractionValidator
             }
         }
 
-        return new DocumentContractValidationResult(true, DocumentExtractionFailureCode.None);
+        return new DocumentContractValidationResult(
+            true,
+            DocumentExtractionFailureCode.None);
     }
 
     public static DocumentContractValidationResult ValidateResponse(

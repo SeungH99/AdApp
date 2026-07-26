@@ -52,27 +52,18 @@ public sealed class DocumentExtractionClient
     private readonly IReadOnlyList<string> _workerArguments;
     private readonly ApprovedRootPathGuard? _approvedRoot;
     private readonly IWorkerLaunchFaultInjector _faultInjector;
-
-    public DocumentExtractionClient(string workerExecutablePath)
-        : this(workerExecutablePath, approvedRoot: null, workerArguments: [])
-    {
-    }
+    private readonly ImmutableArray<string> _defaultOcrLanguages;
 
     public DocumentExtractionClient(
         string workerExecutablePath,
-        ApprovedRootPathGuard? approvedRoot)
-        : this(workerExecutablePath, approvedRoot, workerArguments: [])
-    {
-    }
-
-    public DocumentExtractionClient(
-        string workerExecutablePath,
-        ApprovedRootPathGuard? approvedRoot,
-        IReadOnlyList<string> workerArguments)
+        IReadOnlyList<string> defaultOcrLanguages,
+        ApprovedRootPathGuard? approvedRoot = null,
+        IReadOnlyList<string>? workerArguments = null)
         : this(
             workerExecutablePath,
             approvedRoot,
-            workerArguments,
+            workerArguments ?? [],
+            defaultOcrLanguages,
             NoOpWorkerLaunchFaultInjector.Instance)
     {
     }
@@ -81,6 +72,7 @@ public sealed class DocumentExtractionClient
         string workerExecutablePath,
         ApprovedRootPathGuard? approvedRoot,
         IReadOnlyList<string> workerArguments,
+        IReadOnlyList<string> defaultOcrLanguages,
         IWorkerLaunchFaultInjector? faultInjector)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workerExecutablePath);
@@ -94,6 +86,8 @@ public sealed class DocumentExtractionClient
 
         _workerExecutablePath = workerExecutablePath;
         _workerArguments = workerArguments.ToArray();
+        _defaultOcrLanguages =
+            CopyAndValidateDefaultOcrLanguages(defaultOcrLanguages);
         _approvedRoot = approvedRoot;
         _faultInjector = faultInjector
             ?? NoOpWorkerLaunchFaultInjector.Instance;
@@ -107,7 +101,7 @@ public sealed class DocumentExtractionClient
                 source,
                 descriptor,
                 ExtractionCapability.EmbeddedText | ExtractionCapability.Ocr,
-                ImmutableArray<string>.Empty,
+                _defaultOcrLanguages,
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -201,7 +195,8 @@ public sealed class DocumentExtractionClient
                     descriptor,
                     cancellationToken,
                     ExtractionCapability.EmbeddedText
-                        | ExtractionCapability.Ocr)
+                        | ExtractionCapability.Ocr,
+                    _defaultOcrLanguages)
                 .ConfigureAwait(false)).Response;
         }
     }
@@ -262,7 +257,7 @@ public sealed class DocumentExtractionClient
         DocumentSourceDescriptor descriptor,
         CancellationToken cancellationToken,
         ExtractionCapability requestedCapabilities,
-        ImmutableArray<string>? requestedLanguages = null)
+        ImmutableArray<string> requestedLanguages)
     {
         byte[]? initialHash = null;
         try
@@ -303,7 +298,7 @@ public sealed class DocumentExtractionClient
                         source.Length,
                         ImmutableArray.Create(initialHash)),
                     requestedCapabilities,
-                    requestedLanguages ?? ImmutableArray<string>.Empty);
+                    requestedLanguages);
                 var requestValidation =
                     DocumentExtractionValidator.ValidateRequest(request);
                 if (!requestValidation.IsValid)
@@ -548,6 +543,14 @@ public sealed class DocumentExtractionClient
     {
         if (source.IsAsync)
         {
+            if (!WorkerNativeMethods.TryGetFileMode(source, out var mode)
+                || (mode & WorkerNativeMethods.FileNoIntermediateBuffering)
+                    != 0)
+            {
+                throw new DocumentExtractionException(
+                    DocumentExtractionFailureCode.InvalidSourceHandle);
+            }
+
             var reopened = WorkerNativeMethods.ReOpenFile(
                 source,
                 WorkerNativeMethods.FileGenericRead,
@@ -579,6 +582,31 @@ public sealed class DocumentExtractionClient
         }
 
         return new SafeFileHandle(duplicate, ownsHandle: true);
+    }
+
+    private static ImmutableArray<string> CopyAndValidateDefaultOcrLanguages(
+        IReadOnlyList<string> defaultOcrLanguages)
+    {
+        ArgumentNullException.ThrowIfNull(defaultOcrLanguages);
+        var copy = ImmutableArray.CreateRange(defaultOcrLanguages);
+        if (copy.IsEmpty)
+        {
+            throw new ArgumentException(
+                "At least one default OCR language is required.",
+                nameof(defaultOcrLanguages));
+        }
+
+        var validation =
+            DocumentExtractionValidator.ValidateRequestedLanguages(copy);
+        if (!validation.IsValid)
+        {
+            throw new ArgumentException(
+                "Default OCR languages must be normalized BCP-47 tags "
+                    + $"without duplicates ({validation.FailureCode}).",
+                nameof(defaultOcrLanguages));
+        }
+
+        return copy;
     }
 
     private static async Task<byte[]> ComputeSha256Async(

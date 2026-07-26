@@ -70,6 +70,7 @@ public static class Program
                             corpusRoot,
                             options.WorkerPath!,
                             options.WorkerSha256!,
+                            ConfiguredOcrLanguages(manifest),
                             CancellationToken.None)
                         .ConfigureAwait(false);
             await using (runner.ConfigureAwait(false))
@@ -215,6 +216,23 @@ public static class Program
         string OutputDirectory,
         string? WorkerPath,
         string? WorkerSha256);
+
+    private static IReadOnlyList<string> ConfiguredOcrLanguages(
+        CorpusManifest manifest) =>
+        manifest.Cells
+            .SelectMany(
+                static cell =>
+                    cell.CalibrationDocuments
+                        .Select(static document => document.LanguageId)
+                        .Concat(
+                            cell.HeldOutDocuments.Select(
+                                static document => document.LanguageId))
+                        .Concat(
+                            cell.PerturbationVariants.Select(
+                                static document => document.LanguageId)))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
 }
 
 public sealed class CorpusWorkerAttestationException : Exception
@@ -379,11 +397,13 @@ public sealed class PublishedWorkerCorpusObservationRunner
         string corpusRoot,
         string workerExecutablePath,
         string workerSha256,
+        IReadOnlyList<string> defaultOcrLanguages,
         VerifiedStableSource pinnedWorker)
     {
         var approvedRoot = new ApprovedRootPathGuard(corpusRoot);
         _client = new DocumentExtractionClient(
             Path.GetFullPath(workerExecutablePath),
+            defaultOcrLanguages,
             approvedRoot);
         WorkerSha256 = workerSha256;
         _pinnedWorker = pinnedWorker;
@@ -398,6 +418,7 @@ public sealed class PublishedWorkerCorpusObservationRunner
             string corpusRoot,
             string workerExecutablePath,
             string expectedWorkerSha256,
+            IReadOnlyList<string> defaultOcrLanguages,
             CancellationToken cancellationToken)
     {
         if (!IsSha256(expectedWorkerSha256)
@@ -429,6 +450,7 @@ public sealed class PublishedWorkerCorpusObservationRunner
                 corpusRoot,
                 fullPath,
                 actual,
+                defaultOcrLanguages,
                 pinned);
             pinned = null;
             return runner;
