@@ -14,6 +14,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LocalDocumentOrganizer.Loca
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LocalDocumentOrganizer.CatalogGen", "tools\LocalDocumentOrganizer.CatalogGen\LocalDocumentOrganizer.CatalogGen.csproj", "{8C1D7A56-053E-4AE2-9697-A4FC1537E393}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DocumentAdapterBench", "tools\DocumentAdapterBench\DocumentAdapterBench.csproj", "{B4D23D3D-8A21-4BE8-9428-D6E240C5FB62}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LocalDocumentOrganizer.CorpusEval", "tools\CorpusEval\LocalDocumentOrganizer.CorpusEval.csproj", "{CB1E3B40-0215-4E8F-9DA0-EF9C58D2B754}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -44,5 +48,13 @@ Global
 		{8C1D7A56-053E-4AE2-9697-A4FC1537E393}.Debug|x64.Build.0 = Debug|Any CPU
 		{8C1D7A56-053E-4AE2-9697-A4FC1537E393}.Release|x64.ActiveCfg = Release|Any CPU
 		{8C1D7A56-053E-4AE2-9697-A4FC1537E393}.Release|x64.Build.0 = Release|Any CPU
+		{B4D23D3D-8A21-4BE8-9428-D6E240C5FB62}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{B4D23D3D-8A21-4BE8-9428-D6E240C5FB62}.Debug|x64.Build.0 = Debug|Any CPU
+		{B4D23D3D-8A21-4BE8-9428-D6E240C5FB62}.Release|x64.ActiveCfg = Release|Any CPU
+		{B4D23D3D-8A21-4BE8-9428-D6E240C5FB62}.Release|x64.Build.0 = Release|Any CPU
+		{CB1E3B40-0215-4E8F-9DA0-EF9C58D2B754}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{CB1E3B40-0215-4E8F-9DA0-EF9C58D2B754}.Debug|x64.Build.0 = Debug|Any CPU
+		{CB1E3B40-0215-4E8F-9DA0-EF9C58D2B754}.Release|x64.ActiveCfg = Release|Any CPU
+		{CB1E3B40-0215-4E8F-9DA0-EF9C58D2B754}.Release|x64.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

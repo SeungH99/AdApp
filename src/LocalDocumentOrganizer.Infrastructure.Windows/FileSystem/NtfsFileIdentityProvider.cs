@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using LocalDocumentOrganizer.Core.Transactions;
 using Microsoft.Win32.SafeHandles;
 
@@ -79,7 +80,7 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
             ? handle
             : throw new ObjectDisposedException(nameof(VerifiedStableSource));
 
-    internal long Length { get; }
+    public long Length { get; }
 
     internal DateTimeOffset LastWriteTimeUtc { get; }
 
@@ -136,6 +137,90 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
         _ = Handle;
         RequireSingleLink(
             WindowsFileSystemNative.GetLinkCount(Handle));
+    }
+
+    public async Task<byte[]> ComputeSha256Async(
+        CancellationToken cancellationToken)
+    {
+        RequireSingleLink();
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[81_920];
+        try
+        {
+            long offset = 0;
+            while (offset < Length)
+            {
+                var count = (int)Math.Min(buffer.Length, Length - offset);
+                var read = await RandomAccess.ReadAsync(
+                        Handle,
+                        buffer.AsMemory(0, count),
+                        offset,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (read == 0)
+                {
+                    throw new StableSourceBoundaryException(
+                        StableSourceBoundaryFailure.MissingFileId);
+                }
+
+                hash.AppendData(buffer, 0, read);
+                offset += read;
+            }
+
+            RequireSingleLink();
+            return hash.GetHashAndReset();
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(buffer);
+        }
+    }
+
+    public async Task CopyToAsync(
+        Stream destination,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        if (!destination.CanWrite)
+        {
+            throw new ArgumentException(
+                "The destination stream must be writable.",
+                nameof(destination));
+        }
+
+        RequireSingleLink();
+        var buffer = new byte[81_920];
+        try
+        {
+            long offset = 0;
+            while (offset < Length)
+            {
+                var count = (int)Math.Min(buffer.Length, Length - offset);
+                var read = await RandomAccess.ReadAsync(
+                        Handle,
+                        buffer.AsMemory(0, count),
+                        offset,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (read == 0)
+                {
+                    throw new StableSourceBoundaryException(
+                        StableSourceBoundaryFailure.MissingFileId);
+                }
+
+                await destination.WriteAsync(
+                        buffer.AsMemory(0, read),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                offset += read;
+            }
+
+            RequireSingleLink();
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(buffer);
+        }
     }
 
     internal void AttachPinnedAncestors(
