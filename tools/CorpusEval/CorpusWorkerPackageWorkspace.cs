@@ -11,6 +11,7 @@ public sealed class CorpusWorkerPackageWorkspace :
     private CorpusWorkerPackageLease? _packageLease;
     private CorpusProtectedRootSet? _protectedRoots;
     private readonly CorpusWorkerPackageDeadlineFactory _deadlineFactory;
+    private readonly Action? _afterFinalRevalidation;
     private readonly string _workspaceParent;
     private string? _workspaceRoot;
     private int _disposed;
@@ -20,13 +21,15 @@ public sealed class CorpusWorkerPackageWorkspace :
         CorpusProtectedRootSet protectedRoots,
         string workspaceParent,
         string workspaceRoot,
-        CorpusWorkerPackageDeadlineFactory deadlineFactory)
+        CorpusWorkerPackageDeadlineFactory deadlineFactory,
+        Action? afterFinalRevalidation)
     {
         _packageLease = packageLease;
         _protectedRoots = protectedRoots;
         _workspaceParent = workspaceParent;
         _workspaceRoot = workspaceRoot;
         _deadlineFactory = deadlineFactory;
+        _afterFinalRevalidation = afterFinalRevalidation;
         StagedExecutablePath = packageLease.StagedExecutablePath;
         Identity = packageLease.Identity;
     }
@@ -62,6 +65,28 @@ public sealed class CorpusWorkerPackageWorkspace :
         TimeSpan operationTimeout,
         TimeProvider timeProvider,
         Func<CancellationToken, Task>? beforePackageOperation)
+        => await OpenAsync(
+                packageRoot,
+                workerExecutablePath,
+                expectedPackageSha256,
+                corpusRoot,
+                cancellationToken,
+                operationTimeout,
+                timeProvider,
+                beforePackageOperation,
+                afterFinalRevalidation: null)
+            .ConfigureAwait(false);
+
+    internal static async Task<CorpusWorkerPackageWorkspace> OpenAsync(
+        string packageRoot,
+        string workerExecutablePath,
+        string expectedPackageSha256,
+        string corpusRoot,
+        CancellationToken cancellationToken,
+        TimeSpan operationTimeout,
+        TimeProvider timeProvider,
+        Func<CancellationToken, Task>? beforePackageOperation,
+        Action? afterFinalRevalidation)
     {
         if (!Path.IsPathFullyQualified(packageRoot)
             || !Path.IsPathFullyQualified(workerExecutablePath)
@@ -90,7 +115,8 @@ public sealed class CorpusWorkerPackageWorkspace :
                     corpusRoot,
                     deadline,
                     deadlineFactory,
-                    beforePackageOperation)
+                    beforePackageOperation,
+                    afterFinalRevalidation)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -108,7 +134,8 @@ public sealed class CorpusWorkerPackageWorkspace :
         string corpusRoot,
         CorpusWorkerPackageDeadline deadline,
         CorpusWorkerPackageDeadlineFactory deadlineFactory,
-        Func<CancellationToken, Task>? beforePackageOperation)
+        Func<CancellationToken, Task>? beforePackageOperation,
+        Action? afterFinalRevalidation)
     {
         CorpusWorkerPackageLease? packageLease = null;
         CorpusProtectedRootSet? protectedRoots = null;
@@ -160,12 +187,15 @@ public sealed class CorpusWorkerPackageWorkspace :
                 .ConfigureAwait(false);
             deadline.ThrowIfCancellationRequested();
             protectedRoots.Revalidate();
+            afterFinalRevalidation?.Invoke();
+            deadline.ThrowIfCancellationRequested();
             var workspace = new CorpusWorkerPackageWorkspace(
                 packageLease,
                 protectedRoots,
                 workspaceParent,
                 workspaceRoot,
-                deadlineFactory);
+                deadlineFactory,
+                afterFinalRevalidation);
             packageLease = null;
             protectedRoots = null;
             workspaceParent = null;
@@ -223,6 +253,8 @@ public sealed class CorpusWorkerPackageWorkspace :
             await lease.VerifyAsync(deadline.Token).ConfigureAwait(false);
             deadline.ThrowIfCancellationRequested();
             roots.Revalidate();
+            _afterFinalRevalidation?.Invoke();
+            deadline.ThrowIfCancellationRequested();
         }
         catch (OperationCanceledException)
             when (!cancellationToken.IsCancellationRequested)
