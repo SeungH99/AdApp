@@ -15,6 +15,9 @@ internal static class WorkerNativeMethods
     internal const uint StartfUseStdHandles = 0x00000100;
     internal const uint HandleFlagInherit = 0x00000001;
     internal const uint FileGenericRead = 0x00120089;
+    internal const uint FileShareRead = 0x00000001;
+    internal const uint FileShareDelete = 0x00000004;
+    internal const uint FileFlagSequentialScan = 0x08000000;
     internal const uint WaitObject0 = 0;
     internal const uint WaitTimeout = 258;
     internal const uint WaitFailed = uint.MaxValue;
@@ -116,6 +119,13 @@ internal static class WorkerNativeMethods
         uint desiredAccess,
         [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
         uint options);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern SafeFileHandle ReOpenFile(
+        SafeFileHandle originalFile,
+        uint desiredAccess,
+        uint shareMode,
+        uint flagsAndAttributes);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     internal static extern SafeKernelHandle CreateJobObjectW(

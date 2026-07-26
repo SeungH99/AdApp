@@ -546,6 +546,24 @@ public sealed class DocumentExtractionClient
 
     private static SafeFileHandle DuplicateReadOnly(SafeFileHandle source)
     {
+        if (source.IsAsync)
+        {
+            var reopened = WorkerNativeMethods.ReOpenFile(
+                source,
+                WorkerNativeMethods.FileGenericRead,
+                WorkerNativeMethods.FileShareRead
+                    | WorkerNativeMethods.FileShareDelete,
+                WorkerNativeMethods.FileFlagSequentialScan);
+            if (!reopened.IsInvalid)
+            {
+                return reopened;
+            }
+
+            reopened.Dispose();
+            throw new DocumentExtractionException(
+                DocumentExtractionFailureCode.InvalidSourceHandle);
+        }
+
         var process = WorkerNativeMethods.GetCurrentProcess();
         if (!WorkerNativeMethods.DuplicateHandle(
                 process,

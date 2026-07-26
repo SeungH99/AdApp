@@ -52,7 +52,7 @@ internal static class WindowsFileSystemNative
             FileShareRead,
             IntPtr.Zero,
             OpenExisting,
-            FileFlagOpenReparsePoint | FileFlagSequentialScan | FileFlagOverlapped,
+            FileFlagOpenReparsePoint | FileFlagSequentialScan,
             IntPtr.Zero);
         if (handle.IsInvalid)
         {
