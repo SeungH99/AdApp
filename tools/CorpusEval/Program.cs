@@ -35,12 +35,15 @@ public static class Program
             return CorpusEvalExitCodes.InvalidArguments;
         }
 
+        CorpusProtectedDirectoryLease? corpusBoundary = null;
         try
         {
             var manifestPath = Path.GetFullPath(options.ManifestPath);
             var corpusRoot = Path.GetDirectoryName(manifestPath)
                 ?? throw new ArgumentException("Manifest root is unavailable.");
             var outputDirectory = Path.GetFullPath(options.OutputDirectory);
+            corpusBoundary =
+                CorpusProtectedDirectoryLease.OpenExisting(corpusRoot);
             var manifestBytes = await File.ReadAllBytesAsync(manifestPath)
                 .ConfigureAwait(false);
             var manifest = CorpusManifestJson.Parse(manifestBytes);
@@ -67,18 +70,32 @@ public static class Program
                 return CorpusEvalExitCodes.InvalidArguments;
             }
 
-            ICorpusObservationRunner runner =
-                manifest.CorpusKind == CorpusKind.Synthetic
-                    ? new SyntheticCorpusObservationRunner()
-                    : await PublishedWorkerCorpusObservationRunner.CreateAsync(
+            ICorpusObservationRunner runner;
+            if (manifest.CorpusKind == CorpusKind.Synthetic)
+            {
+                corpusBoundary.Dispose();
+                corpusBoundary = null;
+                runner = new SyntheticCorpusObservationRunner();
+            }
+            else
+            {
+                var protectedRoots = CorpusProtectedRootSet.Create(
+                    options.WorkerPackageRoot!,
+                    corpusBoundary,
+                    outputDirectory);
+                corpusBoundary = null;
+                runner =
+                    await PublishedWorkerCorpusObservationRunner.CreateAsync(
                             corpusRoot,
-                            outputDirectory,
+                            protectedRoots,
                             options.WorkerPackageRoot!,
                             options.WorkerPath!,
                             options.WorkerPackageSha256!,
                             ConfiguredOcrLanguages(manifest),
                             CancellationToken.None)
                         .ConfigureAwait(false);
+            }
+
             await using (runner.ConfigureAwait(false))
             {
                 Directory.CreateDirectory(outputDirectory);
@@ -137,6 +154,10 @@ public static class Program
         {
             Console.Error.WriteLine("corpus-eval:evaluation-failure");
             return CorpusEvalExitCodes.EvaluationFailure;
+        }
+        finally
+        {
+            corpusBoundary?.Dispose();
         }
     }
 
@@ -407,11 +428,13 @@ public sealed class PublishedWorkerCorpusObservationRunner
 {
     private readonly DocumentExtractionClient _client;
     private readonly CorpusWorkerPackageLease _packageLease;
+    private readonly CorpusProtectedRootSet _protectedRoots;
     private int _attestationCompleted;
 
     private PublishedWorkerCorpusObservationRunner(
         string corpusRoot,
         CorpusWorkerPackageLease packageLease,
+        CorpusProtectedRootSet protectedRoots,
         IReadOnlyList<string> defaultOcrLanguages,
         CorpusWorkerPackageIdentity packageIdentity)
     {
@@ -422,6 +445,7 @@ public sealed class PublishedWorkerCorpusObservationRunner
             approvedRoot);
         WorkerPackageIdentity = packageIdentity;
         _packageLease = packageLease;
+        _protectedRoots = protectedRoots;
     }
 
     public bool IsEmpirical => true;
@@ -431,37 +455,41 @@ public sealed class PublishedWorkerCorpusObservationRunner
     public static async Task<PublishedWorkerCorpusObservationRunner>
         CreateAsync(
             string corpusRoot,
-            string outputDirectory,
+            CorpusProtectedRootSet protectedRoots,
             string workerPackageRoot,
             string workerExecutablePath,
             string expectedWorkerPackageSha256,
             IReadOnlyList<string> defaultOcrLanguages,
             CancellationToken cancellationToken)
     {
-        if (!Path.IsPathFullyQualified(workerPackageRoot)
-            || !Path.IsPathFullyQualified(workerExecutablePath)
-            || !Path.IsPathFullyQualified(corpusRoot)
-            || !Path.IsPathFullyQualified(outputDirectory))
-        {
-            throw new CorpusWorkerAttestationException();
-        }
-
+        ArgumentNullException.ThrowIfNull(protectedRoots);
         CorpusWorkerPackageLease? lease = null;
+        CorpusProtectedRootSet? ownedRoots = protectedRoots;
         try
         {
+            if (!Path.IsPathFullyQualified(workerPackageRoot)
+                || !Path.IsPathFullyQualified(workerExecutablePath)
+                || !Path.IsPathFullyQualified(corpusRoot))
+            {
+                throw new CorpusWorkerAttestationException();
+            }
+
+            ownedRoots.Revalidate();
             lease = await CorpusWorkerPackageLease.CreateAsync(
                     workerPackageRoot,
                     workerExecutablePath,
                     expectedWorkerPackageSha256,
-                    [corpusRoot, outputDirectory],
+                    ownedRoots,
                     cancellationToken)
                 .ConfigureAwait(false);
             var runner = new PublishedWorkerCorpusObservationRunner(
                 corpusRoot,
                 lease,
+                ownedRoots,
                 defaultOcrLanguages,
                 lease.Identity);
             lease = null;
+            ownedRoots = null;
             return runner;
         }
         catch (CorpusWorkerAttestationException)
@@ -483,11 +511,22 @@ public sealed class PublishedWorkerCorpusObservationRunner
             {
                 await lease.DisposeAsync().ConfigureAwait(false);
             }
+
+            ownedRoots?.Dispose();
         }
     }
 
-    public ValueTask DisposeAsync() =>
-        _packageLease.DisposeAsync();
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            await _packageLease.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            _protectedRoots.Dispose();
+        }
+    }
 
     public async Task CompleteAttestationAsync(
         CancellationToken cancellationToken)
@@ -499,9 +538,12 @@ public sealed class PublishedWorkerCorpusObservationRunner
             return;
         }
 
+        _protectedRoots.Revalidate();
         await _packageLease.VerifyAsync(cancellationToken)
             .ConfigureAwait(false);
+        _protectedRoots.Revalidate();
         await _packageLease.DisposeAsync().ConfigureAwait(false);
+        _protectedRoots.Revalidate();
     }
 
     public async ValueTask<CorpusObservation> ObserveAsync(

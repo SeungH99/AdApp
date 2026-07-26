@@ -465,7 +465,7 @@ public sealed class CorpusWorkerPackageLease
         string packageRoot,
         string workerExecutablePath,
         string expectedPackageSha256,
-        IReadOnlyList<string> protectedRoots,
+        CorpusProtectedRootSet protectedRoots,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(protectedRoots);
@@ -485,9 +485,9 @@ public sealed class CorpusWorkerPackageLease
             "worker-stage");
         try
         {
+            protectedRoots.Revalidate();
             var fullPackageRoot = Path.TrimEndingDirectorySeparator(
                 Path.GetFullPath(packageRoot));
-            RequireDisjoint(fullPackageRoot, protectedRoots);
             source = await CorpusWorkerPackageSnapshot.CaptureAsync(
                     fullPackageRoot,
                     workerExecutablePath,
@@ -506,8 +506,8 @@ public sealed class CorpusWorkerPackageLease
             stageRoot = Path.Combine(
                 stageParent,
                 StageDirectoryPrefix + Guid.NewGuid().ToString("N"));
-            RequireDisjoint(stageRoot, protectedRoots);
             CreatePrivateStageDirectory(stageRoot);
+            protectedRoots.RequireDisjointExisting(stageRoot);
             await source.CopyToAsync(stageRoot, cancellationToken)
                 .ConfigureAwait(false);
             foreach (var entry in source.Entries)
@@ -616,36 +616,6 @@ public sealed class CorpusWorkerPackageLease
             throw new CorpusWorkerAttestationException();
         }
     }
-
-    private static void RequireDisjoint(
-        string boundaryRoot,
-        IEnumerable<string> protectedRoots)
-    {
-        foreach (var protectedRoot in protectedRoots)
-        {
-            if (string.IsNullOrWhiteSpace(protectedRoot)
-                || !Path.IsPathFullyQualified(protectedRoot))
-            {
-                throw new CorpusWorkerAttestationException();
-            }
-
-            var full = Path.TrimEndingDirectorySeparator(
-                Path.GetFullPath(protectedRoot));
-            if (Contains(boundaryRoot, full)
-                || Contains(full, boundaryRoot))
-            {
-                throw new CorpusWorkerAttestationException();
-            }
-        }
-    }
-
-    private static bool Contains(string root, string candidate) =>
-        string.Equals(root, candidate, StringComparison.OrdinalIgnoreCase)
-        || candidate.StartsWith(
-            Path.EndsInDirectorySeparator(root)
-                ? root
-                : root + Path.DirectorySeparatorChar,
-            StringComparison.OrdinalIgnoreCase);
 
     private static void CreatePrivateStageDirectory(string stageRoot)
     {
