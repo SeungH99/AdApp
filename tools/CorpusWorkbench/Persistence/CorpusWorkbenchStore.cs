@@ -231,6 +231,111 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         return state;
     }
 
+    internal Task<LabelDraftState> ReadApprovalLabelStateAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string documentId) =>
+        ReadLabelStateAsync(
+            connection,
+            transaction,
+            documentId,
+            CancellationToken.None);
+
+    internal async Task<IReadOnlyList<LabelDraftState>>
+        ReadAllApprovalLabelStatesAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction)
+    {
+        var documentIds = new List<string>();
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT document_id
+                FROM documents
+                ORDER BY document_id;
+                """;
+            await using var reader =
+                await command.ExecuteReaderAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+            while (await reader.ReadAsync(CancellationToken.None)
+                       .ConfigureAwait(false))
+            {
+                documentIds.Add(reader.GetString(0));
+            }
+        }
+
+        var states = new List<LabelDraftState>(documentIds.Count);
+        foreach (var documentId in documentIds)
+        {
+            states.Add(
+                await ReadLabelStateAsync(
+                        connection,
+                        transaction,
+                        documentId,
+                        CancellationToken.None)
+                    .ConfigureAwait(false));
+        }
+
+        return states;
+    }
+
+    internal async Task<T> ExecuteApprovalWriteAsync<T>(
+        Func<SqliteConnection, SqliteTransaction, Task<T>> operation,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(operation);
+        cancellationToken.ThrowIfCancellationRequested();
+        await using var connection =
+            await OpenConnectionAsync(cancellationToken)
+                .ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        await using var transaction =
+            connection.BeginTransaction(deferred: false);
+        try
+        {
+            RevalidateDatabaseSet();
+            ValidateSchema(connection, transaction);
+            var result = await operation(connection, transaction)
+                .ConfigureAwait(false);
+            ValidateSchema(connection, transaction);
+            RevalidateDatabaseSet();
+            await transaction.CommitAsync(CancellationToken.None)
+                .ConfigureAwait(false);
+            return result;
+        }
+        catch
+        {
+            try
+            {
+                await transaction.RollbackAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // The primary transaction failure remains canonical.
+            }
+
+            throw;
+        }
+    }
+
+    internal async Task<T> ExecuteApprovalReadAsync<T>(
+        Func<SqliteConnection, Task<T>> operation,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(operation);
+        await using var connection =
+            await OpenConnectionAsync(cancellationToken)
+                .ConfigureAwait(false);
+        ValidateSchema(connection, transaction: null);
+        var result = await operation(connection).ConfigureAwait(false);
+        RevalidateDatabaseSet();
+        return result;
+    }
+
     internal async Task<LabelRevision> PersistLabelRevisionAsync(
         LabelDraftState expectedState,
         LabelDraft draft,

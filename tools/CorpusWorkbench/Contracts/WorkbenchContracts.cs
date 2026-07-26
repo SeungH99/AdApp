@@ -131,17 +131,48 @@ public sealed record LabelRevision(
     DateTimeOffset CreatedAtUtc);
 
 public sealed record ApprovalEntry(
+    long Sequence,
     string EntryId,
     ApprovalMode Mode,
     string ScopeId,
+    string PilotEpoch,
+    string MarketId,
+    string ContractId,
+    string? DocumentId,
     string? DocumentSha256,
+    string? LabelRevisionId,
     string? LabelRevisionSha256,
+    string? PreviousRevisionId,
+    string? PreviousRevisionSha256,
+    DateTimeOffset? LabelRevisionCreatedAtUtc,
+    ImmutableArray<LabeledField> Fields,
     string RuleCatalogSha256,
+    string WorkerPackageManifestId,
+    string WorkerPackageManifestVersion,
     string WorkerPackageSha256,
+    string WorkerExecutableRelativePath,
+    string WorkerExecutableSha256,
     string ReviewerId,
     DateTimeOffset ApprovedAtUtc,
+    string? BatchSummarySha256,
+    ImmutableArray<ApprovalEntryReference> DelegatedEntries,
+    ImmutableArray<ApprovalEntryReference> DirectReviewEntries,
     string PreviousEntrySha256,
     string EntrySha256);
+
+public sealed record ApprovalEntryReference(
+    string EntryId,
+    string EntrySha256,
+    string DocumentId,
+    string DocumentSha256,
+    string LabelRevisionId,
+    string LabelRevisionSha256,
+    string RuleCatalogSha256,
+    string WorkerPackageManifestId,
+    string WorkerPackageManifestVersion,
+    string WorkerPackageSha256,
+    string WorkerExecutableRelativePath,
+    string WorkerExecutableSha256);
 
 public sealed record PilotMarketSummary(
     string MarketId,

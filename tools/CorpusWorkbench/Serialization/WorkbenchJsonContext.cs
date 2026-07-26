@@ -16,6 +16,7 @@ namespace LocalDocumentOrganizer.CorpusWorkbench.Serialization;
 [JsonSerializable(typeof(LabelRevision))]
 [JsonSerializable(typeof(LabelDraft))]
 [JsonSerializable(typeof(ApprovalEntry))]
+[JsonSerializable(typeof(ApprovalEntryReference))]
 [JsonSerializable(typeof(PilotReportEnvelope))]
 [JsonSerializable(typeof(OfficialRuleCatalogDocument))]
 public sealed partial class WorkbenchJsonContext : JsonSerializerContext;
