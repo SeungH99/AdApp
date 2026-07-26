@@ -102,6 +102,20 @@ public sealed class DocumentExtractionClient
     public async Task<DocumentExtractionResponse> ExtractAsync(
         SafeFileHandle source,
         DocumentSourceDescriptor descriptor,
+        CancellationToken cancellationToken) =>
+        await ExtractAsync(
+                source,
+                descriptor,
+                ExtractionCapability.EmbeddedText | ExtractionCapability.Ocr,
+                ImmutableArray<string>.Empty,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    public async Task<DocumentExtractionResponse> ExtractAsync(
+        SafeFileHandle source,
+        DocumentSourceDescriptor descriptor,
+        ExtractionCapability requestedCapabilities,
+        ImmutableArray<string> requestedLanguages,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(source);
@@ -128,7 +142,9 @@ public sealed class DocumentExtractionClient
             return (await ExtractVerifiedAsync(
                     verified,
                     descriptor,
-                    cancellationToken)
+                    cancellationToken,
+                    requestedCapabilities,
+                    requestedLanguages)
                 .ConfigureAwait(false)).Response;
         }
         catch (Exception exception) when (
@@ -183,7 +199,9 @@ public sealed class DocumentExtractionClient
             return (await ExtractVerifiedAsync(
                     verified,
                     descriptor,
-                    cancellationToken)
+                    cancellationToken,
+                    ExtractionCapability.EmbeddedText
+                        | ExtractionCapability.Ocr)
                 .ConfigureAwait(false)).Response;
         }
     }
@@ -231,6 +249,8 @@ public sealed class DocumentExtractionClient
                     verified,
                     descriptor,
                     cancellationToken,
+                    ExtractionCapability.EmbeddedText
+                        | ExtractionCapability.Ocr,
                     requestedLanguages)
                 .ConfigureAwait(false);
         }
@@ -241,6 +261,7 @@ public sealed class DocumentExtractionClient
         VerifiedStableSource source,
         DocumentSourceDescriptor descriptor,
         CancellationToken cancellationToken,
+        ExtractionCapability requestedCapabilities,
         ImmutableArray<string>? requestedLanguages = null)
     {
         byte[]? initialHash = null;
@@ -281,7 +302,7 @@ public sealed class DocumentExtractionClient
                         descriptor.DeclaredMimeType,
                         source.Length,
                         ImmutableArray.Create(initialHash)),
-                    ExtractionCapability.EmbeddedText | ExtractionCapability.Ocr,
+                    requestedCapabilities,
                     requestedLanguages ?? ImmutableArray<string>.Empty);
                 var requestValidation =
                     DocumentExtractionValidator.ValidateRequest(request);
