@@ -112,6 +112,74 @@ public sealed class ApprovedRootFileStore : IDisposable
         }
     }
 
+    public SafeFileHandle CreateNewPromotableVerified(
+        string relativePath,
+        long expectedLength)
+    {
+        if (expectedLength < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(expectedLength),
+                "A non-negative expected length is required.");
+        }
+
+        var normalized = NormalizeRelativePath(relativePath);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            var absolute = GetAbsolutePath(normalized);
+            var parent = Path.GetDirectoryName(absolute)
+                ?? throw Boundary();
+            PinnedDirectoryPathScope? parentScope = null;
+            SafeFileHandle? created = null;
+            try
+            {
+                parentScope = _guard.OpenPinnedDirectoryPath(parent);
+                ValidateDirectoryScope(
+                    parentScope,
+                    GetRelativeParent(normalized));
+                created = WindowsFileSystemNative
+                    .OpenNewPromotableVerifiedFileHandle(absolute);
+                RandomAccess.SetLength(created, expectedLength);
+                ValidateFileHandle(
+                    created,
+                    normalized,
+                    expectedLength);
+                RevalidateCore();
+                RetainDirectoryScope(
+                    parentScope,
+                    GetRelativeParent(normalized));
+                parentScope = null;
+                var result = created;
+                created = null;
+                return result;
+            }
+            catch
+            {
+                if (created is not null)
+                {
+                    try
+                    {
+                        WindowsFileSystemNative.MarkDeleteOnClose(created);
+                    }
+                    catch
+                    {
+                        // The creation failure remains primary.
+                    }
+
+                    created.Dispose();
+                }
+
+                throw;
+            }
+            finally
+            {
+                parentScope?.Dispose();
+            }
+        }
+    }
+
     public VerifiedStableSource OpenExistingVerified(string relativePath)
     {
         var normalized = NormalizeRelativePath(relativePath);
@@ -134,6 +202,84 @@ public sealed class ApprovedRootFileStore : IDisposable
             {
                 source.Dispose();
                 throw;
+            }
+        }
+    }
+
+    public VerifiedStableSource? TryOpenExistingOwnedVerified(
+        string relativePath)
+    {
+        var normalized = NormalizeRelativePath(relativePath);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            var absolute = GetAbsolutePath(normalized);
+            var parent = Path.GetDirectoryName(absolute)
+                ?? throw Boundary();
+            PinnedDirectoryPathScope? parentScope = null;
+            SafeFileHandle? probe = null;
+            SafeFileHandle? opened = null;
+            try
+            {
+                parentScope = _guard.OpenPinnedDirectoryPath(parent);
+                ValidateDirectoryScope(
+                    parentScope,
+                    GetRelativeParent(normalized));
+                probe =
+                    WindowsFileSystemNative.OpenBoundaryProbeHandle(
+                        absolute);
+                if (probe is null)
+                {
+                    RevalidateCore();
+                    return null;
+                }
+
+                ValidateFileHandle(
+                    probe,
+                    normalized,
+                    expectedLength: null);
+                probe.Dispose();
+                probe = null;
+                opened = WindowsFileSystemNative
+                    .TryOpenOwnedExistingFileHandle(absolute);
+                if (opened is null)
+                {
+                    RevalidateCore();
+                    return null;
+                }
+
+                ValidateFileHandle(
+                    opened,
+                    normalized,
+                    expectedLength: null);
+                var source = VerifiedStableSource.Create(opened);
+                opened = null;
+                try
+                {
+                    source.Revalidate();
+                    ValidateFileHandle(
+                        source.Handle,
+                        normalized,
+                        source.Length);
+                    RevalidateCore();
+                    RetainDirectoryScope(
+                        parentScope,
+                        GetRelativeParent(normalized));
+                    parentScope = null;
+                    return source;
+                }
+                catch
+                {
+                    source.Dispose();
+                    throw;
+                }
+            }
+            finally
+            {
+                probe?.Dispose();
+                opened?.Dispose();
+                parentScope?.Dispose();
             }
         }
     }
@@ -236,6 +382,193 @@ public sealed class ApprovedRootFileStore : IDisposable
         }
     }
 
+    public void RevalidateDatabaseFileSet(string relativePath)
+    {
+        var normalized = NormalizeRelativePath(relativePath);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            RequireVerifiedEntryIfPresent(
+                normalized,
+                required: true);
+            RequireVerifiedEntryIfPresent(
+                normalized + "-journal",
+                required: false);
+            RequireVerifiedEntryIfPresent(
+                normalized + "-wal",
+                required: false);
+            RequireVerifiedEntryIfPresent(
+                normalized + "-shm",
+                required: false);
+            RevalidateCore();
+        }
+    }
+
+    public IReadOnlyList<string> EnumerateVerifiedFileNames(
+        string relativeDirectory)
+    {
+        var normalized = NormalizeRelativePath(relativeDirectory);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            using var directory = _guard.OpenPinnedDirectoryPath(
+                GetAbsolutePath(normalized));
+            ValidateDirectoryScope(directory, normalized);
+
+            string[] entries;
+            try
+            {
+                entries = Directory.EnumerateFileSystemEntries(
+                        GetAbsolutePath(normalized),
+                        "*",
+                        SearchOption.TopDirectoryOnly)
+                    .ToArray();
+            }
+            catch (Exception exception) when (
+                exception is IOException
+                    or UnauthorizedAccessException
+                    or System.Security.SecurityException)
+            {
+                throw Boundary();
+            }
+
+            var names = new List<string>(entries.Length);
+            foreach (var entry in entries)
+            {
+                var name = Path.GetFileName(entry);
+                var relative = NormalizeRelativePath(
+                    Path.Combine(normalized, name));
+                using var probe =
+                    WindowsFileSystemNative.OpenBoundaryProbeHandle(
+                        GetAbsolutePath(relative));
+                if (probe is null)
+                {
+                    continue;
+                }
+
+                ValidateFileHandle(
+                    probe,
+                    relative,
+                    expectedLength: null);
+                names.Add(name);
+            }
+
+            RevalidateCore();
+            return names;
+        }
+    }
+
+    public bool PromoteCreatedNoReplace(
+        SafeFileHandle handle,
+        string sourceRelativePath,
+        string destinationRelativePath,
+        long expectedLength,
+        FilePromotionOwnership ownership)
+    {
+        ArgumentNullException.ThrowIfNull(handle);
+        ArgumentNullException.ThrowIfNull(ownership);
+        if (expectedLength < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(expectedLength));
+        }
+
+        var source = NormalizeRelativePath(sourceRelativePath);
+        var destination =
+            NormalizeRelativePath(destinationRelativePath);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            ValidateFileHandle(handle, source, expectedLength);
+            var destinationParent =
+                Path.GetDirectoryName(GetAbsolutePath(destination))
+                ?? throw Boundary();
+            using var destinationScope =
+                _guard.OpenPinnedDirectoryPath(destinationParent);
+            ValidateDirectoryScope(
+                destinationScope,
+                GetRelativeParent(destination));
+
+            using (var existing =
+                   WindowsFileSystemNative.OpenBoundaryProbeHandle(
+                       GetAbsolutePath(destination)))
+            {
+                if (existing is not null)
+                {
+                    ValidateFileHandle(
+                        existing,
+                        destination,
+                        expectedLength: null);
+                    RevalidateCore();
+                    return false;
+                }
+            }
+
+            var promoted = WindowsFileSystemNative.MoveNoReplace(
+                GetAbsolutePath(source),
+                GetAbsolutePath(destination));
+            if (promoted)
+            {
+                ownership.Transfer();
+            }
+
+            ValidateFileHandle(
+                handle,
+                promoted ? destination : source,
+                expectedLength);
+            RevalidateCore();
+            if (promoted)
+            {
+                RetainDirectoryScope(
+                    _guard.OpenPinnedDirectoryPath(
+                        destinationParent),
+                    GetRelativeParent(destination));
+            }
+
+            return promoted;
+        }
+    }
+
+    public VerifiedStableSource AdoptCreatedVerified(
+        SafeFileHandle handle,
+        string relativePath,
+        long expectedLength)
+    {
+        ArgumentNullException.ThrowIfNull(handle);
+        if (expectedLength < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(expectedLength));
+        }
+
+        var normalized = NormalizeRelativePath(relativePath);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            ValidateFileHandle(handle, normalized, expectedLength);
+            var source = VerifiedStableSource.Create(handle);
+            try
+            {
+                source.Revalidate();
+                ValidateFileHandle(
+                    source.Handle,
+                    normalized,
+                    expectedLength);
+                RevalidateCore();
+                return source;
+            }
+            catch
+            {
+                source.Dispose();
+                throw;
+            }
+        }
+    }
+
     public void RevalidateCreated(
         SafeFileHandle handle,
         string relativePath,
@@ -281,6 +614,15 @@ public sealed class ApprovedRootFileStore : IDisposable
         }
     }
 
+    public void RevalidateExisting(
+        VerifiedStableSource source,
+        string relativePath)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        source.Revalidate();
+        RevalidateExisting(source.Handle, relativePath);
+    }
+
     public void DeleteOwnedOnClose(
         SafeFileHandle handle,
         string relativePath,
@@ -299,6 +641,19 @@ public sealed class ApprovedRootFileStore : IDisposable
             WindowsFileSystemNative.MarkDeleteOnClose(handle);
             RevalidateCore();
         }
+    }
+
+    public void DeleteOwnedOnClose(
+        VerifiedStableSource source,
+        string relativePath,
+        long expectedLength)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        source.Revalidate();
+        DeleteOwnedOnClose(
+            source.Handle,
+            relativePath,
+            expectedLength);
     }
 
     public void Dispose()
@@ -387,7 +742,7 @@ public sealed class ApprovedRootFileStore : IDisposable
     private void ValidateFileHandle(
         SafeFileHandle handle,
         string relativePath,
-        long expectedLength)
+        long? expectedLength)
     {
         if (handle.IsClosed || handle.IsInvalid)
         {
@@ -415,7 +770,8 @@ public sealed class ApprovedRootFileStore : IDisposable
             snapshot.FileId.FileId.HighPart);
         if (identifiers.VolumeId != _rootVolumeId
             || snapshot.NumberOfLinks != 1
-            || snapshot.Length != expectedLength)
+            || (expectedLength is not null
+                && snapshot.Length != expectedLength.Value))
         {
             throw Boundary();
         }
@@ -423,6 +779,29 @@ public sealed class ApprovedRootFileStore : IDisposable
         RequirePhysicalPath(
             WindowsFileSystemNative.GetFinalPath(handle),
             GetExpectedPhysicalPath(relativePath));
+    }
+
+    private void RequireVerifiedEntryIfPresent(
+        string relativePath,
+        bool required)
+    {
+        using var probe =
+            WindowsFileSystemNative.OpenBoundaryProbeHandle(
+                GetAbsolutePath(relativePath));
+        if (probe is null)
+        {
+            if (required)
+            {
+                throw Boundary();
+            }
+
+            return;
+        }
+
+        ValidateFileHandle(
+            probe,
+            relativePath,
+            expectedLength: null);
     }
 
     private void RequireRootVolume(SafeFileHandle handle)
@@ -591,4 +970,15 @@ public sealed class FileStoreEntryAlreadyExistsException : IOException
         : base("The approved-root entry already exists.")
     {
     }
+}
+
+public sealed class FilePromotionOwnership
+{
+    private int _transferred;
+
+    public bool IsTransferred =>
+        Volatile.Read(ref _transferred) != 0;
+
+    internal void Transfer() =>
+        Volatile.Write(ref _transferred, 1);
 }

@@ -1,8 +1,12 @@
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using LocalDocumentOrganizer.CorpusWorkbench.Contracts;
 using LocalDocumentOrganizer.CorpusWorkbench.Persistence;
 using LocalDocumentOrganizer.Infrastructure.Windows.FileSystem;
 using Microsoft.Win32.SafeHandles;
+
+[assembly: InternalsVisibleTo(
+    "LocalDocumentOrganizer.CorpusWorkbench.Tests")]
 
 namespace LocalDocumentOrganizer.CorpusWorkbench.Vault;
 
@@ -11,18 +15,23 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
     private const string DatabaseRelativePath = "workbench.db";
     private const string ObjectRootRelativePath =
         "objects\\sha256";
+    private const string StagingRootRelativePath =
+        "objects\\.staging";
 
     private readonly ConcurrentDictionary<string, SemaphoreSlim>
         _importGates = new(StringComparer.Ordinal);
+    private readonly Action<CorpusImportFaultPoint>? _injectFault;
     private ApprovedRootFileStore? _fileStore;
     private CorpusWorkbenchStore? _store;
 
     private CorpusVault(
         ApprovedRootFileStore fileStore,
-        CorpusWorkbenchStore store)
+        CorpusWorkbenchStore store,
+        Action<CorpusImportFaultPoint>? injectFault)
     {
         _fileStore = fileStore;
         _store = store;
+        _injectFault = injectFault;
     }
 
     internal CorpusWorkbenchStore Store =>
@@ -30,6 +39,11 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
         ?? throw new ObjectDisposedException(nameof(CorpusVault));
 
     public static CorpusVault OpenExisting(string vaultRoot)
+        => OpenExisting(vaultRoot, injectFault: null);
+
+    internal static CorpusVault OpenExisting(
+        string vaultRoot,
+        Action<CorpusImportFaultPoint>? injectFault)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(vaultRoot);
         var guard = new ApprovedRootPathGuard(vaultRoot);
@@ -38,6 +52,8 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
         {
             fileStore.EnsureDirectoryVerified("objects");
             fileStore.EnsureDirectoryVerified(ObjectRootRelativePath);
+            fileStore.EnsureDirectoryVerified(
+                StagingRootRelativePath);
             fileStore.EnsureDirectoryVerified("previews");
             fileStore.EnsureDirectoryVerified("checkpoints");
 
@@ -60,8 +76,14 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
                 fileStore,
                 Path.Combine(
                     fileStore.ApprovedRoot,
-                    DatabaseRelativePath));
-            return new CorpusVault(fileStore, store);
+                    DatabaseRelativePath),
+                injectFault);
+            var vault = new CorpusVault(
+                fileStore,
+                store,
+                injectFault);
+            vault.RecoverStagingOrphans();
+            return vault;
         }
         catch
         {
@@ -99,10 +121,40 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
             contentSha256);
     }
 
-    internal SafeFileHandle CreateObject(
-        string contentSha256,
+    internal StagedCorpusObject CreateStagingObject(
         long expectedLength)
     {
+        var fileStore = GetFileStore();
+        for (var attempt = 0; attempt < 16; attempt++)
+        {
+            var relativePath = Path.Combine(
+                StagingRootRelativePath,
+                "import-"
+                + Guid.NewGuid().ToString("N")
+                + ".tmp");
+            try
+            {
+                return new StagedCorpusObject(
+                    fileStore.CreateNewPromotableVerified(
+                        relativePath,
+                        expectedLength),
+                    relativePath,
+                    expectedLength);
+            }
+            catch (FileStoreEntryAlreadyExistsException)
+            {
+            }
+        }
+
+        throw new WorkbenchException(
+            WorkbenchFailureCode.VaultBoundaryViolation);
+    }
+
+    internal bool PromoteStagingObject(
+        StagedCorpusObject staged,
+        string contentSha256)
+    {
+        ArgumentNullException.ThrowIfNull(staged);
         var fileStore = GetFileStore();
         var firstPrefix = Path.Combine(
             ObjectRootRelativePath,
@@ -112,9 +164,41 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
             Path.Combine(
                 firstPrefix,
                 contentSha256.Substring(2, 2)));
-        return fileStore.CreateNewVerified(
-            GetObjectRelativePath(contentSha256),
-            expectedLength);
+        var destination = GetObjectRelativePath(contentSha256);
+        var ownership = new FilePromotionOwnership();
+        try
+        {
+            return fileStore.PromoteCreatedNoReplace(
+                staged.Handle,
+                staged.RelativePath,
+                destination,
+                staged.ExpectedLength,
+                ownership);
+        }
+        finally
+        {
+            if (ownership.IsTransferred)
+            {
+                staged.MarkPromoted(destination);
+            }
+        }
+    }
+
+    internal VerifiedStableSource AdoptPromotedObject(
+        StagedCorpusObject staged)
+    {
+        ArgumentNullException.ThrowIfNull(staged);
+        if (!staged.IsPromoted)
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.VaultBoundaryViolation);
+        }
+
+        var handle = staged.TakeHandle();
+        return GetFileStore().AdoptCreatedVerified(
+            handle,
+            staged.RelativePath,
+            staged.ExpectedLength);
     }
 
     internal VerifiedStableSource? TryOpenObject(
@@ -135,6 +219,11 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
         return fileStore.OpenExistingVerified(relativePath);
     }
 
+    internal VerifiedStableSource? TryOpenOwnedObject(
+        string contentSha256) =>
+        GetFileStore().TryOpenExistingOwnedVerified(
+            GetObjectRelativePath(contentSha256));
+
     internal void RevalidateCreatedObject(
         SafeFileHandle handle,
         string contentSha256,
@@ -144,6 +233,27 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
             GetObjectRelativePath(contentSha256),
             expectedLength);
 
+    internal void RevalidateStagingObject(
+        StagedCorpusObject staged)
+    {
+        ArgumentNullException.ThrowIfNull(staged);
+        GetFileStore().RevalidateCreated(
+            staged.Handle,
+            staged.RelativePath,
+            staged.ExpectedLength);
+    }
+
+    internal void RevalidateObject(
+        VerifiedStableSource source,
+        string contentSha256)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        source.Revalidate();
+        GetFileStore().RevalidateExisting(
+            source,
+            GetObjectRelativePath(contentSha256));
+    }
+
     internal void DeleteOwnedObjectOnClose(
         SafeFileHandle handle,
         string contentSha256,
@@ -152,6 +262,28 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
             handle,
             GetObjectRelativePath(contentSha256),
             expectedLength);
+
+    internal void DeleteOwnedObjectOnClose(
+        VerifiedStableSource source,
+        string contentSha256,
+        long expectedLength) =>
+        GetFileStore().DeleteOwnedOnClose(
+            source,
+            GetObjectRelativePath(contentSha256),
+            expectedLength);
+
+    internal void DeleteOwnedStagingOnClose(
+        StagedCorpusObject staged)
+    {
+        ArgumentNullException.ThrowIfNull(staged);
+        GetFileStore().DeleteOwnedOnClose(
+            staged.Handle,
+            staged.RelativePath,
+            staged.ExpectedLength);
+    }
+
+    internal void InjectFault(CorpusImportFaultPoint point) =>
+        _injectFault?.Invoke(point);
 
     public void Dispose()
     {
@@ -209,6 +341,51 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
             ?? throw new ObjectDisposedException(nameof(CorpusVault));
     }
 
+    private void RecoverStagingOrphans()
+    {
+        var fileStore = GetFileStore();
+        foreach (var name in fileStore.EnumerateVerifiedFileNames(
+                     StagingRootRelativePath))
+        {
+            if (!IsStagingObjectName(name))
+            {
+                throw new WorkbenchException(
+                    WorkbenchFailureCode.VaultBoundaryViolation);
+            }
+
+            var relative = Path.Combine(
+                StagingRootRelativePath,
+                name);
+            using var orphan =
+                fileStore.TryOpenExistingOwnedVerified(relative);
+            if (orphan is null)
+            {
+                continue;
+            }
+
+            fileStore.DeleteOwnedOnClose(
+                orphan,
+                relative,
+                orphan.Length);
+        }
+    }
+
+    private static bool IsStagingObjectName(string name)
+    {
+        const string prefix = "import-";
+        const string suffix = ".tmp";
+        if (!name.StartsWith(prefix, StringComparison.Ordinal)
+            || !name.EndsWith(suffix, StringComparison.Ordinal)
+            || name.Length
+                != prefix.Length + 32 + suffix.Length)
+        {
+            return false;
+        }
+
+        return name.AsSpan(prefix.Length, 32).IndexOfAnyExcept(
+            "0123456789abcdef") < 0;
+    }
+
     private void ThrowIfDisposed()
     {
         if (_fileStore is null || _store is null)
@@ -216,6 +393,55 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
             throw new ObjectDisposedException(nameof(CorpusVault));
         }
     }
+}
+
+internal enum CorpusImportFaultPoint
+{
+    AfterStagingObjectFlushed = 0,
+    AfterObjectPromoted = 1,
+    BeforeAcceptanceRevalidation = 2,
+    AfterDatabaseCommit = 3,
+}
+
+internal sealed class StagedCorpusObject : IDisposable
+{
+    private SafeFileHandle? _handle;
+
+    internal StagedCorpusObject(
+        SafeFileHandle handle,
+        string relativePath,
+        long expectedLength)
+    {
+        _handle = handle;
+        RelativePath = relativePath;
+        ExpectedLength = expectedLength;
+    }
+
+    internal SafeFileHandle Handle =>
+        _handle is { IsClosed: false, IsInvalid: false } handle
+            ? handle
+            : throw new ObjectDisposedException(
+                nameof(StagedCorpusObject));
+
+    internal string RelativePath { get; private set; }
+
+    internal long ExpectedLength { get; }
+
+    internal bool IsPromoted { get; private set; }
+
+    internal void MarkPromoted(string relativePath)
+    {
+        RelativePath = relativePath;
+        IsPromoted = true;
+    }
+
+    internal SafeFileHandle TakeHandle() =>
+        Interlocked.Exchange(ref _handle, null)
+        ?? throw new ObjectDisposedException(
+            nameof(StagedCorpusObject));
+
+    public void Dispose() =>
+        Interlocked.Exchange(ref _handle, null)?.Dispose();
 }
 
 internal sealed class ImportLease : IDisposable

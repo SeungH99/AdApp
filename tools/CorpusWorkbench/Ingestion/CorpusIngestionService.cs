@@ -147,28 +147,21 @@ public sealed class CorpusIngestionService
                         cancellationToken)
                     .ConfigureAwait(false);
 
-            var existing = await _vault.Store.FindDocumentAsync(
-                    receipt.ExpectedContentSha256,
+            var existing = await _vault.Store.FindImportAsync(
+                    receipt,
+                    canonicalReceipt,
+                    receiptSha256,
+                    classified.InputKind,
+                    classified.CodecId,
                     cancellationToken)
                 .ConfigureAwait(false);
             if (existing is not null)
             {
-                await VerifyExistingObjectAsync(
-                        receipt.ExpectedContentSha256,
-                        source.Length,
-                        expectedHash,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-                return new ImportResult(
-                    existing.DocumentId,
-                    existing.ContentSha256,
-                    WasExisting: true);
-            }
-
-            var existingObject = _vault.TryOpenObject(
-                receipt.ExpectedContentSha256);
-            if (existingObject is not null)
-            {
+                var existingObject = _vault.TryOpenObject(
+                    receipt.ExpectedContentSha256)
+                    ?? throw new WorkbenchException(
+                        WorkbenchFailureCode
+                            .VaultBoundaryViolation);
                 await using (existingObject)
                 {
                     await VerifyExistingObjectAsync(
@@ -177,82 +170,174 @@ public sealed class CorpusIngestionService
                             expectedHash,
                             cancellationToken)
                         .ConfigureAwait(false);
+                    source.Revalidate();
+                    _vault.RevalidateObject(
+                        existingObject,
+                        receipt.ExpectedContentSha256);
                 }
 
-                var adopted = await _vault.Store
-                    .PersistImportAsync(
-                        receipt,
-                        canonicalReceipt,
-                        receiptSha256,
-                        classified.InputKind,
-                        classified.CodecId,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-                return ToResult(adopted);
+                return new ImportResult(
+                    existing.DocumentId,
+                    existing.ContentSha256,
+                    WasExisting: true);
             }
 
-            SafeFileHandle? created = null;
-            var ownsCreatedObject = false;
+            StagedCorpusObject? staged = null;
+            VerifiedStableSource? storedObject = null;
+            var ownsFinalObject = false;
+            var ownership = new ImportCommitOwnership();
             try
             {
                 try
                 {
-                    created = _vault.CreateObject(
-                        receipt.ExpectedContentSha256,
-                        source.Length);
-                    ownsCreatedObject = true;
+                    storedObject = _vault.TryOpenObject(
+                        receipt.ExpectedContentSha256);
                 }
-                catch (FileStoreEntryAlreadyExistsException)
+                catch (FileSystemBoundaryException)
                 {
-                    return await ConvergeAfterCreateCollisionAsync(
-                            receipt,
-                            canonicalReceipt,
-                            receiptSha256,
-                            classified,
+                    // A competing importer can hold a newly promoted
+                    // object exclusively until its durable boundary.
+                    storedObject = null;
+                }
+                if (storedObject is not null
+                    && !await IsCompleteValidObjectAsync(
+                            storedObject,
                             source.Length,
                             expectedHash,
                             cancellationToken)
-                        .ConfigureAwait(false);
+                        .ConfigureAwait(false))
+                {
+                    await storedObject.DisposeAsync();
+                    storedObject = null;
+                    if (!await TryReclaimInvalidOrphanAsync(
+                            receipt.ExpectedContentSha256,
+                            source.Length,
+                            expectedHash)
+                        .ConfigureAwait(false))
+                    {
+                        throw new WorkbenchException(
+                            WorkbenchFailureCode
+                                .VaultBoundaryViolation);
+                    }
                 }
 
-                using (var destination = new ObjectWriteSink(
-                           created,
-                           source.Length))
+                if (storedObject is null)
                 {
-                    await source.CopyToAsync(
-                            destination,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    var secondPassHash = destination.Complete();
-                    try
+                    staged = _vault.CreateStagingObject(
+                        source.Length);
+                    using (var destination = new ObjectWriteSink(
+                               staged.Handle,
+                               source.Length))
                     {
-                        if (destination.Length != source.Length
-                            || !CryptographicOperations
-                                .FixedTimeEquals(
-                                    secondPassHash,
-                                    expectedHash)
-                            || !CryptographicOperations
-                                .FixedTimeEquals(
-                                    secondPassHash,
-                                    firstPassHash))
+                        await source.CopyToAsync(
+                                destination,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        var secondPassHash = destination.Complete();
+                        try
                         {
-                            throw new WorkbenchException(
-                                WorkbenchFailureCode
-                                    .ContentHashMismatch);
+                            if (destination.Length != source.Length
+                                || !CryptographicOperations
+                                    .FixedTimeEquals(
+                                        secondPassHash,
+                                        expectedHash)
+                                || !CryptographicOperations
+                                    .FixedTimeEquals(
+                                        secondPassHash,
+                                        firstPassHash))
+                            {
+                                throw new WorkbenchException(
+                                    WorkbenchFailureCode
+                                        .ContentHashMismatch);
+                            }
+                        }
+                        finally
+                        {
+                            CryptographicOperations.ZeroMemory(
+                                secondPassHash);
                         }
                     }
-                    finally
+
+                    RandomAccess.FlushToDisk(staged.Handle);
+                    _vault.RevalidateStagingObject(staged);
+                    _vault.InjectFault(
+                        CorpusImportFaultPoint
+                            .AfterStagingObjectFlushed);
+
+                    for (var attempt = 0;
+                         attempt < 600;
+                         attempt++)
                     {
-                        CryptographicOperations.ZeroMemory(
-                            secondPassHash);
+                        cancellationToken
+                            .ThrowIfCancellationRequested();
+                        if (_vault.PromoteStagingObject(
+                                staged!,
+                                receipt.ExpectedContentSha256))
+                        {
+                            ownsFinalObject = true;
+                            storedObject =
+                                _vault.AdoptPromotedObject(staged!);
+                            staged!.Dispose();
+                            staged = null;
+                            _vault.InjectFault(
+                                CorpusImportFaultPoint
+                                    .AfterObjectPromoted);
+                            break;
+                        }
+
+                        try
+                        {
+                            var collision = _vault.TryOpenObject(
+                                receipt.ExpectedContentSha256);
+                            if (collision is not null)
+                            {
+                                if (await IsCompleteValidObjectAsync(
+                                        collision,
+                                        source.Length,
+                                        expectedHash,
+                                        cancellationToken)
+                                    .ConfigureAwait(false))
+                                {
+                                    storedObject = collision;
+                                    _vault.DeleteOwnedStagingOnClose(
+                                        staged!);
+                                    staged!.Dispose();
+                                    staged = null;
+                                    break;
+                                }
+
+                                await collision.DisposeAsync();
+                                if (await TryReclaimInvalidOrphanAsync(
+                                        receipt.ExpectedContentSha256,
+                                        source.Length,
+                                        expectedHash)
+                                    .ConfigureAwait(false))
+                                {
+                                    continue;
+                                }
+                            }
+                        }
+                        catch (FileSystemBoundaryException)
+                        {
+                            // Another importer can hold its promoted
+                            // handle until its database transaction ends.
+                        }
+
+                        await Task.Delay(
+                                TimeSpan.FromMilliseconds(50),
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+
+                    if (storedObject is null)
+                    {
+                        throw new WorkbenchException(
+                            WorkbenchFailureCode
+                                .VaultBoundaryViolation);
                     }
                 }
 
-                RandomAccess.FlushToDisk(created);
-                _vault.RevalidateCreatedObject(
-                    created,
-                    receipt.ExpectedContentSha256,
-                    source.Length);
+                var acceptedObject = storedObject;
                 var persisted =
                     await _vault.Store.PersistImportAsync(
                             receipt,
@@ -260,33 +345,110 @@ public sealed class CorpusIngestionService
                             receiptSha256,
                             classified.InputKind,
                             classified.CodecId,
+                            () =>
+                            {
+                                _vault.InjectFault(
+                                    CorpusImportFaultPoint
+                                        .BeforeAcceptanceRevalidation);
+                                source.Revalidate();
+                                acceptedObject.Revalidate();
+                                _vault.RevalidateObject(
+                                    acceptedObject,
+                                    receipt
+                                        .ExpectedContentSha256);
+                            },
+                            ownership,
                             cancellationToken)
                         .ConfigureAwait(false);
-                ownsCreatedObject = false;
+                if (ownership.IsTransferred)
+                {
+                    ownsFinalObject = false;
+                }
+
                 return ToResult(persisted);
             }
             catch (Exception exception)
             {
                 var primary = ExceptionDispatchInfo.Capture(
                     exception);
-                if (ownsCreatedObject && created is not null)
+                Exception? cleanupFailure = null;
+                if (staged is { IsPromoted: false })
                 {
                     try
                     {
-                        _vault.DeleteOwnedObjectOnClose(
-                            created,
-                            receipt.ExpectedContentSha256,
-                            source.Length);
+                        _vault.DeleteOwnedStagingOnClose(staged);
                     }
                     catch (Exception cleanupException)
                     {
-                        throw new WorkbenchException(
-                            WorkbenchFailureCode
-                                .VaultBoundaryViolation,
-                            new AggregateException(
-                                exception,
-                                cleanupException));
+                        cleanupFailure = cleanupException;
                     }
+                }
+
+                if (staged is { IsPromoted: true }
+                    && ownsFinalObject
+                    && !ownership.IsTransferred)
+                {
+                    try
+                    {
+                        var promotedStaging = staged;
+                        await _vault.Store.DeleteIfDocumentMissingAsync(
+                                receipt.ExpectedContentSha256,
+                                () =>
+                                {
+                                    _vault.DeleteOwnedStagingOnClose(
+                                        promotedStaging);
+                                    promotedStaging.Dispose();
+                                })
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception cleanupException)
+                    {
+                        cleanupFailure = cleanupFailure is null
+                            ? cleanupException
+                            : new AggregateException(
+                                cleanupFailure,
+                                cleanupException);
+                    }
+                }
+
+                if (ownsFinalObject
+                    && storedObject is not null
+                    && !ownership.IsTransferred)
+                {
+                    try
+                    {
+                        var ownedObject = storedObject;
+                        await _vault.Store.DeleteIfDocumentMissingAsync(
+                                receipt.ExpectedContentSha256,
+                                () =>
+                                {
+                                    _vault.DeleteOwnedObjectOnClose(
+                                        ownedObject,
+                                        receipt
+                                            .ExpectedContentSha256,
+                                        source.Length);
+                                    ownedObject.Dispose();
+                                })
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception cleanupException)
+                    {
+                        cleanupFailure = cleanupFailure is null
+                            ? cleanupException
+                            : new AggregateException(
+                                cleanupFailure,
+                                cleanupException);
+                    }
+                }
+
+                if (cleanupFailure is not null)
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode
+                            .VaultBoundaryViolation,
+                        new AggregateException(
+                            exception,
+                            cleanupFailure));
                 }
 
                 primary.Throw();
@@ -294,7 +456,12 @@ public sealed class CorpusIngestionService
             }
             finally
             {
-                created?.Dispose();
+                staged?.Dispose();
+                if (storedObject is not null)
+                {
+                    await storedObject.DisposeAsync()
+                        .ConfigureAwait(false);
+                }
             }
         }
         finally
@@ -314,105 +481,6 @@ public sealed class CorpusIngestionService
         }
     }
 
-    private async Task<ImportResult>
-        ConvergeAfterCreateCollisionAsync(
-            SourceReceipt receipt,
-            byte[] canonicalReceipt,
-            string receiptSha256,
-            ClassifiedInput classified,
-            long expectedLength,
-            byte[] expectedHash,
-            CancellationToken cancellationToken)
-    {
-        FileSystemBoundaryException? lastBoundary = null;
-        for (var attempt = 0; attempt < 600; attempt++)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var existing = await _vault.Store.FindDocumentAsync(
-                    receipt.ExpectedContentSha256,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            if (existing is not null)
-            {
-                await VerifyExistingObjectAsync(
-                        receipt.ExpectedContentSha256,
-                        expectedLength,
-                        expectedHash,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-                return new ImportResult(
-                    existing.DocumentId,
-                    existing.ContentSha256,
-                    WasExisting: true);
-            }
-
-            try
-            {
-                var existingObject = _vault.TryOpenObject(
-                    receipt.ExpectedContentSha256);
-                if (existingObject is not null)
-                {
-                    await using (existingObject)
-                    {
-                        await VerifyExistingObjectAsync(
-                                existingObject,
-                                expectedLength,
-                                expectedHash,
-                                cancellationToken)
-                            .ConfigureAwait(false);
-                    }
-
-                    var persisted =
-                        await _vault.Store.PersistImportAsync(
-                                receipt,
-                                canonicalReceipt,
-                                receiptSha256,
-                                classified.InputKind,
-                                classified.CodecId,
-                                cancellationToken)
-                            .ConfigureAwait(false);
-                    return ToResult(persisted);
-                }
-            }
-            catch (FileSystemBoundaryException exception)
-            {
-                lastBoundary = exception;
-            }
-
-            await Task.Delay(
-                    TimeSpan.FromMilliseconds(50),
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-
-        if (lastBoundary is not null)
-        {
-            throw lastBoundary;
-        }
-
-        throw new WorkbenchException(
-            WorkbenchFailureCode.VaultBoundaryViolation);
-    }
-
-    private async Task VerifyExistingObjectAsync(
-        string contentSha256,
-        long expectedLength,
-        byte[] expectedHash,
-        CancellationToken cancellationToken)
-    {
-        var existingObject = _vault.TryOpenObject(contentSha256)
-            ?? throw new WorkbenchException(
-                WorkbenchFailureCode.VaultBoundaryViolation);
-        await using (existingObject)
-        {
-            await VerifyExistingObjectAsync(
-                    existingObject,
-                    expectedLength,
-                    expectedHash,
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-    }
 
     private static async Task VerifyExistingObjectAsync(
         VerifiedStableSource existingObject,
@@ -443,6 +511,80 @@ public sealed class CorpusIngestionService
         finally
         {
             CryptographicOperations.ZeroMemory(actual);
+        }
+    }
+
+    private static async Task<bool> IsCompleteValidObjectAsync(
+        VerifiedStableSource existingObject,
+        long expectedLength,
+        byte[] expectedHash,
+        CancellationToken cancellationToken)
+    {
+        if (existingObject.Length != expectedLength)
+        {
+            existingObject.Revalidate();
+            return false;
+        }
+
+        var actual = await existingObject
+            .ComputeSha256Async(cancellationToken)
+            .ConfigureAwait(false);
+        try
+        {
+            existingObject.Revalidate();
+            return CryptographicOperations.FixedTimeEquals(
+                actual,
+                expectedHash);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(actual);
+        }
+    }
+
+    private async Task<bool> TryReclaimInvalidOrphanAsync(
+        string contentSha256,
+        long expectedLength,
+        byte[] expectedHash)
+    {
+        var owned = _vault.TryOpenOwnedObject(contentSha256);
+        if (owned is null)
+        {
+            return false;
+        }
+
+        var disposed = false;
+        try
+        {
+            if (await IsCompleteValidObjectAsync(
+                    owned,
+                    expectedLength,
+                    expectedHash,
+                    CancellationToken.None)
+                .ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            return await _vault.Store.DeleteIfDocumentMissingAsync(
+                    contentSha256,
+                    () =>
+                    {
+                        _vault.DeleteOwnedObjectOnClose(
+                            owned,
+                            contentSha256,
+                            owned.Length);
+                        owned.Dispose();
+                        disposed = true;
+                    })
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            if (!disposed)
+            {
+                await owned.DisposeAsync().ConfigureAwait(false);
+            }
         }
     }
 

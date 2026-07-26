@@ -56,6 +56,7 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
 {
     private readonly byte[] _volumeId;
     private readonly byte[] _fileId;
+    private readonly string _physicalPath;
     private readonly List<SafeFileHandle> _pinnedAncestors;
     private SafeFileHandle? _handle;
 
@@ -65,11 +66,13 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
         byte[] fileId,
         long length,
         DateTimeOffset lastWriteTimeUtc,
+        string physicalPath,
         List<SafeFileHandle> pinnedAncestors)
     {
         _handle = handle;
         _volumeId = volumeId;
         _fileId = fileId;
+        _physicalPath = physicalPath;
         _pinnedAncestors = pinnedAncestors;
         Length = length;
         LastWriteTimeUtc = lastWriteTimeUtc;
@@ -121,6 +124,7 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
                 fileId,
                 snapshot.Length,
                 snapshot.LastWriteTimeUtc,
+                WindowsFileSystemNative.GetFinalPath(handle),
                 pinnedAncestors);
         }
         catch
@@ -139,10 +143,52 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
             WindowsFileSystemNative.GetLinkCount(Handle));
     }
 
+    public void Revalidate()
+    {
+        var handle = Handle;
+        var snapshot =
+            WindowsFileSystemNative.GetStableSourceSnapshot(handle);
+        RequireSingleLink(snapshot.NumberOfLinks);
+        var identifiers = StableSourceValidator.Validate(
+            snapshot.IsLocal,
+            snapshot.HasVolumeInformation,
+            snapshot.FileSystemName,
+            snapshot.FileId.VolumeSerialNumber,
+            snapshot.FileId.FileId.LowPart,
+            snapshot.FileId.FileId.HighPart);
+        Span<byte> volumeId = stackalloc byte[sizeof(ulong)];
+        Span<byte> fileId = stackalloc byte[2 * sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            volumeId,
+            identifiers.VolumeId);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            fileId[..sizeof(ulong)],
+            identifiers.FileIdLow);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            fileId[sizeof(ulong)..],
+            identifiers.FileIdHigh);
+        if (!CryptographicOperations.FixedTimeEquals(
+                volumeId,
+                _volumeId)
+            || !CryptographicOperations.FixedTimeEquals(
+                fileId,
+                _fileId)
+            || snapshot.Length != Length
+            || snapshot.LastWriteTimeUtc != LastWriteTimeUtc
+            || !string.Equals(
+                WindowsFileSystemNative.GetFinalPath(handle),
+                _physicalPath,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new FileSystemBoundaryException(
+                "The stable source identity changed.");
+        }
+    }
+
     public async Task<byte[]> ComputeSha256Async(
         CancellationToken cancellationToken)
     {
-        RequireSingleLink();
+        Revalidate();
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var buffer = new byte[81_920];
         try
@@ -167,7 +213,7 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
                 offset += read;
             }
 
-            RequireSingleLink();
+            Revalidate();
             return hash.GetHashAndReset();
         }
         finally
@@ -188,7 +234,7 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
                 nameof(destination));
         }
 
-        RequireSingleLink();
+        Revalidate();
         var buffer = new byte[81_920];
         try
         {
@@ -215,7 +261,7 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
                 offset += read;
             }
 
-            RequireSingleLink();
+            Revalidate();
         }
         finally
         {

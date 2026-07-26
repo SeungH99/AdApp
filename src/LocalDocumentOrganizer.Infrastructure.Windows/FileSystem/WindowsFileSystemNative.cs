@@ -37,6 +37,8 @@ internal static class WindowsFileSystemNative
     private const int ErrorFileNotFound = 2;
     private const int ErrorPathNotFound = 3;
     private const int ErrorAccessDenied = 5;
+    private const int ErrorSharingViolation = 32;
+    private const int ErrorLockViolation = 33;
     private const int ErrorFileExists = 80;
     private const int ErrorInvalidFunction = 1;
     private const int ErrorNotSupported = 50;
@@ -44,6 +46,7 @@ internal static class WindowsFileSystemNative
     private const int ErrorAlreadyExists = 183;
     private const int ErrorIoIncomplete = 996;
     private const uint InvalidFileAttributes = uint.MaxValue;
+    private const uint MoveFileWriteThrough = 0x00000008;
 
     internal static SafeFileHandle OpenVerifiedSourceHandle(string canonicalPath)
     {
@@ -104,6 +107,129 @@ internal static class WindowsFileSystemNative
         if (error is ErrorFileExists or ErrorAlreadyExists)
         {
             throw new FileStoreEntryAlreadyExistsException();
+        }
+
+        throw CreateNativeException(error);
+    }
+
+    internal static SafeFileHandle OpenNewPromotableVerifiedFileHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            GenericRead | GenericWrite | Delete,
+            FileShareRead | FileShareDelete,
+            IntPtr.Zero,
+            CreateNew,
+            FileFlagOpenReparsePoint | FileFlagSequentialScan,
+            IntPtr.Zero);
+        if (!handle.IsInvalid)
+        {
+            return handle;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        handle.Dispose();
+        if (error is ErrorFileExists or ErrorAlreadyExists)
+        {
+            throw new FileStoreEntryAlreadyExistsException();
+        }
+
+        throw CreateNativeException(error);
+    }
+
+    internal static SafeFileHandle? OpenBoundaryProbeHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            desiredAccess: 0,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            if (error is ErrorFileNotFound or ErrorPathNotFound)
+            {
+                return null;
+            }
+
+            throw CreateNativeException(error);
+        }
+
+        return handle;
+    }
+
+    internal static SafeFileHandle? TryOpenOwnedExistingFileHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            GenericRead | Delete,
+            FileShareRead,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint | FileFlagSequentialScan,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            if (error is ErrorFileNotFound
+                or ErrorPathNotFound
+                or ErrorSharingViolation
+                or ErrorLockViolation)
+            {
+                return null;
+            }
+
+            throw CreateNativeException(error);
+        }
+
+        try
+        {
+            var information = GetAttributeTagInfo(handle);
+            if ((information.FileAttributes
+                    & (FileAttributeDirectory
+                        | FileAttributeReparsePoint)) != 0)
+            {
+                throw new FileSystemBoundaryException(
+                    "The owned entry is not an approved regular file.");
+            }
+
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    internal static bool MoveNoReplace(
+        string sourceCanonicalPath,
+        string destinationCanonicalPath)
+    {
+        RequireWindows();
+        if (MoveFileEx(
+                ToExtendedPath(sourceCanonicalPath),
+                ToExtendedPath(destinationCanonicalPath),
+                MoveFileWriteThrough))
+        {
+            return true;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        if (error is ErrorFileExists or ErrorAlreadyExists)
+        {
+            return false;
         }
 
         throw CreateNativeException(error);
@@ -955,6 +1081,17 @@ internal static class WindowsFileSystemNative
     private static extern bool CreateDirectory(
         string path,
         IntPtr securityAttributes);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "MoveFileExW",
+        CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool MoveFileEx(
+        string existingFileName,
+        string newFileName,
+        uint flags);
 
     [DllImport(
         "kernel32.dll",

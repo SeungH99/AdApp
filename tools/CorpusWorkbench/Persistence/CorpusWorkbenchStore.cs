@@ -1,5 +1,7 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using LocalDocumentOrganizer.CorpusWorkbench.Contracts;
+using LocalDocumentOrganizer.CorpusWorkbench.Vault;
 using LocalDocumentOrganizer.Infrastructure.Windows.FileSystem;
 using Microsoft.Data.Sqlite;
 using Microsoft.Win32.SafeHandles;
@@ -142,17 +144,20 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
 
     private readonly ApprovedRootFileStore _fileStore;
     private readonly string _databasePath;
+    private readonly Action<CorpusImportFaultPoint>? _injectFault;
     private SafeFileHandle? _databaseLease;
     private int _disposed;
 
     internal CorpusWorkbenchStore(
         ApprovedRootFileStore fileStore,
-        string databasePath)
+        string databasePath,
+        Action<CorpusImportFaultPoint>? injectFault)
     {
         ArgumentNullException.ThrowIfNull(fileStore);
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
         _fileStore = fileStore;
         _databasePath = Path.GetFullPath(databasePath);
+        _injectFault = injectFault;
         _databaseLease = fileStore.OpenExistingMutableVerified(
             "workbench.db");
         try
@@ -167,25 +172,7 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         }
     }
 
-    internal async Task<WorkbenchDocument?> FindDocumentAsync(
-        string contentSha256,
-        CancellationToken cancellationToken)
-    {
-        ThrowIfDisposed();
-        await using var connection =
-            await OpenConnectionAsync(cancellationToken)
-                .ConfigureAwait(false);
-        var result = await ReadDocumentAsync(
-                connection,
-                transaction: null,
-                contentSha256,
-                cancellationToken)
-            .ConfigureAwait(false);
-        RevalidateDatabase();
-        return result;
-    }
-
-    internal async Task<PersistedImport> PersistImportAsync(
+    internal async Task<WorkbenchDocument?> FindImportAsync(
         SourceReceipt receipt,
         byte[] canonicalReceipt,
         string receiptSha256,
@@ -194,17 +181,56 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        await using var connection =
+            await OpenConnectionAsync(cancellationToken)
+                .ConfigureAwait(false);
+        ValidateSchema(connection, transaction: null);
+        var persisted = await ReadPersistedImportAsync(
+                connection,
+                transaction: null,
+                receipt.ExpectedContentSha256,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (persisted is not null)
+        {
+            RequireExactRetry(
+                persisted,
+                receipt,
+                canonicalReceipt,
+                receiptSha256,
+                inputKind,
+                codecId);
+        }
+
+        RevalidateDatabaseSet();
+        return persisted?.Document;
+    }
+
+    internal async Task<PersistedImport> PersistImportAsync(
+        SourceReceipt receipt,
+        byte[] canonicalReceipt,
+        string receiptSha256,
+        string inputKind,
+        string? codecId,
+        Action acceptanceRevalidation,
+        ImportCommitOwnership ownership,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(receipt);
         ArgumentNullException.ThrowIfNull(canonicalReceipt);
+        ArgumentNullException.ThrowIfNull(acceptanceRevalidation);
+        ArgumentNullException.ThrowIfNull(ownership);
         await using var connection =
             await OpenConnectionAsync(cancellationToken)
                 .ConfigureAwait(false);
         await using var transaction =
             connection.BeginTransaction(deferred: false);
-        var committed = false;
         try
         {
-            var existing = await ReadDocumentAsync(
+            RevalidateDatabaseSet();
+            ValidateSchema(connection, transaction);
+            var existing = await ReadPersistedImportAsync(
                     connection,
                     transaction,
                     receipt.ExpectedContentSha256,
@@ -212,11 +238,23 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                 .ConfigureAwait(false);
             if (existing is not null)
             {
-                await transaction.CommitAsync(cancellationToken)
+                RequireExactRetry(
+                    existing,
+                    receipt,
+                    canonicalReceipt,
+                    receiptSha256,
+                    inputKind,
+                    codecId);
+                await CommitAcceptedAsync(
+                        connection,
+                        transaction,
+                        acceptanceRevalidation,
+                        ownership,
+                        cancellationToken)
                     .ConfigureAwait(false);
-                committed = true;
-                RevalidateDatabase();
-                return new PersistedImport(existing, WasExisting: true);
+                return new PersistedImport(
+                    existing.Document,
+                    WasExisting: true);
             }
 
             await RequireReceiptAvailableAsync(
@@ -335,15 +373,20 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                 }
             }
 
-            await transaction.CommitAsync(cancellationToken)
+            await CommitAcceptedAsync(
+                    connection,
+                    transaction,
+                    acceptanceRevalidation,
+                    ownership,
+                    cancellationToken)
                 .ConfigureAwait(false);
-            committed = true;
-            RevalidateDatabase();
-            return new PersistedImport(document, WasExisting: false);
+            return new PersistedImport(
+                document,
+                WasExisting: false);
         }
         catch
         {
-            if (!committed)
+            if (!ownership.IsTransferred)
             {
                 try
                 {
@@ -359,6 +402,37 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
 
             throw;
         }
+    }
+
+    internal async Task<bool> DeleteIfDocumentMissingAsync(
+        string contentSha256,
+        Action deleteOwnedObject)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(deleteOwnedObject);
+        await using var connection =
+            await OpenConnectionAsync(CancellationToken.None)
+                .ConfigureAwait(false);
+        await using var transaction =
+            connection.BeginTransaction(deferred: false);
+        RevalidateDatabaseSet();
+        ValidateSchema(connection, transaction);
+        if (await ReadPersistedImportAsync(
+                connection,
+                transaction,
+                contentSha256,
+                CancellationToken.None)
+            .ConfigureAwait(false) is not null)
+        {
+            return false;
+        }
+
+        deleteOwnedObject();
+        RevalidateDatabaseSet();
+        await transaction.CommitAsync(CancellationToken.None)
+            .ConfigureAwait(false);
+        RevalidateDatabaseSet();
+        return true;
     }
 
     public void Dispose()
@@ -381,16 +455,19 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
     private void Initialize()
     {
         ThrowIfDisposed();
-        RevalidateDatabase();
+        RevalidateDatabaseSet();
         using var connection = CreateConnection();
         connection.Open();
+        RevalidateDatabaseSet();
         ConfigureConnection(connection);
+        RevalidateDatabaseSet();
         RequirePragma(connection, "journal_mode", "wal");
 
         using var transaction =
             connection.BeginTransaction(deferred: false);
         try
         {
+            RevalidateDatabaseSet();
             using (var command = connection.CreateCommand())
             {
                 command.Transaction = transaction;
@@ -399,6 +476,7 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             }
 
             ValidateSchema(connection, transaction);
+            RevalidateDatabaseSet();
             transaction.Commit();
         }
         catch
@@ -408,23 +486,24 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         }
 
         ValidateSchema(connection, transaction: null);
-        RevalidateDatabase();
+        RevalidateDatabaseSet();
     }
 
     private async Task<SqliteConnection> OpenConnectionAsync(
         CancellationToken cancellationToken)
     {
-        RevalidateDatabase();
+        RevalidateDatabaseSet();
         var connection = CreateConnection();
         try
         {
             await connection.OpenAsync(cancellationToken)
                 .ConfigureAwait(false);
+            RevalidateDatabaseSet();
             await ConfigureConnectionAsync(
                     connection,
                     cancellationToken)
                 .ConfigureAwait(false);
-            RevalidateDatabase();
+            RevalidateDatabaseSet();
             return connection;
         }
         catch
@@ -516,7 +595,8 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             .ConfigureAwait(false);
     }
 
-    private static async Task<WorkbenchDocument?> ReadDocumentAsync(
+    private static async Task<PersistedImportIdentity?>
+        ReadPersistedImportAsync(
         SqliteConnection connection,
         SqliteTransaction? transaction,
         string contentSha256,
@@ -533,11 +613,15 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
               contract_id,
               input_kind,
               codec_id,
-              receipt_id,
+              documents.receipt_id,
               lifecycle_state,
-              created_at_utc
+              created_at_utc,
+              source_receipts.receipt_sha256,
+              source_receipts.canonical_json
             FROM documents
-            WHERE content_sha256=$content_sha256;
+            INNER JOIN source_receipts
+              ON source_receipts.receipt_id=documents.receipt_id
+            WHERE documents.content_sha256=$content_sha256;
             """;
         command.Parameters.AddWithValue(
             "$content_sha256",
@@ -573,13 +657,79 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             reader.GetString(7),
             reader.GetString(8),
             createdAt);
+        var persistedReceiptSha256 = reader.GetString(10);
+        if (reader.GetValue(11) is not byte[] persistedCanonicalReceipt)
+        {
+            throw InvalidState();
+        }
+
         if (await reader.ReadAsync(cancellationToken)
                 .ConfigureAwait(false))
         {
             throw InvalidState();
         }
 
-        return document;
+        return new PersistedImportIdentity(
+            document,
+            persistedReceiptSha256,
+            persistedCanonicalReceipt);
+    }
+
+    private static void RequireExactRetry(
+        PersistedImportIdentity persisted,
+        SourceReceipt receipt,
+        byte[] canonicalReceipt,
+        string receiptSha256,
+        string inputKind,
+        string? codecId)
+    {
+        var document = persisted.Document;
+        if (!string.Equals(
+                document.DocumentId,
+                CreateDocumentId(receipt.ExpectedContentSha256),
+                StringComparison.Ordinal)
+            || !string.Equals(
+                document.ContentSha256,
+                receipt.ExpectedContentSha256,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                document.SourceFamilyId,
+                receipt.SourceFamilyId,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                document.MarketId,
+                receipt.MarketId,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                document.ContractId,
+                receipt.ContractId,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                document.InputKind,
+                inputKind,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                document.CodecId,
+                codecId,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                document.ReceiptId,
+                receipt.ReceiptId,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                document.LifecycleState,
+                "imported",
+                StringComparison.Ordinal)
+            || !string.Equals(
+                persisted.ReceiptSha256,
+                receiptSha256,
+                StringComparison.Ordinal)
+            || !CryptographicOperations.FixedTimeEquals(
+                persisted.CanonicalReceipt,
+                canonicalReceipt))
+        {
+            throw InvalidState();
+        }
     }
 
     private static async Task RequireReceiptAvailableAsync(
@@ -613,6 +763,36 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         }
     }
 
+    private async Task CommitAcceptedAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Action acceptanceRevalidation,
+        ImportCommitOwnership ownership,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ValidateSchema(connection, transaction);
+        RevalidateDatabaseSet();
+
+        // This is the last acceptance check. The live source/object handles
+        // deny data writes and delete/rename while the IMMEDIATE SQLite
+        // transaction serializes database ownership. NTFS hard-link creation
+        // is not fully fenced by sharing flags, so the approved roots must also
+        // enforce an exclusive-writer ACL. The check below detects any link
+        // introduced before this boundary; no stronger race-free claim is made.
+        acceptanceRevalidation();
+        await transaction.CommitAsync(CancellationToken.None)
+            .ConfigureAwait(false);
+
+        // This transfer cannot throw. It is intentionally the first operation
+        // after a successful durable commit so later health failures can never
+        // authorize deletion of the committed object.
+        ownership.Transfer();
+        RevalidateDatabaseSet();
+        _injectFault?.Invoke(
+            CorpusImportFaultPoint.AfterDatabaseCommit);
+    }
+
     private static string CreateDocumentId(string contentSha256) =>
         "document-" + contentSha256;
 
@@ -628,7 +808,6 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                 SELECT name
                 FROM sqlite_schema
                 WHERE type='table'
-                  AND name NOT LIKE 'sqlite_%'
                 ORDER BY name;
                 """;
             using var reader = command.ExecuteReader();
@@ -639,38 +818,46 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         }
 
         if (!tableNames.SequenceEqual(
-                Columns.Keys.Order(StringComparer.Ordinal),
+                Columns.Keys
+                    .Append("sqlite_sequence")
+                    .Order(StringComparer.Ordinal),
                 StringComparer.Ordinal))
         {
             throw InvalidState();
         }
 
+        RequireExactSqliteSequenceSql(
+            connection,
+            transaction);
+
         foreach (var (table, expectedColumns) in Columns)
         {
-            var actualColumns = new List<string>();
-            var actualTypes = new List<string>();
-            var actualNotNull = new List<bool>();
-            var actualPrimaryKeys = new List<int>();
+            RequireExactTableSql(
+                connection,
+                transaction,
+                table);
+            var actualColumns = new List<TableColumn>();
             using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText =
-                $"PRAGMA table_info(\"{table}\");";
+                $"PRAGMA table_xinfo(\"{table}\");";
             using var reader = command.ExecuteReader();
             while (reader.Read())
             {
-                actualColumns.Add(reader.GetString(1));
-                actualTypes.Add(reader.GetString(2));
-                actualNotNull.Add(reader.GetInt64(3) != 0);
-                actualPrimaryKeys.Add(
-                    checked((int)reader.GetInt64(5)));
+                actualColumns.Add(
+                    new TableColumn(
+                        checked((int)reader.GetInt64(0)),
+                        reader.GetString(1),
+                        reader.GetString(2),
+                        reader.GetInt64(3) != 0,
+                        reader.IsDBNull(4)
+                            ? null
+                            : reader.GetValue(4),
+                        checked((int)reader.GetInt64(5)),
+                        checked((int)reader.GetInt64(6))));
             }
 
-            if (!actualColumns.SequenceEqual(
-                    expectedColumns,
-                    StringComparer.Ordinal)
-                || !actualTypes.SequenceEqual(
-                    Types[table],
-                    StringComparer.OrdinalIgnoreCase))
+            if (actualColumns.Count != expectedColumns.Length)
             {
                 throw InvalidState();
             }
@@ -687,13 +874,34 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                 var expectedNotNull = !isPrimaryKey
                     && !NullableColumns.Contains(
                         table + "." + column);
-                if (actualNotNull[index] != expectedNotNull
-                    || actualPrimaryKeys[index]
-                        != (isPrimaryKey ? 1 : 0))
+                var actual = actualColumns[index];
+                if (actual.Ordinal != index
+                    || !string.Equals(
+                        actual.Name,
+                        column,
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        actual.Type,
+                        Types[table][index],
+                        StringComparison.Ordinal)
+                    || actual.NotNull != expectedNotNull
+                    || actual.DefaultValue is not null
+                    || actual.PrimaryKeyOrder
+                        != (isPrimaryKey ? 1 : 0)
+                    || actual.Hidden != 0)
                 {
                     throw InvalidState();
                 }
             }
+
+            RequireExactIndexes(
+                connection,
+                transaction,
+                table);
+            RequireExactForeignKeys(
+                connection,
+                transaction,
+                table);
         }
 
         using (var command = connection.CreateCommand())
@@ -707,52 +915,13 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             }
         }
 
-        RequireUniqueColumn(
-            connection,
-            transaction,
-            "source_receipts",
-            "receipt_sha256");
-        RequireUniqueColumn(
-            connection,
-            transaction,
-            "documents",
-            "content_sha256");
-        RequireUniqueColumn(
-            connection,
-            transaction,
-            "label_revisions",
-            "revision_sha256");
-        RequireUniqueColumn(
-            connection,
-            transaction,
-            "approval_entries",
-            "entry_id");
-        RequireUniqueColumn(
-            connection,
-            transaction,
-            "approval_entries",
-            "entry_sha256");
-        RequireForeignKey(
-            connection,
-            transaction,
-            "documents",
-            "receipt_id",
-            "source_receipts",
-            "receipt_id");
-        RequireForeignKey(
-            connection,
-            transaction,
-            "label_revisions",
-            "document_id",
-            "documents",
-            "document_id");
-
         using var unexpected = connection.CreateCommand();
         unexpected.Transaction = transaction;
         unexpected.CommandText = """
             SELECT COUNT(*)
             FROM sqlite_schema
-            WHERE type IN ('trigger', 'view');
+            WHERE type IN ('trigger', 'view')
+               OR (type='index' AND sql IS NOT NULL);
             """;
         if (Convert.ToInt64(
                 unexpected.ExecuteScalar(),
@@ -763,14 +932,60 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         }
     }
 
-    private static void RequireUniqueColumn(
+    private static void RequireExactTableSql(
         SqliteConnection connection,
         SqliteTransaction? transaction,
-        string table,
-        string column)
+        string table)
     {
-        var found = false;
-        var indexes = new List<string>();
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT sql
+            FROM sqlite_schema
+            WHERE type='table' AND name=$name AND tbl_name=$name;
+            """;
+        command.Parameters.AddWithValue("$name", table);
+        if (command.ExecuteScalar() is not string actual
+            || !string.Equals(
+                NormalizeSql(actual),
+                NormalizeSql(ExtractSchemaStatement(table)),
+                StringComparison.Ordinal))
+        {
+            throw InvalidState();
+        }
+    }
+
+    private static void RequireExactSqliteSequenceSql(
+        SqliteConnection connection,
+        SqliteTransaction? transaction)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT sql
+            FROM sqlite_schema
+            WHERE type='table'
+              AND name='sqlite_sequence'
+              AND tbl_name='sqlite_sequence';
+            """;
+        if (command.ExecuteScalar() is not string actual
+            || !string.Equals(
+                NormalizeSql(actual),
+                NormalizeSql(
+                    "CREATE TABLE sqlite_sequence(name,seq)"),
+                StringComparison.Ordinal))
+        {
+            throw InvalidState();
+        }
+    }
+
+    private static void RequireExactIndexes(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string table)
+    {
+        var actual = new List<IndexSignature>();
+        var indexNames = new List<(string Name, string Origin)>();
         using (var command = connection.CreateCommand())
         {
             command.Transaction = transaction;
@@ -779,48 +994,96 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             using var reader = command.ExecuteReader();
             while (reader.Read())
             {
-                if (reader.GetInt64(2) == 1)
+                if (reader.GetInt64(2) != 1
+                    || reader.GetInt64(4) != 0)
                 {
-                    indexes.Add(reader.GetString(1));
+                    throw InvalidState();
                 }
+
+                indexNames.Add((
+                    reader.GetString(1),
+                    reader.GetString(3)));
             }
         }
 
-        foreach (var index in indexes)
+        foreach (var (name, origin) in indexNames)
         {
-            var columns = new List<string>();
+            var keyColumns = new List<string>();
+            var auxiliaryRows = 0;
             using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText =
-                $"PRAGMA index_info(\"{index}\");";
+                $"PRAGMA index_xinfo(\"{name}\");";
             using var reader = command.ExecuteReader();
             while (reader.Read())
             {
-                columns.Add(reader.GetString(2));
+                var columnId = reader.GetInt64(1);
+                var descending = reader.GetInt64(3);
+                var collation = reader.IsDBNull(4)
+                    ? null
+                    : reader.GetString(4);
+                var isKey = reader.GetInt64(5) != 0;
+                if (descending != 0
+                    || !string.Equals(
+                        collation,
+                        "BINARY",
+                        StringComparison.Ordinal))
+                {
+                    throw InvalidState();
+                }
+
+                if (isKey)
+                {
+                    if (columnId < 0 || reader.IsDBNull(2))
+                    {
+                        throw InvalidState();
+                    }
+
+                    keyColumns.Add(reader.GetString(2));
+                }
+                else
+                {
+                    if (columnId != -1 || !reader.IsDBNull(2))
+                    {
+                        throw InvalidState();
+                    }
+
+                    auxiliaryRows++;
+                }
             }
 
-            found |= columns.Count == 1
-                && string.Equals(
-                    columns[0],
-                    column,
-                    StringComparison.Ordinal);
+            if (auxiliaryRows != 1)
+            {
+                throw InvalidState();
+            }
+
+            actual.Add(
+                new IndexSignature(
+                    origin,
+                    [.. keyColumns]));
         }
 
-        if (!found)
+        if (!actual.OrderBy(
+                    static item => item.SortKey,
+                    StringComparer.Ordinal)
+                .Select(static item => item.SortKey)
+                .SequenceEqual(
+                    ExpectedIndexes(table).OrderBy(
+                        static item => item.SortKey,
+                        StringComparer.Ordinal)
+                    .Select(static item => item.SortKey),
+                    StringComparer.Ordinal))
         {
             throw InvalidState();
         }
     }
 
-    private static void RequireForeignKey(
+    private static void RequireExactForeignKeys(
         SqliteConnection connection,
         SqliteTransaction? transaction,
-        string table,
-        string fromColumn,
-        string targetTable,
-        string targetColumn)
+        string table)
     {
-        var found = false;
+        var actual = new List<ForeignKeySignature>();
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText =
@@ -828,24 +1091,168 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         using var reader = command.ExecuteReader();
         while (reader.Read())
         {
-            found |= string.Equals(
+            if (reader.GetInt64(1) != 0)
+            {
+                throw InvalidState();
+            }
+
+            actual.Add(
+                new ForeignKeySignature(
                     reader.GetString(2),
-                    targetTable,
-                    StringComparison.Ordinal)
-                && string.Equals(
                     reader.GetString(3),
-                    fromColumn,
-                    StringComparison.Ordinal)
-                && string.Equals(
                     reader.GetString(4),
-                    targetColumn,
-                    StringComparison.Ordinal);
+                    reader.GetString(5),
+                    reader.GetString(6),
+                    reader.GetString(7)));
         }
 
-        if (!found)
+        if (!actual.SequenceEqual(ExpectedForeignKeys(table)))
         {
             throw InvalidState();
         }
+    }
+
+    private static IReadOnlyList<IndexSignature> ExpectedIndexes(
+        string table) =>
+        table switch
+        {
+            "source_receipts" =>
+            [
+                new("pk", ["receipt_id"]),
+                new("u", ["receipt_sha256"]),
+            ],
+            "documents" =>
+            [
+                new("pk", ["document_id"]),
+                new("u", ["content_sha256"]),
+            ],
+            "label_revisions" =>
+            [
+                new("pk", ["revision_id"]),
+                new("u", ["revision_sha256"]),
+            ],
+            "approval_entries" =>
+            [
+                new("u", ["entry_id"]),
+                new("u", ["entry_sha256"]),
+            ],
+            "checkpoints" =>
+            [
+                new("pk", ["checkpoint_id"]),
+            ],
+            _ => throw InvalidState(),
+        };
+
+    private static IReadOnlyList<ForeignKeySignature>
+        ExpectedForeignKeys(string table) =>
+        table switch
+        {
+            "documents" =>
+            [
+                new(
+                    "source_receipts",
+                    "receipt_id",
+                    "receipt_id",
+                    "NO ACTION",
+                    "NO ACTION",
+                    "NONE"),
+            ],
+            "label_revisions" =>
+            [
+                new(
+                    "documents",
+                    "document_id",
+                    "document_id",
+                    "NO ACTION",
+                    "NO ACTION",
+                    "NONE"),
+            ],
+            _ => [],
+        };
+
+    private static string ExtractSchemaStatement(string table)
+    {
+        var prefix = "CREATE TABLE IF NOT EXISTS " + table + " ";
+        var start = SchemaSql.IndexOf(
+            prefix,
+            StringComparison.Ordinal);
+        if (start < 0)
+        {
+            throw InvalidState();
+        }
+
+        var end = SchemaSql.IndexOf(';', start);
+        if (end < 0)
+        {
+            throw InvalidState();
+        }
+
+        return SchemaSql[start..end].Replace(
+            "CREATE TABLE IF NOT EXISTS",
+            "CREATE TABLE",
+            StringComparison.Ordinal);
+    }
+
+    private static string NormalizeSql(string sql)
+    {
+        var normalized = new System.Text.StringBuilder(sql.Length);
+        var inSingleQuote = false;
+        var inDoubleQuote = false;
+        for (var index = 0; index < sql.Length; index++)
+        {
+            var character = sql[index];
+            if (character == '\'' && !inDoubleQuote)
+            {
+                normalized.Append(character);
+                if (inSingleQuote
+                    && index + 1 < sql.Length
+                    && sql[index + 1] == '\'')
+                {
+                    normalized.Append(sql[++index]);
+                }
+                else
+                {
+                    inSingleQuote = !inSingleQuote;
+                }
+
+                continue;
+            }
+
+            if (character == '"' && !inSingleQuote)
+            {
+                normalized.Append(character);
+                if (inDoubleQuote
+                    && index + 1 < sql.Length
+                    && sql[index + 1] == '"')
+                {
+                    normalized.Append(sql[++index]);
+                }
+                else
+                {
+                    inDoubleQuote = !inDoubleQuote;
+                }
+
+                continue;
+            }
+
+            if (!inSingleQuote && !inDoubleQuote)
+            {
+                if (char.IsWhiteSpace(character)
+                    || character == ';')
+                {
+                    continue;
+                }
+
+                normalized.Append(
+                    char.ToLowerInvariant(character));
+            }
+            else
+            {
+                normalized.Append(character);
+            }
+        }
+
+        return normalized.ToString();
     }
 
     private static void Execute(
@@ -917,13 +1324,15 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         }
     }
 
-    private void RevalidateDatabase()
+    private void RevalidateDatabaseSet()
     {
         var lease = _databaseLease
             ?? throw new ObjectDisposedException(
                 nameof(CorpusWorkbenchStore));
         _fileStore.RevalidateExisting(
             lease,
+            "workbench.db");
+        _fileStore.RevalidateDatabaseFileSet(
             "workbench.db");
     }
 
@@ -934,3 +1343,44 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
 internal sealed record PersistedImport(
     WorkbenchDocument Document,
     bool WasExisting);
+
+internal sealed record PersistedImportIdentity(
+    WorkbenchDocument Document,
+    string ReceiptSha256,
+    byte[] CanonicalReceipt);
+
+internal sealed class ImportCommitOwnership
+{
+    private int _transferred;
+
+    internal bool IsTransferred =>
+        Volatile.Read(ref _transferred) != 0;
+
+    internal void Transfer() =>
+        Volatile.Write(ref _transferred, 1);
+}
+
+internal sealed record TableColumn(
+    int Ordinal,
+    string Name,
+    string Type,
+    bool NotNull,
+    object? DefaultValue,
+    int PrimaryKeyOrder,
+    int Hidden);
+
+internal sealed record IndexSignature(
+    string Origin,
+    string[] Columns)
+{
+    internal string SortKey =>
+        Origin + ":" + string.Join("\u001f", Columns);
+}
+
+internal sealed record ForeignKeySignature(
+    string TargetTable,
+    string FromColumn,
+    string TargetColumn,
+    string OnUpdate,
+    string OnDelete,
+    string Match);
