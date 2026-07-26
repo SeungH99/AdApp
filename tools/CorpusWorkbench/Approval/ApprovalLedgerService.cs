@@ -338,17 +338,20 @@ public sealed class ApprovalLedgerService
                 var invalid = FindChainFailures(rows);
                 FindLedgerSemanticFailures(rows, invalid);
                 FindAnchorFailures(ledger, invalid);
-                var states =
-                    await _store.ReadAllApprovalLabelStatesAsync(
-                            connection,
-                            transaction)
-                        .ConfigureAwait(false);
-                FindCurrentStateFailures(rows, states, invalid);
                 if (invalid.Count != 0)
                 {
                     throw new WorkbenchException(
                         WorkbenchFailureCode.ApprovalChainInvalid);
                 }
+
+                var states =
+                    await _store.ReadAllApprovalLabelStatesAsync(
+                            connection,
+                            transaction)
+                        .ConfigureAwait(false);
+                var currentByDocument = states.ToDictionary(
+                    static state => state.Document.DocumentId,
+                    StringComparer.Ordinal);
 
                 var approved =
                     new Dictionary<string, OwnerApprovedDocument>(
@@ -358,6 +361,13 @@ public sealed class ApprovalLedgerService
                              ApprovalMode.DirectReview))
                 {
                     var payload = row.Payload!;
+                    if (!IsCurrentDocumentApproval(
+                            payload,
+                            currentByDocument))
+                    {
+                        continue;
+                    }
+
                     approved[payload.DocumentId!] =
                         new OwnerApprovedDocument(
                             payload.DocumentId!,
@@ -379,6 +389,14 @@ public sealed class ApprovalLedgerService
                                      static row => row.Sequence)
                                  .First()))
                 {
+                    if (!IsCurrentBatchApproval(
+                            batch,
+                            rows,
+                            states))
+                    {
+                        continue;
+                    }
+
                     foreach (var delegated in
                              batch.Payload!.DelegatedEntries)
                     {
@@ -687,6 +705,61 @@ public sealed class ApprovalLedgerService
             {
                 invalid.Add(batch.DiagnosticId);
             }
+        }
+    }
+
+    private bool IsCurrentDocumentApproval(
+        ApprovalDecisionPayload payload,
+        IReadOnlyDictionary<string, LabelDraftState> currentByDocument)
+    {
+        if (!currentByDocument.TryGetValue(
+                payload.DocumentId!,
+                out var state)
+            || !MatchesCurrent(payload, state))
+        {
+            return false;
+        }
+
+        try
+        {
+            RequireReviewCoverage(
+                state.PreviousRevision!,
+                _context.RuleIdsByMarket[state.Document.MarketId]);
+            return true;
+        }
+        catch (WorkbenchException)
+        {
+            return false;
+        }
+    }
+
+    // A batch commits one exact direct/delegated selection. Its delegated
+    // approvals are therefore atomic: any stale bound entry filters the
+    // complete batch instead of deriving a smaller, unapproved selection.
+    private bool IsCurrentBatchApproval(
+        ApprovalLedgerRow batch,
+        IReadOnlyList<ApprovalLedgerRow> rows,
+        IReadOnlyList<LabelDraftState> states)
+    {
+        try
+        {
+            var payload = batch.Payload!;
+            var selected = SelectBatchBindings(
+                payload.MarketId,
+                rows,
+                states,
+                requireExactDirectCount: true);
+            var summary = ComputeBatchSummarySha256(selected.Delegated);
+            return FixedEquals(summary, payload.BatchSummarySha256!)
+                && payload.DelegatedEntries.AsSpan()
+                    .SequenceEqual(selected.Delegated.AsSpan())
+                && payload.DirectReviewEntries.AsSpan()
+                    .SequenceEqual(selected.Direct.AsSpan())
+                && IsCurrentContext(payload);
+        }
+        catch (WorkbenchException)
+        {
+            return false;
         }
     }
 
