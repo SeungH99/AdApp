@@ -51,8 +51,11 @@ public sealed class DocumentExtractionClient
     private readonly string _workerExecutablePath;
     private readonly IReadOnlyList<string> _workerArguments;
     private readonly ApprovedRootPathGuard? _approvedRoot;
-    private readonly IWorkerLaunchFaultInjector _faultInjector;
     private readonly ImmutableArray<string> _defaultOcrLanguages;
+    private readonly IDocumentExtractionDeadlineFactory _deadlineFactory;
+    private readonly IDocumentSourceHasher _sourceHasher;
+    private readonly IDocumentWorkerSessionLauncher _workerLauncher;
+    private readonly IDocumentWorkerCleanupDiagnostics _cleanupDiagnostics;
 
     public DocumentExtractionClient(
         string workerExecutablePath,
@@ -74,6 +77,29 @@ public sealed class DocumentExtractionClient
         IReadOnlyList<string> workerArguments,
         IReadOnlyList<string> defaultOcrLanguages,
         IWorkerLaunchFaultInjector? faultInjector)
+        : this(
+            workerExecutablePath,
+            approvedRoot,
+            workerArguments,
+            defaultOcrLanguages,
+            faultInjector,
+            deadlineFactory: null,
+            sourceHasher: null,
+            workerLauncher: null,
+            cleanupDiagnostics: null)
+    {
+    }
+
+    internal DocumentExtractionClient(
+        string workerExecutablePath,
+        ApprovedRootPathGuard? approvedRoot,
+        IReadOnlyList<string> workerArguments,
+        IReadOnlyList<string> defaultOcrLanguages,
+        IWorkerLaunchFaultInjector? faultInjector,
+        IDocumentExtractionDeadlineFactory? deadlineFactory,
+        IDocumentSourceHasher? sourceHasher,
+        IDocumentWorkerSessionLauncher? workerLauncher,
+        IDocumentWorkerCleanupDiagnostics? cleanupDiagnostics = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workerExecutablePath);
         ArgumentNullException.ThrowIfNull(workerArguments);
@@ -89,8 +115,21 @@ public sealed class DocumentExtractionClient
         _defaultOcrLanguages =
             CopyAndValidateDefaultOcrLanguages(defaultOcrLanguages);
         _approvedRoot = approvedRoot;
-        _faultInjector = faultInjector
+        var effectiveFaultInjector = faultInjector
             ?? NoOpWorkerLaunchFaultInjector.Instance;
+        _deadlineFactory = deadlineFactory
+            ?? new MonotonicDocumentExtractionDeadlineFactory(
+                TimeSpan.FromMilliseconds(
+                    DocumentExtractionLimits.ExtractionTimeoutMilliseconds),
+                TimeProvider.System);
+        _sourceHasher = sourceHasher
+            ?? DefaultDocumentSourceHasher.Instance;
+        _cleanupDiagnostics = cleanupDiagnostics
+            ?? NullDocumentWorkerCleanupDiagnostics.Instance;
+        _workerLauncher = workerLauncher
+            ?? new AppContainerDocumentWorkerSessionLauncher(
+                effectiveFaultInjector,
+                _cleanupDiagnostics);
     }
 
     public async Task<DocumentExtractionResponse> ExtractAsync(
@@ -114,32 +153,44 @@ public sealed class DocumentExtractionClient
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(descriptor);
-        if (cancellationToken.IsCancellationRequested)
-        {
-            throw new DocumentExtractionException(
-                DocumentExtractionFailureCode.ExtractionCancelled);
-        }
-
-        if (source.IsClosed || source.IsInvalid)
-        {
-            throw new DocumentExtractionException(
-                DocumentExtractionFailureCode.InvalidSourceHandle);
-        }
-
-        SafeFileHandle? verificationHandle = null;
         try
         {
-            verificationHandle = DuplicateReadOnly(source);
-            await using var verified = VerifiedStableSource.Create(
-                verificationHandle);
-            verificationHandle = null;
-            return (await ExtractVerifiedAsync(
-                    verified,
-                    descriptor,
+            return await RunWithDeadlineAsync(
                     cancellationToken,
-                    requestedCapabilities,
-                    requestedLanguages)
-                .ConfigureAwait(false)).Response;
+                    async deadline =>
+                    {
+                        deadline.ThrowIfCancellationRequested();
+                        if (source.IsClosed || source.IsInvalid)
+                        {
+                            throw new DocumentExtractionException(
+                                DocumentExtractionFailureCode
+                                    .InvalidSourceHandle);
+                        }
+
+                        SafeFileHandle? verificationHandle = null;
+                        try
+                        {
+                            verificationHandle = DuplicateReadOnly(source);
+                            deadline.ThrowIfCancellationRequested();
+                            await using var verified =
+                                VerifiedStableSource.Create(
+                                    verificationHandle);
+                            verificationHandle = null;
+                            deadline.ThrowIfCancellationRequested();
+                            return (await ExtractVerifiedAsync(
+                                    verified,
+                                    descriptor,
+                                    deadline,
+                                    requestedCapabilities,
+                                    requestedLanguages)
+                                .ConfigureAwait(false)).Response;
+                        }
+                        finally
+                        {
+                            verificationHandle?.Dispose();
+                        }
+                    })
+                .ConfigureAwait(false);
         }
         catch (Exception exception) when (
             exception is StableSourceBoundaryException
@@ -147,10 +198,6 @@ public sealed class DocumentExtractionClient
         {
             throw new DocumentExtractionException(
                 DocumentExtractionFailureCode.InvalidSourceHandle);
-        }
-        finally
-        {
-            verificationHandle?.Dispose();
         }
     }
 
@@ -165,16 +212,29 @@ public sealed class DocumentExtractionClient
                 "An approved-root guard is required for path-based extraction.");
         }
 
-        if (cancellationToken.IsCancellationRequested)
-        {
-            throw new DocumentExtractionException(
-                DocumentExtractionFailureCode.ExtractionCancelled);
-        }
-
-        VerifiedStableSource verified;
         try
         {
-            verified = _approvedRoot.OpenVerifiedSource(sourcePath);
+            return await RunWithDeadlineAsync(
+                    cancellationToken,
+                    async deadline =>
+                    {
+                        deadline.ThrowIfCancellationRequested();
+                        var verified =
+                            _approvedRoot.OpenVerifiedSource(sourcePath);
+                        await using (verified)
+                        {
+                            deadline.ThrowIfCancellationRequested();
+                            return (await ExtractVerifiedAsync(
+                                    verified,
+                                    descriptor,
+                                    deadline,
+                                    ExtractionCapability.EmbeddedText
+                                        | ExtractionCapability.Ocr,
+                                    _defaultOcrLanguages)
+                                .ConfigureAwait(false)).Response;
+                        }
+                    })
+                .ConfigureAwait(false);
         }
         catch (Exception exception) when (
             exception is FileSystemBoundaryException
@@ -186,18 +246,6 @@ public sealed class DocumentExtractionClient
         {
             throw new DocumentExtractionException(
                 DocumentExtractionFailureCode.InvalidSourceHandle);
-        }
-
-        await using (verified)
-        {
-            return (await ExtractVerifiedAsync(
-                    verified,
-                    descriptor,
-                    cancellationToken,
-                    ExtractionCapability.EmbeddedText
-                        | ExtractionCapability.Ocr,
-                    _defaultOcrLanguages)
-                .ConfigureAwait(false)).Response;
         }
     }
 
@@ -221,10 +269,29 @@ public sealed class DocumentExtractionClient
                 nameof(requestedLanguages));
         }
 
-        VerifiedStableSource verified;
         try
         {
-            verified = _approvedRoot.OpenVerifiedSource(sourcePath);
+            return await RunWithDeadlineAsync(
+                    cancellationToken,
+                    async deadline =>
+                    {
+                        deadline.ThrowIfCancellationRequested();
+                        var verified =
+                            _approvedRoot.OpenVerifiedSource(sourcePath);
+                        await using (verified)
+                        {
+                            deadline.ThrowIfCancellationRequested();
+                            return await ExtractVerifiedAsync(
+                                    verified,
+                                    descriptor,
+                                    deadline,
+                                    ExtractionCapability.EmbeddedText
+                                        | ExtractionCapability.Ocr,
+                                    requestedLanguages)
+                                .ConfigureAwait(false);
+                        }
+                    })
+                .ConfigureAwait(false);
         }
         catch (Exception exception) when (
             exception is FileSystemBoundaryException
@@ -237,57 +304,58 @@ public sealed class DocumentExtractionClient
             throw new DocumentExtractionException(
                 DocumentExtractionFailureCode.InvalidSourceHandle);
         }
-
-        await using (verified)
-        {
-            return await ExtractVerifiedAsync(
-                    verified,
-                    descriptor,
-                    cancellationToken,
-                    ExtractionCapability.EmbeddedText
-                        | ExtractionCapability.Ocr,
-                    requestedLanguages)
-                .ConfigureAwait(false);
-        }
     }
 
     private async Task<DocumentExtractionEvaluationResult>
         ExtractVerifiedAsync(
         VerifiedStableSource source,
         DocumentSourceDescriptor descriptor,
-        CancellationToken cancellationToken,
+        IDocumentExtractionDeadline deadline,
         ExtractionCapability requestedCapabilities,
         ImmutableArray<string> requestedLanguages)
     {
         byte[]? initialHash = null;
         try
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            deadline.ThrowIfCancellationRequested();
             if (!File.Exists(_workerExecutablePath))
             {
                 throw new DocumentExtractionException(
                     DocumentExtractionFailureCode.WorkerTerminated);
             }
 
+            deadline.ThrowIfCancellationRequested();
             source.RequireSingleLink();
-            initialHash = await ComputeSha256Async(
+            initialHash = await _sourceHasher.ComputeSha256Async(
                     source.Handle,
                     source.Length,
-                    cancellationToken)
+                    deadline.Token)
                 .ConfigureAwait(false);
-            var profile = AppContainerProfile.OpenOrCreate();
-            LaunchedAppContainerProcess? worker = null;
+            deadline.ThrowIfCancellationRequested();
+            DocumentWorkerSessionLease? worker = null;
             Exception? primaryException = null;
             try
             {
-                var launcher = new AppContainerProcessLauncher(
-                    profile,
-                    _faultInjector);
-                var activeWorker = launcher.Start(
-                    _workerExecutablePath,
-                    _workerArguments,
-                    source.Handle);
-                worker = activeWorker;
+                var launch = LaunchWithOwnedSourceAsync(
+                    source.Handle,
+                    deadline);
+                IDocumentWorkerSession activeWorker;
+                try
+                {
+                    activeWorker = await launch
+                        .WaitAsync(deadline.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    ObserveLateLaunch(launch);
+                    throw;
+                }
+
+                worker = new DocumentWorkerSessionLease(
+                    activeWorker,
+                    _cleanupDiagnostics);
+                deadline.ThrowIfCancellationRequested();
                 var request = new DocumentExtractionRequest(
                     DocumentExtractionProtocol.CurrentVersion,
                     Guid.NewGuid(),
@@ -303,35 +371,29 @@ public sealed class DocumentExtractionClient
                     DocumentExtractionValidator.ValidateRequest(request);
                 if (!requestValidation.IsValid)
                 {
-                    activeWorker.Kill();
+                    worker.Abort();
                     throw new DocumentExtractionException(
                         requestValidation.FailureCode);
                 }
 
-                using var timeout = new CancellationTokenSource(
-                    TimeSpan.FromMilliseconds(
-                        DocumentExtractionLimits.ExtractionTimeoutMilliseconds));
-                using var linked = CancellationTokenSource.CreateLinkedTokenSource(
-                    cancellationToken,
-                    timeout.Token);
                 try
                 {
                     await ReadWorkerReadinessAsync(
                             activeWorker.StandardOutput,
-                            linked.Token)
+                            deadline.Token)
                         .ConfigureAwait(false);
                     await WriteRequestFrameAsync(
                             activeWorker.StandardInput,
                             request,
-                            linked.Token)
+                            deadline.Token)
                         .ConfigureAwait(false);
                     activeWorker.StandardInput.Dispose();
 
                     var response = await ReadResponseFrameAsync(
                             activeWorker.StandardOutput,
-                            linked.Token)
+                            deadline.Token)
                         .ConfigureAwait(false);
-                    await activeWorker.WaitForExitAsync(linked.Token)
+                    await activeWorker.WaitForExitAsync(deadline.Token)
                         .ConfigureAwait(false);
                     if (activeWorker.ExitCode != 0)
                     {
@@ -358,10 +420,10 @@ public sealed class DocumentExtractionClient
                             DocumentExtractionFailureCode.InvalidSourceLength);
                     }
 
-                    var finalHash = await ComputeSha256Async(
+                    var finalHash = await _sourceHasher.ComputeSha256Async(
                             source.Handle,
                             source.Length,
-                            linked.Token)
+                            deadline.Token)
                         .ConfigureAwait(false);
                     try
                     {
@@ -383,28 +445,32 @@ public sealed class DocumentExtractionClient
                         response,
                         ImmutableArray.CreateRange(initialHash));
                 }
-                catch (OperationCanceledException exception)
+                catch (OperationCanceledException)
                 {
-                    await RescueAsync(activeWorker).ConfigureAwait(false);
-                    throw new DocumentExtractionException(
-                        cancellationToken.IsCancellationRequested
-                            ? DocumentExtractionFailureCode.ExtractionCancelled
-                            : DocumentExtractionFailureCode.ExtractionTimedOut,
-                        exception);
+                    worker.Abort();
+                    throw;
                 }
                 catch (FrameException exception)
                 {
                     var failureCode = activeWorker.WasProcessMemoryLimitReached()
                         ? DocumentExtractionFailureCode.WorkerMemoryLimitExceeded
                         : exception.FailureCode;
-                    await RescueAsync(activeWorker).ConfigureAwait(false);
+                    worker.Abort();
+                    await DrainDiagnosticsAsync(
+                            activeWorker,
+                            deadline.Token)
+                        .ConfigureAwait(false);
                     throw new DocumentExtractionException(
                         failureCode,
                         exception);
                 }
                 catch (DocumentExtractionException)
                 {
-                    await RescueAsync(activeWorker).ConfigureAwait(false);
+                    worker.Abort();
+                    await DrainDiagnosticsAsync(
+                            activeWorker,
+                            deadline.Token)
+                        .ConfigureAwait(false);
                     throw;
                 }
                 catch (Exception exception) when (
@@ -412,7 +478,11 @@ public sealed class DocumentExtractionClient
                         or JsonException
                         or AppContainerLaunchException)
                 {
-                    await RescueAsync(activeWorker).ConfigureAwait(false);
+                    worker.Abort();
+                    await DrainDiagnosticsAsync(
+                            activeWorker,
+                            deadline.Token)
+                        .ConfigureAwait(false);
                     throw CreateTerminationFailure(activeWorker, exception);
                 }
             }
@@ -423,19 +493,15 @@ public sealed class DocumentExtractionClient
             }
             finally
             {
-                await CleanupWorkerAndProfileAsync(
-                        worker,
-                        profile,
-                        primaryException)
-                    .ConfigureAwait(false);
+                if (worker is not null)
+                {
+                    await CleanupWorkerWithinDeadlineAsync(
+                            worker,
+                            primaryException,
+                            deadline)
+                        .ConfigureAwait(false);
+                }
             }
-        }
-        catch (OperationCanceledException exception)
-            when (cancellationToken.IsCancellationRequested)
-        {
-            throw new DocumentExtractionException(
-                DocumentExtractionFailureCode.ExtractionCancelled,
-                exception);
         }
         catch (Exception exception) when (
             exception is StableSourceBoundaryException
@@ -459,84 +525,125 @@ public sealed class DocumentExtractionClient
         }
     }
 
-    private static async ValueTask CleanupWorkerAndProfileAsync(
-        LaunchedAppContainerProcess? worker,
-        AppContainerProfile profile,
-        Exception? primaryException)
+    private async Task<T> RunWithDeadlineAsync<T>(
+        CancellationToken callerCancellation,
+        Func<IDocumentExtractionDeadline, Task<T>> operation)
     {
-        var cleanupFailed = false;
-        var workerTerminationUnconfirmed = false;
-        if (worker is not null)
+        using var deadline = _deadlineFactory.Start(callerCancellation);
+        try
         {
-            try
-            {
-                await worker.DisposeAsync().ConfigureAwait(false);
-            }
-            catch (Exception exception) when (
-                exception is AppContainerLaunchException
-                    or IOException
-                    or ObjectDisposedException
-                    or UnauthorizedAccessException)
-            {
-                cleanupFailed = true;
-                workerTerminationUnconfirmed = true;
-            }
+            deadline.ThrowIfCancellationRequested();
+            return await operation(deadline).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException exception)
+        {
+            throw new DocumentExtractionException(
+                callerCancellation.IsCancellationRequested
+                    ? DocumentExtractionFailureCode.ExtractionCancelled
+                    : DocumentExtractionFailureCode.ExtractionTimedOut,
+                exception);
+        }
+    }
+
+    private async Task<IDocumentWorkerSession> LaunchWithOwnedSourceAsync(
+        SafeFileHandle source,
+        IDocumentExtractionDeadline deadline)
+    {
+        using var launchSource = DuplicateReadOnly(source);
+        deadline.ThrowIfCancellationRequested();
+        var remainingBudget = deadline.Remaining;
+        if (remainingBudget <= TimeSpan.Zero)
+        {
+            deadline.ThrowIfCancellationRequested();
+            throw new OperationCanceledException(deadline.Token);
         }
 
-        if (workerTerminationUnconfirmed)
+        return await _workerLauncher.LaunchAsync(
+                _workerExecutablePath,
+                _workerArguments,
+                launchSource,
+                remainingBudget)
+            .ConfigureAwait(false);
+    }
+
+    private void ObserveLateLaunch(
+        Task<IDocumentWorkerSession> launch)
+    {
+        _ = AbortAndCleanupLateLaunchAsync(launch);
+    }
+
+    private async Task AbortAndCleanupLateLaunchAsync(
+        Task<IDocumentWorkerSession> launch)
+    {
+        try
         {
-            try
-            {
-                profile.ReleaseWithoutProfileDeletion();
-            }
-            catch (Exception exception) when (
-                exception is IOException
-                    or ObjectDisposedException
-                    or UnauthorizedAccessException)
-            {
-                cleanupFailed = true;
-            }
+            var worker = new DocumentWorkerSessionLease(
+                await launch.ConfigureAwait(false),
+                _cleanupDiagnostics);
+            worker.Abort();
+            await Task.Run(
+                    async () =>
+                        await worker.CleanupAsync(
+                                new OperationCanceledException(
+                                    "The launch completed after its deadline."))
+                            .ConfigureAwait(false))
+                .ConfigureAwait(false);
         }
-        else
+        catch (Exception)
         {
-            try
-            {
-                profile.Dispose();
-            }
-            catch (Exception exception) when (
-                exception is AppContainerLaunchException
-                    or IOException
-                    or ObjectDisposedException
-                    or UnauthorizedAccessException)
-            {
-                cleanupFailed = true;
-            }
+            DocumentWorkerCleanupDiagnostics.ReportSafely(
+                _cleanupDiagnostics,
+                DocumentWorkerCleanupFailureKind.LateLaunch);
+        }
+    }
+
+    private async Task CleanupWorkerWithinDeadlineAsync(
+        DocumentWorkerSessionLease worker,
+        Exception? primaryException,
+        IDocumentExtractionDeadline deadline)
+    {
+        if (primaryException is not null
+            || deadline.Token.IsCancellationRequested
+            || deadline.Remaining <= TimeSpan.Zero)
+        {
+            worker.Abort();
         }
 
-        if (!cleanupFailed)
+        var cleanup = Task.Run(
+            async () =>
+                await worker.CleanupAsync(primaryException)
+                    .ConfigureAwait(false));
+        try
         {
-            return;
+            deadline.ThrowIfCancellationRequested();
+            await cleanup.WaitAsync(deadline.Token).ConfigureAwait(false);
+            deadline.ThrowIfCancellationRequested();
         }
-
-        if (primaryException is not null)
+        catch (OperationCanceledException)
         {
-            try
-            {
-                primaryException.Data["DocumentExtractionCleanup"] =
-                    "One or more isolated worker cleanup steps failed.";
-            }
-            catch (Exception exception) when (
-                exception is ArgumentException
-                    or InvalidOperationException
-                    or NotSupportedException)
-            {
-            }
-
-            return;
+            worker.Abort();
+            ObserveBackgroundCleanup(cleanup);
+            throw;
         }
+    }
 
-        throw new AppContainerLaunchException(
-            "The isolated worker cleanup did not complete.");
+    private void ObserveBackgroundCleanup(Task cleanup)
+    {
+        _ = ObserveBackgroundCleanupAsync(cleanup);
+    }
+
+    private async Task ObserveBackgroundCleanupAsync(Task cleanup)
+    {
+        try
+        {
+            await cleanup.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            DocumentWorkerCleanupDiagnostics.ReportSafely(
+                _cleanupDiagnostics,
+                DocumentWorkerCleanupFailureKind.BackgroundCleanup);
+        }
     }
 
     private static SafeFileHandle DuplicateReadOnly(SafeFileHandle source)
@@ -805,18 +912,10 @@ public sealed class DocumentExtractionClient
         }
     }
 
-    private static async Task RescueAsync(
-        LaunchedAppContainerProcess worker)
+    private static async Task DrainDiagnosticsAsync(
+        IDocumentWorkerSession worker,
+        CancellationToken deadlineCancellation)
     {
-        try
-        {
-            worker.Kill();
-        }
-        catch (AppContainerLaunchException)
-        {
-            // Kill-on-close remains the final process-tree rescue.
-        }
-
         try
         {
             worker.StandardInput.Dispose();
@@ -826,16 +925,20 @@ public sealed class DocumentExtractionClient
         }
 
         using var drainTimeout = new CancellationTokenSource(
-            TimeSpan.FromMilliseconds(250));
+            TimeSpan.FromMilliseconds(250),
+            TimeProvider.System);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            deadlineCancellation,
+            drainTimeout.Token);
         var buffer = new byte[DiagnosticDrainLimit];
         try
         {
             var total = 0;
             while (total < buffer.Length)
             {
-                var read = await worker.StandardOutput.ReadAsync(
-                        buffer.AsMemory(total),
-                        drainTimeout.Token)
+                    var read = await worker.StandardOutput.ReadAsync(
+                            buffer.AsMemory(total),
+                            linked.Token)
                     .ConfigureAwait(false);
                 if (read == 0)
                 {
@@ -856,13 +959,32 @@ public sealed class DocumentExtractionClient
     }
 
     private static DocumentExtractionException CreateTerminationFailure(
-        LaunchedAppContainerProcess worker,
+        IDocumentWorkerSession worker,
         Exception? innerException = null) =>
         new(
             worker.WasProcessMemoryLimitReached()
                 ? DocumentExtractionFailureCode.WorkerMemoryLimitExceeded
                 : DocumentExtractionFailureCode.WorkerTerminated,
             innerException);
+
+    private sealed class DefaultDocumentSourceHasher
+        : IDocumentSourceHasher
+    {
+        internal static DefaultDocumentSourceHasher Instance { get; } = new();
+
+        private DefaultDocumentSourceHasher()
+        {
+        }
+
+        public Task<byte[]> ComputeSha256Async(
+            SafeFileHandle source,
+            long length,
+            CancellationToken cancellationToken) =>
+            DocumentExtractionClient.ComputeSha256Async(
+                source,
+                length,
+                cancellationToken);
+    }
 
     private sealed class FrameException : Exception
     {
