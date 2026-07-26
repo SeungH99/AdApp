@@ -466,11 +466,32 @@ public sealed class CorpusWorkerPackageLease
         string workerExecutablePath,
         string expectedPackageSha256,
         CorpusProtectedRootSet protectedRoots,
+        CancellationToken cancellationToken) =>
+        await CreateAsync(
+                packageRoot,
+                workerExecutablePath,
+                expectedPackageSha256,
+                protectedRoots,
+                Path.Combine(
+                    Path.GetTempPath(),
+                    "LocalDocumentOrganizer",
+                    "CorpusEval",
+                    "worker-stage"),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    internal static async Task<CorpusWorkerPackageLease> CreateAsync(
+        string packageRoot,
+        string workerExecutablePath,
+        string expectedPackageSha256,
+        CorpusProtectedRootSet protectedRoots,
+        string stageParent,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(protectedRoots);
         if (!CorpusWorkerPackageManifest.IsSha256(
-                expectedPackageSha256))
+                expectedPackageSha256)
+            || !Path.IsPathFullyQualified(stageParent))
         {
             throw new CorpusWorkerAttestationException();
         }
@@ -478,11 +499,8 @@ public sealed class CorpusWorkerPackageLease
         CorpusWorkerPackageSnapshot? source = null;
         CorpusWorkerPackageSnapshot? staged = null;
         string? stageRoot = null;
-        var stageParent = Path.Combine(
-            Path.GetTempPath(),
-            "LocalDocumentOrganizer",
-            "CorpusEval",
-            "worker-stage");
+        stageParent = Path.TrimEndingDirectorySeparator(
+            Path.GetFullPath(stageParent));
         try
         {
             protectedRoots.Revalidate();
@@ -506,7 +524,7 @@ public sealed class CorpusWorkerPackageLease
             stageRoot = Path.Combine(
                 stageParent,
                 StageDirectoryPrefix + Guid.NewGuid().ToString("N"));
-            CreatePrivateStageDirectory(stageRoot);
+            CreatePrivateDirectory(stageRoot);
             protectedRoots.RequireDisjointExisting(stageRoot);
             await source.CopyToAsync(stageRoot, cancellationToken)
                 .ConfigureAwait(false);
@@ -617,7 +635,7 @@ public sealed class CorpusWorkerPackageLease
         }
     }
 
-    private static void CreatePrivateStageDirectory(string stageRoot)
+    internal static void CreatePrivateDirectory(string stageRoot)
     {
         using var identity = WindowsIdentity.GetCurrent();
         var user = identity.User

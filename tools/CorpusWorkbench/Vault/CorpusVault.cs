@@ -21,14 +21,17 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
     private readonly ConcurrentDictionary<string, SemaphoreSlim>
         _importGates = new(StringComparer.Ordinal);
     private readonly Action<CorpusImportFaultPoint>? _injectFault;
+    private readonly ApprovedRootPathGuard _rootGuard;
     private ApprovedRootFileStore? _fileStore;
     private CorpusWorkbenchStore? _store;
 
     private CorpusVault(
+        ApprovedRootPathGuard rootGuard,
         ApprovedRootFileStore fileStore,
         CorpusWorkbenchStore store,
         Action<CorpusImportFaultPoint>? injectFault)
     {
+        _rootGuard = rootGuard;
         _fileStore = fileStore;
         _store = store;
         _injectFault = injectFault;
@@ -37,6 +40,15 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
     internal CorpusWorkbenchStore Store =>
         _store
         ?? throw new ObjectDisposedException(nameof(CorpusVault));
+
+    internal ApprovedRootPathGuard ExtractionRootGuard
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return _rootGuard;
+        }
+    }
 
     public static CorpusVault OpenExisting(string vaultRoot)
         => OpenExisting(vaultRoot, injectFault: null);
@@ -79,6 +91,7 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
                     DatabaseRelativePath),
                 injectFault);
             var vault = new CorpusVault(
+                guard,
                 fileStore,
                 store,
                 injectFault);
@@ -119,6 +132,27 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
             contentSha256[..2],
             contentSha256.Substring(2, 2),
             contentSha256);
+    }
+
+    internal string GetObjectPathForExtraction(
+        WorkbenchDocument document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        ValidateContentSha256(document.ContentSha256);
+        if (!string.Equals(
+                document.DocumentId,
+                "document-" + document.ContentSha256,
+                StringComparison.Ordinal))
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.ContentHashMismatch);
+        }
+
+        var fileStore = GetFileStore();
+        var relative = GetObjectRelativePath(document.ContentSha256);
+        using var source = fileStore.OpenExistingVerified(relative);
+        fileStore.RevalidateExisting(source, relative);
+        return Path.Combine(fileStore.ApprovedRoot, relative);
     }
 
     internal StagedCorpusObject CreateStagingObject(

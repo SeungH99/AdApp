@@ -1,6 +1,11 @@
 using System.Globalization;
 using System.Security.Cryptography;
+using LocalDocumentOrganizer.CorpusEval;
 using LocalDocumentOrganizer.CorpusWorkbench.Contracts;
+using LocalDocumentOrganizer.CorpusWorkbench.Ingestion;
+using LocalDocumentOrganizer.CorpusWorkbench.Labels;
+using LocalDocumentOrganizer.CorpusWorkbench.Rules;
+using LocalDocumentOrganizer.CorpusWorkbench.Serialization;
 using LocalDocumentOrganizer.CorpusWorkbench.Vault;
 using LocalDocumentOrganizer.Infrastructure.Windows.FileSystem;
 using Microsoft.Data.Sqlite;
@@ -204,6 +209,164 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
 
         RevalidateDatabaseSet();
         return persisted?.Document;
+    }
+
+    internal async Task<LabelDraftState> LoadLabelStateAsync(
+        string documentId,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        ArgumentException.ThrowIfNullOrWhiteSpace(documentId);
+        await using var connection =
+            await OpenConnectionAsync(cancellationToken)
+                .ConfigureAwait(false);
+        ValidateSchema(connection, transaction: null);
+        var state = await ReadLabelStateAsync(
+                connection,
+                transaction: null,
+                documentId,
+                cancellationToken)
+            .ConfigureAwait(false);
+        RevalidateDatabaseSet();
+        return state;
+    }
+
+    internal async Task<LabelRevision> PersistLabelRevisionAsync(
+        LabelDraftState expectedState,
+        LabelDraft draft,
+        OfficialRuleCatalogSnapshot rules,
+        CorpusWorkerPackageIdentity workerIdentity,
+        DateTimeOffset createdAtUtc,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(expectedState);
+        ArgumentNullException.ThrowIfNull(draft);
+        ArgumentNullException.ThrowIfNull(rules);
+        ArgumentNullException.ThrowIfNull(workerIdentity);
+        await using var connection =
+            await OpenConnectionAsync(cancellationToken)
+                .ConfigureAwait(false);
+        await using var transaction =
+            connection.BeginTransaction(deferred: false);
+        try
+        {
+            RevalidateDatabaseSet();
+            ValidateSchema(connection, transaction);
+            var current = await ReadLabelStateAsync(
+                    connection,
+                    transaction,
+                    expectedState.Document.DocumentId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (current.Document != expectedState.Document)
+            {
+                throw InvalidState();
+            }
+
+            if (current.PreviousRevision is { } currentHead
+                && DraftLabelService.HasSameBinding(
+                    currentHead,
+                    current.Document,
+                    draft,
+                    rules,
+                    workerIdentity))
+            {
+                await transaction.CommitAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+                RevalidateDatabaseSet();
+                return currentHead;
+            }
+
+            if (!SameRevision(
+                    current.PreviousRevision,
+                    expectedState.PreviousRevision))
+            {
+                throw InvalidState();
+            }
+
+            var revision =
+                DraftLabelService.CreateCanonicalRevision(
+                    current.Document,
+                    draft,
+                    rules,
+                    workerIdentity,
+                    current.PreviousRevision,
+                    createdAtUtc);
+            var canonical = WorkbenchJson.Serialize(
+                revision,
+                WorkbenchJsonContext.Default.LabelRevision);
+            await using (var command = connection.CreateCommand())
+            {
+                command.Transaction = transaction;
+                command.CommandText = """
+                    INSERT INTO label_revisions(
+                      revision_id,
+                      document_id,
+                      previous_revision_id,
+                      revision_sha256,
+                      canonical_json,
+                      created_at_utc)
+                    VALUES(
+                      $revision_id,
+                      $document_id,
+                      $previous_revision_id,
+                      $revision_sha256,
+                      $canonical_json,
+                      $created_at_utc);
+                    """;
+                command.Parameters.AddWithValue(
+                    "$revision_id",
+                    revision.RevisionId);
+                command.Parameters.AddWithValue(
+                    "$document_id",
+                    revision.DocumentId);
+                command.Parameters.AddWithValue(
+                    "$previous_revision_id",
+                    (object?)revision.PreviousRevisionId
+                        ?? DBNull.Value);
+                command.Parameters.AddWithValue(
+                    "$revision_sha256",
+                    revision.RevisionSha256);
+                var canonicalParameter = command.Parameters.Add(
+                    "$canonical_json",
+                    SqliteType.Blob);
+                canonicalParameter.Value = canonical;
+                command.Parameters.AddWithValue(
+                    "$created_at_utc",
+                    revision.CreatedAtUtc.UtcDateTime.ToString(
+                        "O",
+                        CultureInfo.InvariantCulture));
+                if (await command.ExecuteNonQueryAsync(cancellationToken)
+                        .ConfigureAwait(false)
+                    != 1)
+                {
+                    throw InvalidState();
+                }
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            ValidateSchema(connection, transaction);
+            RevalidateDatabaseSet();
+            await transaction.CommitAsync(CancellationToken.None)
+                .ConfigureAwait(false);
+            RevalidateDatabaseSet();
+            return revision;
+        }
+        catch
+        {
+            try
+            {
+                await transaction.RollbackAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // The primary transaction failure remains canonical.
+            }
+
+            throw;
+        }
     }
 
     internal async Task<PersistedImport> PersistImportAsync(
@@ -674,6 +837,289 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             persistedReceiptSha256,
             persistedCanonicalReceipt);
     }
+
+    private static async Task<LabelDraftState> ReadLabelStateAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string documentId,
+        CancellationToken cancellationToken)
+    {
+        string contentSha256;
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT content_sha256
+                FROM documents
+                WHERE document_id=$document_id;
+                """;
+            command.Parameters.AddWithValue(
+                "$document_id",
+                documentId);
+            var value = await command.ExecuteScalarAsync(
+                    cancellationToken)
+                .ConfigureAwait(false);
+            contentSha256 = value as string
+                ?? throw InvalidState();
+        }
+
+        var persisted = await ReadPersistedImportAsync(
+                connection,
+                transaction,
+                contentSha256,
+                cancellationToken)
+            .ConfigureAwait(false)
+            ?? throw InvalidState();
+        if (!string.Equals(
+                persisted.Document.DocumentId,
+                documentId,
+                StringComparison.Ordinal))
+        {
+            throw InvalidState();
+        }
+
+        RequireReceiptIdentity(persisted);
+        var revisions = new List<LabelRevision>();
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT
+                  revision_id,
+                  previous_revision_id,
+                  revision_sha256,
+                  canonical_json,
+                  created_at_utc
+                FROM label_revisions
+                WHERE document_id=$document_id;
+                """;
+            command.Parameters.AddWithValue(
+                "$document_id",
+                documentId);
+            await using var reader =
+                await command.ExecuteReaderAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken)
+                       .ConfigureAwait(false))
+            {
+                if (reader.GetValue(3) is not byte[] canonical)
+                {
+                    throw InvalidState();
+                }
+
+                LabelRevision revision;
+                try
+                {
+                    revision = WorkbenchJson.Parse(
+                        canonical,
+                        WorkbenchJsonContext.Default.LabelRevision);
+                }
+                catch (Exception exception) when (
+                    exception is System.Text.Json.JsonException
+                        or NotSupportedException)
+                {
+                    throw InvalidState();
+                }
+
+                var createdAtText = reader.GetString(4);
+                if (!DateTimeOffset.TryParseExact(
+                        createdAtText,
+                        "O",
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.RoundtripKind,
+                        out var createdAt)
+                    || createdAt.Offset != TimeSpan.Zero
+                    || revision.CreatedAtUtc.Offset != TimeSpan.Zero
+                    || revision.CreatedAtUtc != createdAt
+                    || !string.Equals(
+                        revision.RevisionId,
+                        reader.GetString(0),
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.DocumentId,
+                        documentId,
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.DocumentSha256,
+                        persisted.Document.ContentSha256,
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.MarketId,
+                        persisted.Document.MarketId,
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.ContractId,
+                        persisted.Document.ContractId,
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.PreviousRevisionId,
+                        reader.IsDBNull(1)
+                            ? null
+                            : reader.GetString(1),
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.RevisionSha256,
+                        reader.GetString(2),
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.RevisionId,
+                        "revision-" + revision.RevisionSha256,
+                        StringComparison.Ordinal)
+                    || !DraftLabelService.HasValidCanonicalHash(
+                        revision)
+                    || !CryptographicOperations.FixedTimeEquals(
+                        canonical,
+                        WorkbenchJson.Serialize(
+                            revision,
+                            WorkbenchJsonContext.Default
+                                .LabelRevision)))
+                {
+                    throw InvalidState();
+                }
+
+                revisions.Add(revision);
+            }
+        }
+
+        return new LabelDraftState(
+            persisted.Document,
+            RequireLinearHead(revisions));
+    }
+
+    private static void RequireReceiptIdentity(
+        PersistedImportIdentity persisted)
+    {
+        SourceReceipt receipt;
+        try
+        {
+            receipt = WorkbenchJson.Parse(
+                persisted.CanonicalReceipt,
+                WorkbenchJsonContext.Default.SourceReceipt);
+        }
+        catch (Exception exception) when (
+            exception is System.Text.Json.JsonException
+                or NotSupportedException)
+        {
+            throw InvalidState();
+        }
+
+        var canonical = CanonicalSourceReceipt.Serialize(receipt);
+        var sha256 =
+            Convert.ToHexStringLower(SHA256.HashData(canonical));
+        var document = persisted.Document;
+        if (!CryptographicOperations.FixedTimeEquals(
+                canonical,
+                persisted.CanonicalReceipt)
+            || !string.Equals(
+                sha256,
+                persisted.ReceiptSha256,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                receipt.ReceiptId,
+                document.ReceiptId,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                receipt.ExpectedContentSha256,
+                document.ContentSha256,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                receipt.SourceFamilyId,
+                document.SourceFamilyId,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                receipt.MarketId,
+                document.MarketId,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                receipt.ContractId,
+                document.ContractId,
+                StringComparison.Ordinal))
+        {
+            throw InvalidState();
+        }
+    }
+
+    private static LabelRevision? RequireLinearHead(
+        IReadOnlyList<LabelRevision> revisions)
+    {
+        if (revisions.Count == 0)
+        {
+            return null;
+        }
+
+        var byId = revisions.ToDictionary(
+            static revision => revision.RevisionId,
+            StringComparer.Ordinal);
+        var referenced = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var revision in revisions)
+        {
+            if (revision.PreviousRevisionId is null)
+            {
+                if (revision.PreviousRevisionSha256 is not null)
+                {
+                    throw InvalidState();
+                }
+
+                continue;
+            }
+
+            if (!byId.TryGetValue(
+                    revision.PreviousRevisionId,
+                    out var previous)
+                || !string.Equals(
+                    revision.PreviousRevisionSha256,
+                    previous.RevisionSha256,
+                    StringComparison.Ordinal)
+                || !referenced.Add(previous.RevisionId))
+            {
+                throw InvalidState();
+            }
+        }
+
+        var heads = revisions
+            .Where(revision => !referenced.Contains(revision.RevisionId))
+            .ToArray();
+        if (heads.Length != 1)
+        {
+            throw InvalidState();
+        }
+
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        var current = heads[0];
+        while (true)
+        {
+            if (!visited.Add(current.RevisionId))
+            {
+                throw InvalidState();
+            }
+
+            if (current.PreviousRevisionId is null)
+            {
+                break;
+            }
+
+            current = byId[current.PreviousRevisionId];
+        }
+
+        return visited.Count == revisions.Count
+            ? heads[0]
+            : throw InvalidState();
+    }
+
+    private static bool SameRevision(
+        LabelRevision? left,
+        LabelRevision? right) =>
+        left is null && right is null
+        || left is not null
+        && right is not null
+        && string.Equals(
+            left.RevisionId,
+            right.RevisionId,
+            StringComparison.Ordinal)
+        && string.Equals(
+            left.RevisionSha256,
+            right.RevisionSha256,
+            StringComparison.Ordinal);
 
     private static void RequireExactRetry(
         PersistedImportIdentity persisted,
@@ -1348,6 +1794,10 @@ internal sealed record PersistedImportIdentity(
     WorkbenchDocument Document,
     string ReceiptSha256,
     byte[] CanonicalReceipt);
+
+internal sealed record LabelDraftState(
+    WorkbenchDocument Document,
+    LabelRevision? PreviousRevision);
 
 internal sealed class ImportCommitOwnership
 {

@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
 using LocalDocumentOrganizer.CorpusWorkbench.Contracts;
+using LocalDocumentOrganizer.CorpusWorkbench.Labels;
 
 namespace LocalDocumentOrganizer.CorpusWorkbench.Serialization;
 
@@ -13,6 +14,7 @@ namespace LocalDocumentOrganizer.CorpusWorkbench.Serialization;
 [JsonSerializable(typeof(PilotScope))]
 [JsonSerializable(typeof(SourceReceipt))]
 [JsonSerializable(typeof(LabelRevision))]
+[JsonSerializable(typeof(LabelDraft))]
 [JsonSerializable(typeof(ApprovalEntry))]
 [JsonSerializable(typeof(PilotReportEnvelope))]
 [JsonSerializable(typeof(OfficialRuleCatalogDocument))]
