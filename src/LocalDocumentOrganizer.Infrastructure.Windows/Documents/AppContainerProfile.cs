@@ -29,6 +29,29 @@ public sealed class AppContainerProfile : IDisposable
 
     public string FolderPath { get; }
 
+    public static string DeriveSid()
+    {
+        var result =
+            WorkerNativeMethods.DeriveAppContainerSidFromAppContainerName(
+                ProfileName,
+                out var sidPointer);
+        if (result < 0 || sidPointer == IntPtr.Zero)
+        {
+            if (sidPointer != IntPtr.Zero)
+            {
+                using var pendingSid = new SafeSidHandle(sidPointer);
+            }
+
+            throw AppContainerLaunchException.FromHResult(
+                "AppContainer SID derivation",
+                result);
+        }
+
+        using var sid = new SafeSidHandle(sidPointer);
+        return new SecurityIdentifier(
+            sid.DangerousGetHandle()).Value;
+    }
+
     internal SafeSidHandle GetSidHandle() =>
         _sid is { IsClosed: false, IsInvalid: false } sid
             ? sid

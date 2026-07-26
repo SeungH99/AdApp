@@ -42,11 +42,13 @@ public sealed record CorpusPerturbationResult(
     CorpusPerturbationKind Kind,
     string BaselineDocumentId,
     string VariantDocumentId,
+    CorpusWorkerPackageIdentity WorkerPackageIdentity,
     bool Passed);
 
 public sealed record CorpusReport(
     string SchemaVersion,
     string? RunIdentityId,
+    CorpusWorkerPackageIdentity WorkerPackageIdentity,
     CorpusKind CorpusKind,
     bool Empirical,
     bool EmpiricalGatePassed,
@@ -55,10 +57,12 @@ public sealed record CorpusReport(
     CorpusAggregateReport Aggregate);
 
 public sealed record CorpusArtifact<T>(
+    string SchemaVersion,
     CorpusKind CorpusKind,
     bool Empirical,
     bool EmpiricalGatePassed,
     string RunIdentityId,
+    CorpusWorkerPackageIdentity WorkerPackageIdentity,
     string ReportSha256,
     T Data);
 

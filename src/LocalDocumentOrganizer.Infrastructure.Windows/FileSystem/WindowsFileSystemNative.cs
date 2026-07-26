@@ -48,7 +48,7 @@ internal static class WindowsFileSystemNative
         RequireWindows();
         var handle = CreateFile(
             ToExtendedPath(canonicalPath),
-            GenericRead | Delete,
+            GenericRead,
             FileShareRead,
             IntPtr.Zero,
             OpenExisting,

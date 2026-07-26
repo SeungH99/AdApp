@@ -47,8 +47,11 @@ public static class Program
             CorpusManifestValidator.Validate(manifest);
             if (manifest.CorpusKind == CorpusKind.OwnerApproved
                 && (options.WorkerPath is null
-                    || options.WorkerSha256 is null
+                    || options.WorkerPackageRoot is null
+                    || options.WorkerPackageSha256 is null
                     || !Path.IsPathFullyQualified(options.WorkerPath)
+                    || !Path.IsPathFullyQualified(
+                        options.WorkerPackageRoot)
                     || !File.Exists(options.WorkerPath)))
             {
                 Console.Error.WriteLine("corpus-eval:worker-required");
@@ -57,7 +60,8 @@ public static class Program
 
             if (manifest.CorpusKind == CorpusKind.Synthetic
                 && (options.WorkerPath is not null
-                    || options.WorkerSha256 is not null))
+                    || options.WorkerPackageRoot is not null
+                    || options.WorkerPackageSha256 is not null))
             {
                 Console.Error.WriteLine("corpus-eval:invalid-arguments");
                 return CorpusEvalExitCodes.InvalidArguments;
@@ -68,8 +72,10 @@ public static class Program
                     ? new SyntheticCorpusObservationRunner()
                     : await PublishedWorkerCorpusObservationRunner.CreateAsync(
                             corpusRoot,
+                            outputDirectory,
+                            options.WorkerPackageRoot!,
                             options.WorkerPath!,
-                            options.WorkerSha256!,
+                            options.WorkerPackageSha256!,
                             ConfiguredOcrLanguages(manifest),
                             CancellationToken.None)
                         .ConfigureAwait(false);
@@ -140,7 +146,8 @@ public static class Program
         string? manifest = null;
         string? output = null;
         string? worker = null;
-        string? workerSha256 = null;
+        string? workerPackageRoot = null;
+        string? workerPackageSha256 = null;
         for (var index = 0; index < args.Count; index++)
         {
             if (args[index] == "--manifest"
@@ -161,11 +168,17 @@ public static class Program
             {
                 worker = args[++index];
             }
-            else if (args[index] == "--worker-sha256"
+            else if (args[index] == "--worker-package-root"
                      && index + 1 < args.Count
-                     && workerSha256 is null)
+                     && workerPackageRoot is null)
             {
-                workerSha256 = args[++index];
+                workerPackageRoot = args[++index];
+            }
+            else if (args[index] == "--worker-package-sha256"
+                     && index + 1 < args.Count
+                     && workerPackageSha256 is null)
+            {
+                workerPackageSha256 = args[++index];
             }
             else
             {
@@ -187,7 +200,8 @@ public static class Program
             manifest,
             output,
             worker,
-            workerSha256);
+            workerPackageRoot,
+            workerPackageSha256);
     }
 
     private static async Task WriteSchemaAsync(string path)
@@ -215,7 +229,8 @@ public static class Program
         string ManifestPath,
         string OutputDirectory,
         string? WorkerPath,
-        string? WorkerSha256);
+        string? WorkerPackageRoot,
+        string? WorkerPackageSha256);
 
     private static IReadOnlyList<string> ConfiguredOcrLanguages(
         CorpusManifest manifest) =>
@@ -391,68 +406,62 @@ public sealed class PublishedWorkerCorpusObservationRunner
     : ICorpusObservationRunner
 {
     private readonly DocumentExtractionClient _client;
-    private readonly VerifiedStableSource _pinnedWorker;
+    private readonly CorpusWorkerPackageLease _packageLease;
+    private int _attestationCompleted;
 
     private PublishedWorkerCorpusObservationRunner(
         string corpusRoot,
-        string workerExecutablePath,
-        string workerSha256,
+        CorpusWorkerPackageLease packageLease,
         IReadOnlyList<string> defaultOcrLanguages,
-        VerifiedStableSource pinnedWorker)
+        CorpusWorkerPackageIdentity packageIdentity)
     {
         var approvedRoot = new ApprovedRootPathGuard(corpusRoot);
         _client = new DocumentExtractionClient(
-            Path.GetFullPath(workerExecutablePath),
+            packageLease.StagedExecutablePath,
             defaultOcrLanguages,
             approvedRoot);
-        WorkerSha256 = workerSha256;
-        _pinnedWorker = pinnedWorker;
+        WorkerPackageIdentity = packageIdentity;
+        _packageLease = packageLease;
     }
 
     public bool IsEmpirical => true;
 
-    public string WorkerSha256 { get; }
+    public CorpusWorkerPackageIdentity WorkerPackageIdentity { get; }
 
     public static async Task<PublishedWorkerCorpusObservationRunner>
         CreateAsync(
             string corpusRoot,
+            string outputDirectory,
+            string workerPackageRoot,
             string workerExecutablePath,
-            string expectedWorkerSha256,
+            string expectedWorkerPackageSha256,
             IReadOnlyList<string> defaultOcrLanguages,
             CancellationToken cancellationToken)
     {
-        if (!IsSha256(expectedWorkerSha256)
-            || !Path.IsPathFullyQualified(workerExecutablePath))
+        if (!Path.IsPathFullyQualified(workerPackageRoot)
+            || !Path.IsPathFullyQualified(workerExecutablePath)
+            || !Path.IsPathFullyQualified(corpusRoot)
+            || !Path.IsPathFullyQualified(outputDirectory))
         {
             throw new CorpusWorkerAttestationException();
         }
 
-        VerifiedStableSource? pinned = null;
+        CorpusWorkerPackageLease? lease = null;
         try
         {
-            var fullPath = Path.GetFullPath(workerExecutablePath);
-            var workerRoot = Path.GetDirectoryName(fullPath)
-                ?? throw new CorpusWorkerAttestationException();
-            pinned = new ApprovedRootPathGuard(workerRoot)
-                .OpenVerifiedSource(fullPath);
-            var digest = await pinned.ComputeSha256Async(cancellationToken)
+            lease = await CorpusWorkerPackageLease.CreateAsync(
+                    workerPackageRoot,
+                    workerExecutablePath,
+                    expectedWorkerPackageSha256,
+                    [corpusRoot, outputDirectory],
+                    cancellationToken)
                 .ConfigureAwait(false);
-            var actual = Convert.ToHexString(digest).ToLowerInvariant();
-            CryptographicOperations.ZeroMemory(digest);
-            if (!CorpusHashing.FixedTimeEquals(
-                    expectedWorkerSha256.ToLowerInvariant(),
-                    actual))
-            {
-                throw new CorpusWorkerAttestationException();
-            }
-
             var runner = new PublishedWorkerCorpusObservationRunner(
                 corpusRoot,
-                fullPath,
-                actual,
+                lease,
                 defaultOcrLanguages,
-                pinned);
-            pinned = null;
+                lease.Identity);
+            lease = null;
             return runner;
         }
         catch (CorpusWorkerAttestationException)
@@ -470,15 +479,30 @@ public sealed class PublishedWorkerCorpusObservationRunner
         }
         finally
         {
-            if (pinned is not null)
+            if (lease is not null)
             {
-                await pinned.DisposeAsync().ConfigureAwait(false);
+                await lease.DisposeAsync().ConfigureAwait(false);
             }
         }
     }
 
     public ValueTask DisposeAsync() =>
-        _pinnedWorker.DisposeAsync();
+        _packageLease.DisposeAsync();
+
+    public async Task CompleteAttestationAsync(
+        CancellationToken cancellationToken)
+    {
+        if (Interlocked.Exchange(
+                ref _attestationCompleted,
+                1) != 0)
+        {
+            return;
+        }
+
+        await _packageLease.VerifyAsync(cancellationToken)
+            .ConfigureAwait(false);
+        await _packageLease.DisposeAsync().ConfigureAwait(false);
+    }
 
     public async ValueTask<CorpusObservation> ObserveAsync(
         CorpusObservationRequest request,
@@ -522,7 +546,4 @@ public sealed class PublishedWorkerCorpusObservationRunner
                 _ => throw new InvalidOperationException(
                     "The raster codec is invalid."),
             };
-
-    private static bool IsSha256(string value) =>
-        value.Length == 64 && value.All(Uri.IsHexDigit);
 }

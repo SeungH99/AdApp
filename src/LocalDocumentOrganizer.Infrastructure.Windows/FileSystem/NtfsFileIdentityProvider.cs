@@ -80,7 +80,7 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
             ? handle
             : throw new ObjectDisposedException(nameof(VerifiedStableSource));
 
-    internal long Length { get; }
+    public long Length { get; }
 
     internal DateTimeOffset LastWriteTimeUtc { get; }
 
@@ -169,6 +169,53 @@ public sealed class VerifiedStableSource : IDisposable, IAsyncDisposable
 
             RequireSingleLink();
             return hash.GetHashAndReset();
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(buffer);
+        }
+    }
+
+    public async Task CopyToAsync(
+        Stream destination,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        if (!destination.CanWrite)
+        {
+            throw new ArgumentException(
+                "The destination stream must be writable.",
+                nameof(destination));
+        }
+
+        RequireSingleLink();
+        var buffer = new byte[81_920];
+        try
+        {
+            long offset = 0;
+            while (offset < Length)
+            {
+                var count = (int)Math.Min(buffer.Length, Length - offset);
+                var read = await RandomAccess.ReadAsync(
+                        Handle,
+                        buffer.AsMemory(0, count),
+                        offset,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (read == 0)
+                {
+                    throw new StableSourceBoundaryException(
+                        StableSourceBoundaryFailure.MissingFileId);
+                }
+
+                await destination.WriteAsync(
+                        buffer.AsMemory(0, read),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                offset += read;
+            }
+
+            RequireSingleLink();
         }
         finally
         {

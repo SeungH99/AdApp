@@ -16,8 +16,12 @@ public interface ICorpusObservationRunner
 {
     bool IsEmpirical { get; }
 
-    string WorkerSha256 =>
-        CorpusRuntimeTrust.SyntheticWorkerSha256;
+    CorpusWorkerPackageIdentity WorkerPackageIdentity =>
+        CorpusWorkerPackageIdentity.Synthetic;
+
+    Task CompleteAttestationAsync(
+        CancellationToken cancellationToken) =>
+        Task.CompletedTask;
 
     ValueTask<CorpusObservation> ObserveAsync(
         CorpusObservationRequest request,
@@ -104,6 +108,7 @@ public static class CorpusEvaluator
         CorpusManifest manifest,
         IReadOnlyDictionary<string, CorpusDocumentScore> scores,
         string runIdentityId,
+        CorpusWorkerPackageIdentity workerPackageIdentity,
         IReadOnlyList<CorpusPerturbationResult> perturbations,
         bool empirical)
     {
@@ -141,8 +146,9 @@ public static class CorpusEvaluator
             perturbations.All(static result => result.Passed)
                 && cells.All(static cell => cell.Passed));
         return new CorpusReport(
-            "1",
+            "2",
             runIdentityId,
+            workerPackageIdentity,
             manifest.CorpusKind,
             empirical,
             empirical && aggregate.Passed,
