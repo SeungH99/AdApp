@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -17,6 +18,12 @@ public sealed record ImportResult(
 
 public sealed class CorpusIngestionService
 {
+    private const int ExistingObjectOpenRetryLimit = 40;
+    private static readonly TimeSpan ExistingObjectOpenRetryDeadline =
+        TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan ExistingObjectOpenRetryDelay =
+        TimeSpan.FromMilliseconds(25);
+
     public const long MaxInputLength = 64L * 1024 * 1024;
     public const string VerifiedReusableStatus =
         "verified-reusable";
@@ -157,11 +164,15 @@ public sealed class CorpusIngestionService
                 .ConfigureAwait(false);
             if (existing is not null)
             {
-                var existingObject = _vault.TryOpenObject(
-                    receipt.ExpectedContentSha256)
-                    ?? throw new WorkbenchException(
-                        WorkbenchFailureCode
-                            .VaultBoundaryViolation);
+                var opened = await OpenExistingObjectAfterHandoffAsync(
+                        existing,
+                        receipt,
+                        canonicalReceipt,
+                        receiptSha256,
+                        classified,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                var existingObject = opened.Object;
                 await using (existingObject)
                 {
                     await VerifyExistingObjectAsync(
@@ -177,8 +188,8 @@ public sealed class CorpusIngestionService
                 }
 
                 return new ImportResult(
-                    existing.DocumentId,
-                    existing.ContentSha256,
+                    opened.Document.DocumentId,
+                    opened.Document.ContentSha256,
                     WasExisting: true);
             }
 
@@ -193,7 +204,7 @@ public sealed class CorpusIngestionService
                     storedObject = _vault.TryOpenObject(
                         receipt.ExpectedContentSha256);
                 }
-                catch (FileSystemBoundaryException)
+                catch (FileSystemTransientShareOrLockException)
                 {
                     // A competing importer can hold a newly promoted
                     // object exclusively until its durable boundary.
@@ -317,7 +328,7 @@ public sealed class CorpusIngestionService
                                 }
                             }
                         }
-                        catch (FileSystemBoundaryException)
+                        catch (FileSystemTransientShareOrLockException)
                         {
                             // Another importer can hold its promoted
                             // handle until its database transaction ends.
@@ -479,6 +490,122 @@ public sealed class CorpusIngestionService
                 CryptographicOperations.ZeroMemory(expectedHash);
             }
         }
+    }
+
+    private async Task<OpenedExistingObject>
+        OpenExistingObjectAfterHandoffAsync(
+            WorkbenchDocument expectedDocument,
+            SourceReceipt receipt,
+            byte[] canonicalReceipt,
+            string receiptSha256,
+            ClassifiedInput classified,
+            CancellationToken cancellationToken)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        using var deadlineCancellation = new CancellationTokenSource(
+            ExistingObjectOpenRetryDeadline);
+        using var retryCancellation =
+            CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                deadlineCancellation.Token);
+        for (var attempt = 0;
+             attempt < ExistingObjectOpenRetryLimit;
+             attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (stopwatch.Elapsed >= ExistingObjectOpenRetryDeadline)
+            {
+                throw new WorkbenchException(
+                    WorkbenchFailureCode.VaultBoundaryViolation);
+            }
+
+            WorkbenchDocument? current;
+            try
+            {
+                current = await _vault.Store.FindImportAsync(
+                        receipt,
+                        canonicalReceipt,
+                        receiptSha256,
+                        classified.InputKind,
+                        classified.CodecId,
+                        retryCancellation.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (deadlineCancellation.IsCancellationRequested
+                    && !cancellationToken.IsCancellationRequested)
+            {
+                throw new WorkbenchException(
+                    WorkbenchFailureCode.VaultBoundaryViolation);
+            }
+            if (current is null
+                || !string.Equals(
+                    current.DocumentId,
+                    expectedDocument.DocumentId,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    current.ContentSha256,
+                    expectedDocument.ContentSha256,
+                    StringComparison.Ordinal))
+            {
+                throw new WorkbenchException(
+                    WorkbenchFailureCode.VaultBoundaryViolation);
+            }
+
+            try
+            {
+                var opened = _vault.TryOpenObject(
+                    receipt.ExpectedContentSha256);
+                if (opened is null)
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.VaultBoundaryViolation);
+                }
+
+                if (stopwatch.Elapsed >= ExistingObjectOpenRetryDeadline)
+                {
+                    opened.Dispose();
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.VaultBoundaryViolation);
+                }
+
+                return new OpenedExistingObject(current, opened);
+            }
+            catch (FileSystemTransientShareOrLockException)
+            {
+                _vault.InjectFault(
+                    CorpusImportFaultPoint
+                        .ExistingObjectOpenTransientShareOrLock);
+                var remaining = ExistingObjectOpenRetryDeadline
+                    - stopwatch.Elapsed;
+                if (attempt + 1 >= ExistingObjectOpenRetryLimit
+                    || remaining <= TimeSpan.Zero)
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.VaultBoundaryViolation);
+                }
+
+                try
+                {
+                    await Task.Delay(
+                            remaining < ExistingObjectOpenRetryDelay
+                                ? remaining
+                                : ExistingObjectOpenRetryDelay,
+                            retryCancellation.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                    when (deadlineCancellation.IsCancellationRequested
+                        && !cancellationToken.IsCancellationRequested)
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.VaultBoundaryViolation);
+                }
+            }
+        }
+
+        throw new WorkbenchException(
+            WorkbenchFailureCode.VaultBoundaryViolation);
     }
 
 
@@ -758,6 +885,10 @@ public sealed class CorpusIngestionService
     private sealed record ClassifiedInput(
         string InputKind,
         string? CodecId);
+
+    private sealed record OpenedExistingObject(
+        WorkbenchDocument Document,
+        VerifiedStableSource Object);
 
     private sealed class ProbeSink : Stream
     {

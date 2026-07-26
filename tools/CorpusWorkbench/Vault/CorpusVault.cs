@@ -401,6 +401,7 @@ internal enum CorpusImportFaultPoint
     AfterObjectPromoted = 1,
     BeforeAcceptanceRevalidation = 2,
     AfterDatabaseCommit = 3,
+    ExistingObjectOpenTransientShareOrLock = 4,
 }
 
 internal sealed class StagedCorpusObject : IDisposable

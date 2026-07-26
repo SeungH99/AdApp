@@ -1054,9 +1054,12 @@ internal static class WindowsFileSystemNative
     }
 
     private static Exception CreateNativeException(int error) =>
-        new FileSystemBoundaryException(
-            "A native file-system boundary operation failed.",
-            new Win32Exception(error));
+        error is ErrorSharingViolation or ErrorLockViolation
+            ? new FileSystemTransientShareOrLockException(
+                new Win32Exception(error))
+            : new FileSystemBoundaryException(
+                "A native file-system boundary operation failed.",
+                new Win32Exception(error));
 
     [DllImport(
         "kernel32.dll",
@@ -1394,7 +1397,7 @@ internal static class WindowsFileSystemNative
     }
 }
 
-public sealed class FileSystemBoundaryException : IOException
+public class FileSystemBoundaryException : IOException
 {
     internal FileSystemBoundaryException(string message)
         : base(message)
@@ -1403,6 +1406,18 @@ public sealed class FileSystemBoundaryException : IOException
 
     internal FileSystemBoundaryException(string message, Exception innerException)
         : base(message, innerException)
+    {
+    }
+}
+
+public sealed class FileSystemTransientShareOrLockException
+    : FileSystemBoundaryException
+{
+    internal FileSystemTransientShareOrLockException(
+        Exception innerException)
+        : base(
+            "A native file-system boundary operation is temporarily unavailable.",
+            innerException)
     {
     }
 }
