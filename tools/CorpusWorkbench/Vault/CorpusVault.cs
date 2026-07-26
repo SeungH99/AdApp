@@ -17,6 +17,8 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
         "objects\\sha256";
     private const string StagingRootRelativePath =
         "objects\\.staging";
+    private const string PreviewStagingRootRelativePath =
+        "previews\\.staging";
 
     private readonly ConcurrentDictionary<string, SemaphoreSlim>
         _importGates = new(StringComparer.Ordinal);
@@ -50,6 +52,15 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
         }
     }
 
+    internal ApprovedRootFileStore PreviewFileStore
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return GetFileStore();
+        }
+    }
+
     public static CorpusVault OpenExisting(string vaultRoot)
         => OpenExisting(vaultRoot, injectFault: null);
 
@@ -67,6 +78,8 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
             fileStore.EnsureDirectoryVerified(
                 StagingRootRelativePath);
             fileStore.EnsureDirectoryVerified("previews");
+            fileStore.EnsureDirectoryVerified(
+                PreviewStagingRootRelativePath);
             fileStore.EnsureDirectoryVerified("checkpoints");
 
             try
@@ -96,6 +109,7 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
                 store,
                 injectFault);
             vault.RecoverStagingOrphans();
+            vault.RecoverPreviewStagingOrphans();
             return vault;
         }
         catch
@@ -404,9 +418,54 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
         }
     }
 
+    private void RecoverPreviewStagingOrphans()
+    {
+        var fileStore = GetFileStore();
+        foreach (var name in fileStore.EnumerateVerifiedFileNames(
+                     PreviewStagingRootRelativePath))
+        {
+            if (!IsPreviewStagingName(name))
+            {
+                throw new WorkbenchException(
+                    WorkbenchFailureCode.VaultBoundaryViolation);
+            }
+
+            var relative = Path.Combine(
+                PreviewStagingRootRelativePath,
+                name);
+            using var orphan =
+                fileStore.TryOpenExistingOwnedVerified(relative);
+            if (orphan is null)
+            {
+                continue;
+            }
+
+            fileStore.DeleteOwnedOnClose(
+                orphan,
+                relative,
+                orphan.Length);
+        }
+    }
+
     private static bool IsStagingObjectName(string name)
     {
         const string prefix = "import-";
+        const string suffix = ".tmp";
+        if (!name.StartsWith(prefix, StringComparison.Ordinal)
+            || !name.EndsWith(suffix, StringComparison.Ordinal)
+            || name.Length
+                != prefix.Length + 32 + suffix.Length)
+        {
+            return false;
+        }
+
+        return name.AsSpan(prefix.Length, 32).IndexOfAnyExcept(
+            "0123456789abcdef") < 0;
+    }
+
+    private static bool IsPreviewStagingName(string name)
+    {
+        const string prefix = "preview-";
         const string suffix = ".tmp";
         if (!name.StartsWith(prefix, StringComparison.Ordinal)
             || !name.EndsWith(suffix, StringComparison.Ordinal)

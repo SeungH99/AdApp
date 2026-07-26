@@ -4,6 +4,7 @@ using System.Text.Json.Serialization.Metadata;
 using LocalDocumentOrganizer.CorpusWorkbench.Approval;
 using LocalDocumentOrganizer.CorpusWorkbench.Contracts;
 using LocalDocumentOrganizer.CorpusWorkbench.Labels;
+using LocalDocumentOrganizer.CorpusWorkbench.Review;
 
 namespace LocalDocumentOrganizer.CorpusWorkbench.Serialization;
 
@@ -22,6 +23,11 @@ namespace LocalDocumentOrganizer.CorpusWorkbench.Serialization;
 [JsonSerializable(typeof(OwnerApprovalView))]
 [JsonSerializable(typeof(PilotReportEnvelope))]
 [JsonSerializable(typeof(OfficialRuleCatalogDocument))]
+[JsonSerializable(typeof(ReviewDecisionRequest))]
+[JsonSerializable(typeof(ReviewItemView))]
+[JsonSerializable(typeof(ReviewDecisionOutcome))]
+[JsonSerializable(typeof(ReviewError))]
+[JsonSerializable(typeof(ReviewDecisionCheckpoint))]
 public sealed partial class WorkbenchJsonContext : JsonSerializerContext;
 
 public static class WorkbenchJson
