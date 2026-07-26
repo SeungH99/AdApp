@@ -362,6 +362,16 @@ public static class CorpusEvaluationRunner
         var workItemsByDocument = workItems.ToDictionary(
             static item => item.Document.StableDocumentId,
             StringComparer.Ordinal);
+        var variantWorkItemsByDocument = manifest.Cells
+            .SelectMany(
+                static cell => cell.PerturbationVariants.Select(
+                    document => CorpusWorkItem.Create(
+                        cell.MarketId,
+                        cell.ContractId,
+                        document)))
+            .ToDictionary(
+                static item => item.Document.StableDocumentId,
+                StringComparer.Ordinal);
         var perturbationResults =
             new List<CorpusPerturbationResult>(
                 manifest.CodecPerturbations.Count);
@@ -371,7 +381,7 @@ public static class CorpusEvaluationRunner
         {
             var baseline = workItemsByDocument[
                 perturbation.BaselineDocumentId];
-            var variant = workItemsByDocument[
+            var variant = variantWorkItemsByDocument[
                 perturbation.VariantDocumentId];
             var baselineObservation =
                 await observationRunner.ObserveAsync(
