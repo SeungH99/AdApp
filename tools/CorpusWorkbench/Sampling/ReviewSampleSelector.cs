@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Numerics;
 using System.Security.Cryptography;
 using System.Text;
 using LocalDocumentOrganizer.CorpusWorkbench.Contracts;
@@ -47,18 +48,14 @@ public static class ReviewSampleSelector
             throw CoverageInsufficient(missingStrata);
         }
 
-        var selection = new List<RankedCandidate>(SampleTarget);
-        if (!TrySelect(
-                ranked,
-                startIndex: 0,
-                selection,
-                imagePdfCount: 0,
-                rasterCount: 0,
-                families: new HashSet<string>(StringComparer.Ordinal),
-                tags: new HashSet<string>(StringComparer.Ordinal)))
+        var solver = new FeasibilitySolver(ranked, requireTags: true, requireFamilies: true);
+        var initialState = solver.CreateInitialState();
+        if (!solver.CanComplete(initialState))
         {
-            throw CoverageInsufficient(["feasible-combination"]);
+            throw CoverageInsufficient(GetCombinedCapacityStrata(ranked));
         }
+
+        var selection = solver.ReconstructLexicographicallyFirstSelection(initialState);
 
         var selectedTags = selection
             .SelectMany(static item => item.Candidate.EdgeCaseTags)
@@ -84,110 +81,51 @@ public static class ReviewSampleSelector
             selectedTags);
     }
 
-    private static bool TrySelect(
-        IReadOnlyList<RankedCandidate> ranked,
-        int startIndex,
-        List<RankedCandidate> selection,
-        int imagePdfCount,
-        int rasterCount,
-        HashSet<string> families,
-        HashSet<string> tags)
+    // The result of each state is independent of traversal order, which makes the
+    // bounded solver safe to use as a feasibility oracle during rank-first selection.
+    private static ImmutableArray<string> GetCombinedCapacityStrata(
+        IReadOnlyList<RankedCandidate> ranked)
     {
-        if (selection.Count == SampleTarget)
-        {
-            return imagePdfCount == PerKindTarget
-                && rasterCount == PerKindTarget
-                && families.Count >= MinimumFamilyCount
-                && RequiredTags.All(tags.Contains);
-        }
-
-        if (!CanStillSatisfy(
+        var canCompleteWithoutTags = new FeasibilitySolver(
                 ranked,
-                startIndex,
-                selection.Count,
-                imagePdfCount,
-                rasterCount,
-                families,
-                tags))
+                requireTags: false,
+                requireFamilies: true)
+            .CanComplete();
+        var canCompleteWithoutFamilies = new FeasibilitySolver(
+                ranked,
+                requireTags: true,
+                requireFamilies: false)
+            .CanComplete();
+
+        if (canCompleteWithoutTags && canCompleteWithoutFamilies)
         {
-            return false;
+            return ["combined-strata-capacity"];
         }
 
-        for (var index = startIndex; index < ranked.Count; index++)
-        {
-            var candidate = ranked[index];
-            var isImagePdf = candidate.Candidate.InputKind == ImagePdf;
-            if ((isImagePdf && imagePdfCount == PerKindTarget)
-                || (!isImagePdf && rasterCount == PerKindTarget))
-            {
-                continue;
-            }
-
-            selection.Add(candidate);
-            var familyWasAdded = families.Add(candidate.Candidate.SourceFamilyId);
-            var addedTags = AddTags(tags, candidate.Candidate.EdgeCaseTags);
-            if (TrySelect(
-                    ranked,
-                    index + 1,
-                    selection,
-                    imagePdfCount + (isImagePdf ? 1 : 0),
-                    rasterCount + (isImagePdf ? 0 : 1),
-                    families,
-                    tags))
-            {
-                return true;
-            }
-
-            RemoveTags(tags, addedTags);
-            if (familyWasAdded)
-            {
-                families.Remove(candidate.Candidate.SourceFamilyId);
-            }
-
-            selection.RemoveAt(selection.Count - 1);
-        }
-
-        return false;
+        return canCompleteWithoutTags
+            ? ["combined-input-kind-edge-case-capacity"]
+            : canCompleteWithoutFamilies
+                ? ["combined-input-kind-source-family-capacity"]
+                : ["combined-strata-capacity"];
     }
 
-    private static bool CanStillSatisfy(
-        IReadOnlyList<RankedCandidate> ranked,
-        int startIndex,
-        int selectedCount,
-        int imagePdfCount,
-        int rasterCount,
-        IReadOnlySet<string> families,
-        IReadOnlySet<string> tags)
+    // Local tests use this deterministic diagnostic to assert the bounded search
+    // state-space without relying on a wall-clock threshold.
+    internal static int GetFeasibilityStateCount(
+        PilotScope scope,
+        string marketId,
+        IReadOnlyList<ReviewCandidate> candidates)
     {
-        if (ranked.Count - startIndex < SampleTarget - selectedCount)
+        ValidateScope(scope, marketId);
+        if (candidates is null || candidates.Count > MaximumPilotCandidates)
         {
-            return false;
+            throw InvalidArguments();
         }
 
-        var availableImagePdf = 0;
-        var availableRaster = 0;
-        var possibleFamilies = new HashSet<string>(families, StringComparer.Ordinal);
-        var possibleTags = new HashSet<string>(tags, StringComparer.Ordinal);
-        for (var index = startIndex; index < ranked.Count; index++)
-        {
-            var candidate = ranked[index].Candidate;
-            if (candidate.InputKind == ImagePdf)
-            {
-                availableImagePdf++;
-            }
-            else
-            {
-                availableRaster++;
-            }
-
-            possibleFamilies.Add(candidate.SourceFamilyId);
-            possibleTags.UnionWith(candidate.EdgeCaseTags);
-        }
-
-        return availableImagePdf >= PerKindTarget - imagePdfCount
-            && availableRaster >= PerKindTarget - rasterCount
-            && possibleFamilies.Count >= MinimumFamilyCount
-            && RequiredTags.All(possibleTags.Contains);
+        var ranked = ValidateAndRank(scope, marketId, candidates);
+        var solver = new FeasibilitySolver(ranked, requireTags: true, requireFamilies: true);
+        _ = solver.CanComplete();
+        return solver.StateCount;
     }
 
     private static ImmutableArray<RankedCandidate> ValidateAndRank(
@@ -336,30 +274,6 @@ public static class ReviewSampleSelector
             character is >= '0' and <= '9'
                 or >= 'a' and <= 'f');
 
-    private static List<string> AddTags(
-        ISet<string> tags,
-        ImmutableArray<string> candidateTags)
-    {
-        var added = new List<string>(candidateTags.Length);
-        foreach (var tag in candidateTags)
-        {
-            if (tags.Add(tag))
-            {
-                added.Add(tag);
-            }
-        }
-
-        return added;
-    }
-
-    private static void RemoveTags(ISet<string> tags, IEnumerable<string> addedTags)
-    {
-        foreach (var tag in addedTags)
-        {
-            tags.Remove(tag);
-        }
-    }
-
     private static WorkbenchException CoverageInsufficient(
         ImmutableArray<string> unsatisfiedStrata) =>
         new(
@@ -368,6 +282,222 @@ public static class ReviewSampleSelector
 
     private static WorkbenchException InvalidArguments() =>
         new(WorkbenchFailureCode.InvalidArguments);
+
+    private sealed class FeasibilitySolver
+    {
+        private const byte RequiredTagMask = 0b1111;
+
+        private readonly ImmutableArray<SolverCandidate> _candidates;
+        private readonly int[] _remainingImagePdf;
+        private readonly int[] _remainingRaster;
+        private readonly byte[] _remainingTagMasks;
+        private readonly ulong[] _remainingFamilyMasks;
+        private readonly bool _requireTags;
+        private readonly bool _requireFamilies;
+        private readonly Dictionary<FeasibilityState, bool> _memo =
+            new(FeasibilityStateComparer.Instance);
+
+        public FeasibilitySolver(
+            IReadOnlyList<RankedCandidate> ranked,
+            bool requireTags,
+            bool requireFamilies)
+        {
+            _requireTags = requireTags;
+            _requireFamilies = requireFamilies;
+
+            var families = ranked
+                .Select(static item => item.Candidate.SourceFamilyId)
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(static family => family, StringComparer.Ordinal)
+                .ToArray();
+            _candidates = ranked
+                .Select(item => new SolverCandidate(
+                    item,
+                    item.Candidate.InputKind == ImagePdf,
+                    GetTagMask(item.Candidate.EdgeCaseTags),
+                    1UL << Array.BinarySearch(
+                        families,
+                        item.Candidate.SourceFamilyId,
+                        StringComparer.Ordinal)))
+                .ToImmutableArray();
+
+            _remainingImagePdf = new int[_candidates.Length + 1];
+            _remainingRaster = new int[_candidates.Length + 1];
+            _remainingTagMasks = new byte[_candidates.Length + 1];
+            _remainingFamilyMasks = new ulong[_candidates.Length + 1];
+            for (var index = _candidates.Length - 1; index >= 0; index--)
+            {
+                var candidate = _candidates[index];
+                _remainingImagePdf[index] = _remainingImagePdf[index + 1]
+                    + (candidate.IsImagePdf ? 1 : 0);
+                _remainingRaster[index] = _remainingRaster[index + 1]
+                    + (candidate.IsImagePdf ? 0 : 1);
+                _remainingTagMasks[index] = (byte)(
+                    _remainingTagMasks[index + 1] | candidate.TagMask);
+                _remainingFamilyMasks[index] = _remainingFamilyMasks[index + 1]
+                    | candidate.FamilyBit;
+            }
+        }
+
+        public int StateCount => _memo.Count;
+
+        public FeasibilityState CreateInitialState() =>
+            new(0, PerKindTarget, PerKindTarget, 0, 0, !_requireFamilies);
+
+        public bool CanComplete() => CanComplete(CreateInitialState());
+
+        public bool CanComplete(FeasibilityState state)
+        {
+            if (_memo.TryGetValue(state, out var result))
+            {
+                return result;
+            }
+
+            result = CanCompleteUncached(state);
+            _memo.Add(state, result);
+            return result;
+        }
+
+        public List<RankedCandidate> ReconstructLexicographicallyFirstSelection(
+            FeasibilityState initialState)
+        {
+            var result = new List<RankedCandidate>(SampleTarget);
+            var state = initialState;
+            while (state.ImagePdfSlots > 0 || state.RasterSlots > 0)
+            {
+                var candidate = _candidates[state.RankIndex];
+                if (TryInclude(state, candidate, out var included)
+                    && CanComplete(included))
+                {
+                    result.Add(candidate.Ranked);
+                    state = included;
+                }
+                else
+                {
+                    state = state with { RankIndex = state.RankIndex + 1 };
+                }
+            }
+
+            return result;
+        }
+
+        private bool CanCompleteUncached(FeasibilityState state)
+        {
+            if (state.ImagePdfSlots == 0 && state.RasterSlots == 0)
+            {
+                return (!_requireTags || state.CoveredTagMask == RequiredTagMask)
+                    && (!_requireFamilies || state.HasThreeFamilies);
+            }
+
+            if (state.RankIndex == _candidates.Length
+                || _candidates.Length - state.RankIndex < state.ImagePdfSlots + state.RasterSlots
+                || _remainingImagePdf[state.RankIndex] < state.ImagePdfSlots
+                || _remainingRaster[state.RankIndex] < state.RasterSlots
+                || (_requireTags
+                    && (state.CoveredTagMask | _remainingTagMasks[state.RankIndex])
+                        != RequiredTagMask)
+                || (_requireFamilies
+                    && !state.HasThreeFamilies
+                    && BitOperations.PopCount(
+                        state.SelectedFamilyMask | _remainingFamilyMasks[state.RankIndex])
+                        < MinimumFamilyCount))
+            {
+                return false;
+            }
+
+            var candidate = _candidates[state.RankIndex];
+            return (TryInclude(state, candidate, out var included) && CanComplete(included))
+                || CanComplete(state with { RankIndex = state.RankIndex + 1 });
+        }
+
+        private bool TryInclude(
+            FeasibilityState state,
+            SolverCandidate candidate,
+            out FeasibilityState included)
+        {
+            if ((candidate.IsImagePdf && state.ImagePdfSlots == 0)
+                || (!candidate.IsImagePdf && state.RasterSlots == 0))
+            {
+                included = default;
+                return false;
+            }
+
+            var selectedFamilyMask = state.SelectedFamilyMask;
+            var hasThreeFamilies = state.HasThreeFamilies;
+            if (_requireFamilies && !hasThreeFamilies)
+            {
+                selectedFamilyMask |= candidate.FamilyBit;
+                if (BitOperations.PopCount(selectedFamilyMask) >= MinimumFamilyCount)
+                {
+                    selectedFamilyMask = 0;
+                    hasThreeFamilies = true;
+                }
+            }
+
+            included = new(
+                state.RankIndex + 1,
+                state.ImagePdfSlots - (candidate.IsImagePdf ? 1 : 0),
+                state.RasterSlots - (candidate.IsImagePdf ? 0 : 1),
+                _requireTags ? (byte)(state.CoveredTagMask | candidate.TagMask) : (byte)0,
+                selectedFamilyMask,
+                hasThreeFamilies);
+            return true;
+        }
+
+        private static byte GetTagMask(ImmutableArray<string> tags)
+        {
+            var result = (byte)0;
+            foreach (var tag in tags)
+            {
+                for (var index = 0; index < RequiredTags.Length; index++)
+                {
+                    if (string.Equals(tag, RequiredTags[index], StringComparison.Ordinal))
+                    {
+                        result |= (byte)(1 << index);
+                        break;
+                    }
+                }
+            }
+
+            return result;
+        }
+    }
+
+    private readonly record struct FeasibilityState(
+        int RankIndex,
+        int ImagePdfSlots,
+        int RasterSlots,
+        byte CoveredTagMask,
+        ulong SelectedFamilyMask,
+        bool HasThreeFamilies);
+
+    private sealed class FeasibilityStateComparer : IEqualityComparer<FeasibilityState>
+    {
+        public static FeasibilityStateComparer Instance { get; } = new();
+
+        public bool Equals(FeasibilityState left, FeasibilityState right) => left == right;
+
+        public int GetHashCode(FeasibilityState value)
+        {
+            unchecked
+            {
+                var hash = (uint)value.RankIndex;
+                hash = (hash * 31) + (uint)value.ImagePdfSlots;
+                hash = (hash * 31) + (uint)value.RasterSlots;
+                hash = (hash * 31) + value.CoveredTagMask;
+                hash = (hash * 31) + (uint)value.SelectedFamilyMask;
+                hash = (hash * 31) + (uint)(value.SelectedFamilyMask >> 32);
+                hash = (hash * 31) + (value.HasThreeFamilies ? 1U : 0U);
+                return (int)hash;
+            }
+        }
+    }
+
+    private sealed record SolverCandidate(
+        RankedCandidate Ranked,
+        bool IsImagePdf,
+        byte TagMask,
+        ulong FamilyBit);
 
     private sealed record RankedCandidate(ReviewCandidate Candidate, byte[] Rank);
 
