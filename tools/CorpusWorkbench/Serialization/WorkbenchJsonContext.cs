@@ -23,6 +23,8 @@ namespace LocalDocumentOrganizer.CorpusWorkbench.Serialization;
 [JsonSerializable(typeof(ApprovalEntryReference))]
 [JsonSerializable(typeof(OwnerApprovedDocument))]
 [JsonSerializable(typeof(OwnerApprovalView))]
+[JsonSerializable(typeof(PilotValidationRequest))]
+[JsonSerializable(typeof(PilotValidationCheckpoint))]
 [JsonSerializable(typeof(PilotReportEnvelope))]
 [JsonSerializable(typeof(OfficialRuleCatalogDocument))]
 [JsonSerializable(typeof(ReviewDecisionRequest))]

@@ -202,6 +202,33 @@ public sealed record PilotMarketSummary(
     bool BatchApproved,
     ImmutableDictionary<string, int> AggregateErrorCounts);
 
+public sealed record PilotValidationRequest(
+    PilotScope Scope,
+    string RuleCatalogSha256,
+    string WorkerPackageSha256,
+    string LedgerHeadSha256);
+
+public sealed record PilotValidationResult(
+    bool PilotComplete,
+    WorkbenchFailureCode? PrimaryFailureCode,
+    ImmutableArray<WorkbenchFailureCode> BlockingReasons,
+    ImmutableArray<PilotMarketSummary> Markets,
+    string RuleCatalogSha256,
+    string WorkerPackageSha256,
+    string LedgerHeadSha256)
+{
+    internal PilotScope? Scope { get; init; }
+}
+
+public sealed record PilotValidationCheckpoint(
+    string SchemaVersion,
+    string CheckpointIdentitySha256,
+    PilotScope Scope,
+    string RuleCatalogSha256,
+    string WorkerPackageSha256,
+    string LedgerHeadSha256,
+    ImmutableArray<string> DocumentIds);
+
 public sealed record PilotReportEnvelope(
     string SchemaVersion,
     string CatalogEpoch,
