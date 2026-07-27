@@ -458,7 +458,7 @@ public sealed class ApprovalLedgerService
                     ApprovalPilotReadPoint.AfterLedgerBeforeStates);
                 cancellationToken.ThrowIfCancellationRequested();
                 var states =
-                    await _store.ReadAllApprovalLabelStatesAsync(
+                    await _store.ReadAllPilotLabelStatesAsync(
                             connection,
                             transaction,
                             PilotCatalog.HeldOutTargetPerMarket * 2,

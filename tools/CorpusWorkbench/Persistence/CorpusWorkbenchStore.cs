@@ -18,6 +18,22 @@ namespace LocalDocumentOrganizer.CorpusWorkbench.Persistence;
 public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
 {
     private const int BusyTimeoutMilliseconds = 30_000;
+    internal const int MaximumPilotLabelRevisionCount = 64;
+    private const int MaximumPilotDocumentIdCharacters = 73;
+    private const int MaximumPilotSha256Characters = 64;
+    private const int MaximumPilotSourceFamilyIdCharacters = 512;
+    private const int MaximumPilotMarketIdCharacters = 32;
+    private const int MaximumPilotContractIdCharacters = 256;
+    private const int MaximumPilotInputKindCharacters = 64;
+    private const int MaximumPilotCodecIdCharacters = 256;
+    private const int MaximumPilotReceiptIdCharacters = 512;
+    private const int MaximumPilotLifecycleStateCharacters = 32;
+    private const int MaximumPilotTimestampCharacters = 64;
+    private const int MaximumPilotReceiptCanonicalBytes = 64 * 1024;
+    private const int MaximumPilotRevisionIdCharacters = 73;
+    private const int MaximumPilotRevisionCanonicalBytes = 64 * 1024;
+    private const int MaximumPilotRevisionFieldCount = 6;
+    private const int MaximumPilotEvidenceBoxesPerField = 256;
 
     private const string SchemaSql = """
         CREATE TABLE IF NOT EXISTS source_receipts (
@@ -795,6 +811,78 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         return states;
     }
 
+    internal async Task<IReadOnlyList<LabelDraftState>>
+        ReadAllPilotLabelStatesAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int maximumCount,
+        CancellationToken cancellationToken)
+    {
+        if (maximumCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maximumCount));
+        }
+
+        var documentIds = new List<string>();
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT
+                  typeof(document_id),
+                  length(document_id),
+                  document_id
+                FROM documents
+                ORDER BY document_id
+                LIMIT $limit;
+                """;
+            command.Parameters.AddWithValue(
+                "$limit",
+                checked((long)maximumCount + 1L));
+            await using var reader =
+                await command.ExecuteReaderAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken)
+                       .ConfigureAwait(false))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (documentIds.Count >= maximumCount)
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.InvalidArguments);
+                }
+
+                if (!IsBoundedPilotText(
+                        reader,
+                        0,
+                        1,
+                        MaximumPilotDocumentIdCharacters,
+                        MaximumPilotDocumentIdCharacters))
+                {
+                    throw InvalidState();
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                documentIds.Add(reader.GetString(2));
+            }
+        }
+
+        var states = new List<LabelDraftState>(documentIds.Count);
+        foreach (var documentId in documentIds)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            states.Add(
+                await ReadPilotLabelStateAsync(
+                        connection,
+                        transaction,
+                        documentId,
+                        cancellationToken)
+                    .ConfigureAwait(false));
+        }
+
+        return states;
+    }
+
     internal Task<bool> HasPilotValidationCheckpointAsync(
         CancellationToken cancellationToken) =>
         ExecuteApprovalReadAsync(
@@ -1505,6 +1593,397 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             persistedReceiptSha256,
             persistedCanonicalReceipt);
     }
+
+    private static async Task<LabelDraftState> ReadPilotLabelStateAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string documentId,
+        CancellationToken cancellationToken)
+    {
+        var persisted = await ReadPilotPersistedImportAsync(
+                connection,
+                transaction,
+                documentId,
+                cancellationToken)
+            .ConfigureAwait(false)
+            ?? throw InvalidState();
+        if (!string.Equals(
+                persisted.Document.DocumentId,
+                documentId,
+                StringComparison.Ordinal))
+        {
+            throw InvalidState();
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        RequireReceiptIdentity(persisted);
+        var revisions = new List<LabelRevision>();
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT
+                  typeof(revision_id),
+                  length(revision_id),
+                  revision_id,
+                  typeof(previous_revision_id),
+                  length(previous_revision_id),
+                  previous_revision_id,
+                  typeof(revision_sha256),
+                  length(revision_sha256),
+                  revision_sha256,
+                  typeof(canonical_json),
+                  length(canonical_json),
+                  canonical_json,
+                  typeof(created_at_utc),
+                  length(created_at_utc),
+                  created_at_utc
+                FROM label_revisions
+                WHERE document_id=$document_id
+                ORDER BY revision_id
+                LIMIT $limit;
+                """;
+            command.Parameters.AddWithValue("$document_id", documentId);
+            command.Parameters.AddWithValue(
+                "$limit",
+                checked((long)MaximumPilotLabelRevisionCount + 1L));
+            await using var reader =
+                await command.ExecuteReaderAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken)
+                       .ConfigureAwait(false))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (revisions.Count >= MaximumPilotLabelRevisionCount)
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.InvalidArguments);
+                }
+
+                if (!IsBoundedPilotText(
+                        reader,
+                        0,
+                        1,
+                        MaximumPilotRevisionIdCharacters,
+                        MaximumPilotRevisionIdCharacters)
+                    || !IsBoundedPilotNullableText(
+                        reader,
+                        3,
+                        4,
+                        MaximumPilotRevisionIdCharacters)
+                    || !IsBoundedPilotText(
+                        reader,
+                        6,
+                        7,
+                        MaximumPilotSha256Characters,
+                        MaximumPilotSha256Characters)
+                    || !IsBoundedPilotBlob(
+                        reader,
+                        9,
+                        10,
+                        MaximumPilotRevisionCanonicalBytes)
+                    || !IsBoundedPilotText(
+                        reader,
+                        12,
+                        13,
+                        1,
+                        MaximumPilotTimestampCharacters))
+                {
+                    throw InvalidState();
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                var revisionId = reader.GetString(2);
+                cancellationToken.ThrowIfCancellationRequested();
+                var previousRevisionId = reader.IsDBNull(5)
+                    ? null
+                    : reader.GetString(5);
+                cancellationToken.ThrowIfCancellationRequested();
+                var revisionSha256 = reader.GetString(8);
+                cancellationToken.ThrowIfCancellationRequested();
+                var canonical = reader.GetFieldValue<byte[]>(11);
+                cancellationToken.ThrowIfCancellationRequested();
+                var createdAtText = reader.GetString(14);
+
+                LabelRevision revision;
+                try
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    revision = WorkbenchJson.Parse(
+                        canonical,
+                        WorkbenchJsonContext.Default.LabelRevision);
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+                catch (Exception exception) when (
+                    exception is System.Text.Json.JsonException
+                        or NotSupportedException
+                        or InvalidOperationException
+                        or ArgumentException)
+                {
+                    throw InvalidState();
+                }
+
+                if (!HasBoundedPilotRevisionShape(revision)
+                    || !DateTimeOffset.TryParseExact(
+                        createdAtText,
+                        "O",
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.RoundtripKind,
+                        out var createdAt)
+                    || createdAt.Offset != TimeSpan.Zero
+                    || revision.CreatedAtUtc.Offset != TimeSpan.Zero
+                    || revision.CreatedAtUtc != createdAt
+                    || !string.Equals(
+                        revision.RevisionId,
+                        revisionId,
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.DocumentId,
+                        documentId,
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.DocumentSha256,
+                        persisted.Document.ContentSha256,
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.MarketId,
+                        persisted.Document.MarketId,
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.ContractId,
+                        persisted.Document.ContractId,
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.PreviousRevisionId,
+                        previousRevisionId,
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.RevisionSha256,
+                        revisionSha256,
+                        StringComparison.Ordinal)
+                    || !string.Equals(
+                        revision.RevisionId,
+                        "revision-" + revision.RevisionSha256,
+                        StringComparison.Ordinal)
+                    || !DraftLabelService.HasValidCanonicalHash(revision)
+                    || !CryptographicOperations.FixedTimeEquals(
+                        canonical,
+                        WorkbenchJson.Serialize(
+                            revision,
+                            WorkbenchJsonContext.Default.LabelRevision)))
+                {
+                    throw InvalidState();
+                }
+
+                revisions.Add(revision);
+            }
+        }
+
+        return new LabelDraftState(
+            persisted.Document,
+            RequireLinearHead(revisions));
+    }
+
+    private static async Task<PersistedImportIdentity?>
+        ReadPilotPersistedImportAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string documentId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT
+              typeof(documents.document_id),
+              length(documents.document_id),
+              documents.document_id,
+              typeof(documents.content_sha256),
+              length(documents.content_sha256),
+              documents.content_sha256,
+              typeof(documents.source_family_id),
+              length(documents.source_family_id),
+              documents.source_family_id,
+              typeof(documents.market_id),
+              length(documents.market_id),
+              documents.market_id,
+              typeof(documents.contract_id),
+              length(documents.contract_id),
+              documents.contract_id,
+              typeof(documents.input_kind),
+              length(documents.input_kind),
+              documents.input_kind,
+              typeof(documents.codec_id),
+              length(documents.codec_id),
+              documents.codec_id,
+              typeof(documents.receipt_id),
+              length(documents.receipt_id),
+              documents.receipt_id,
+              typeof(documents.lifecycle_state),
+              length(documents.lifecycle_state),
+              documents.lifecycle_state,
+              typeof(documents.created_at_utc),
+              length(documents.created_at_utc),
+              documents.created_at_utc,
+              typeof(source_receipts.receipt_sha256),
+              length(source_receipts.receipt_sha256),
+              source_receipts.receipt_sha256,
+              typeof(source_receipts.canonical_json),
+              length(source_receipts.canonical_json),
+              source_receipts.canonical_json
+            FROM documents
+            INNER JOIN source_receipts
+              ON source_receipts.receipt_id=documents.receipt_id
+            WHERE documents.document_id=$document_id;
+            """;
+        command.Parameters.AddWithValue("$document_id", documentId);
+        await using var reader =
+            await command.ExecuteReaderAsync(cancellationToken)
+                .ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken)
+                .ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        if (!IsBoundedPilotText(reader, 0, 1,
+                MaximumPilotDocumentIdCharacters,
+                MaximumPilotDocumentIdCharacters)
+            || !IsBoundedPilotText(reader, 3, 4,
+                MaximumPilotSha256Characters,
+                MaximumPilotSha256Characters)
+            || !IsBoundedPilotText(reader, 6, 7, 1,
+                MaximumPilotSourceFamilyIdCharacters)
+            || !IsBoundedPilotText(reader, 9, 10, 1,
+                MaximumPilotMarketIdCharacters)
+            || !IsBoundedPilotText(reader, 12, 13, 1,
+                MaximumPilotContractIdCharacters)
+            || !IsBoundedPilotText(reader, 15, 16, 1,
+                MaximumPilotInputKindCharacters)
+            || !IsBoundedPilotNullableText(reader, 18, 19,
+                MaximumPilotCodecIdCharacters)
+            || !IsBoundedPilotText(reader, 21, 22, 1,
+                MaximumPilotReceiptIdCharacters)
+            || !IsBoundedPilotText(reader, 24, 25, 1,
+                MaximumPilotLifecycleStateCharacters)
+            || !IsBoundedPilotText(reader, 27, 28, 1,
+                MaximumPilotTimestampCharacters)
+            || !IsBoundedPilotText(reader, 30, 31,
+                MaximumPilotSha256Characters,
+                MaximumPilotSha256Characters)
+            || !IsBoundedPilotBlob(reader, 33, 34,
+                MaximumPilotReceiptCanonicalBytes))
+        {
+            throw InvalidState();
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var persistedDocumentId = reader.GetString(2);
+        cancellationToken.ThrowIfCancellationRequested();
+        var contentSha256 = reader.GetString(5);
+        cancellationToken.ThrowIfCancellationRequested();
+        var sourceFamilyId = reader.GetString(8);
+        cancellationToken.ThrowIfCancellationRequested();
+        var marketId = reader.GetString(11);
+        cancellationToken.ThrowIfCancellationRequested();
+        var contractId = reader.GetString(14);
+        cancellationToken.ThrowIfCancellationRequested();
+        var inputKind = reader.GetString(17);
+        cancellationToken.ThrowIfCancellationRequested();
+        var codecId = reader.IsDBNull(20) ? null : reader.GetString(20);
+        cancellationToken.ThrowIfCancellationRequested();
+        var receiptId = reader.GetString(23);
+        cancellationToken.ThrowIfCancellationRequested();
+        var lifecycleState = reader.GetString(26);
+        cancellationToken.ThrowIfCancellationRequested();
+        var createdAtText = reader.GetString(29);
+        cancellationToken.ThrowIfCancellationRequested();
+        var receiptSha256 = reader.GetString(32);
+        cancellationToken.ThrowIfCancellationRequested();
+        var canonicalReceipt = reader.GetFieldValue<byte[]>(35);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (!DateTimeOffset.TryParseExact(
+                createdAtText,
+                "O",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind,
+                out var createdAt))
+        {
+            throw InvalidState();
+        }
+
+        if (await reader.ReadAsync(cancellationToken)
+                .ConfigureAwait(false))
+        {
+            throw InvalidState();
+        }
+
+        return new PersistedImportIdentity(
+            new WorkbenchDocument(
+                persistedDocumentId,
+                contentSha256,
+                sourceFamilyId,
+                marketId,
+                contractId,
+                inputKind,
+                codecId,
+                receiptId,
+                lifecycleState,
+                createdAt),
+            receiptSha256,
+            canonicalReceipt);
+    }
+
+    private static bool HasBoundedPilotRevisionShape(
+        LabelRevision revision) =>
+        !revision.Fields.IsDefault
+        && revision.Fields.Length <= MaximumPilotRevisionFieldCount
+        && revision.Fields.All(static field =>
+            !field.Evidence.IsDefault
+            && field.Evidence.Length <= MaximumPilotEvidenceBoxesPerField);
+
+    private static bool IsBoundedPilotText(
+        SqliteDataReader reader,
+        int typeOrdinal,
+        int lengthOrdinal,
+        int minimumLength,
+        int maximumLength) =>
+        IsPilotSqliteType(reader, typeOrdinal, "text")
+        && reader.GetValue(lengthOrdinal) is long length
+        && length >= minimumLength
+        && length <= maximumLength;
+
+    private static bool IsBoundedPilotNullableText(
+        SqliteDataReader reader,
+        int typeOrdinal,
+        int lengthOrdinal,
+        int maximumLength) =>
+        IsPilotSqliteType(reader, typeOrdinal, "null")
+        && reader.IsDBNull(lengthOrdinal)
+        || IsBoundedPilotText(
+            reader,
+            typeOrdinal,
+            lengthOrdinal,
+            1,
+            maximumLength);
+
+    private static bool IsBoundedPilotBlob(
+        SqliteDataReader reader,
+        int typeOrdinal,
+        int lengthOrdinal,
+        int maximumLength) =>
+        IsPilotSqliteType(reader, typeOrdinal, "blob")
+        && reader.GetValue(lengthOrdinal) is long length
+        && length > 0
+        && length <= maximumLength;
+
+    private static bool IsPilotSqliteType(
+        SqliteDataReader reader,
+        int ordinal,
+        string expected) =>
+        reader.GetValue(ordinal) is string actual
+        && string.Equals(actual, expected, StringComparison.Ordinal);
 
     private static async Task<LabelDraftState> ReadLabelStateAsync(
         SqliteConnection connection,
