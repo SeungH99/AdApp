@@ -208,20 +208,33 @@ public sealed record PilotValidationRequest(
     string WorkerPackageSha256,
     string LedgerHeadSha256);
 
+public enum PilotWorkerValidationMode
+{
+    BoundWorker = 0,
+    PendingUnassigned = 1,
+}
+
 public sealed record PilotValidationResult(
     bool PilotComplete,
     WorkbenchFailureCode? PrimaryFailureCode,
     ImmutableArray<WorkbenchFailureCode> BlockingReasons,
     ImmutableArray<PilotMarketSummary> Markets,
     string RuleCatalogSha256,
-    string WorkerPackageSha256,
+    string? WorkerPackageSha256,
     string LedgerHeadSha256)
 {
+    public PilotWorkerValidationMode WorkerValidationMode { get; init; } =
+        PilotWorkerValidationMode.BoundWorker;
+
     internal PilotScope? Scope { get; init; }
 
     internal string? AttestationVersion { get; init; }
 
     internal byte[]? Attestation { get; init; }
+
+    internal string? ValidationSnapshotSha256 { get; init; }
+
+    internal string? ConfigurationIdentitySha256 { get; init; }
 }
 
 public sealed record PilotValidationCheckpoint(
@@ -238,13 +251,15 @@ public sealed record PilotReportEnvelope(
     string CatalogEpoch,
     string ContractId,
     string RuleCatalogSha256,
-    string WorkerPackageSha256,
+    string? WorkerPackageSha256,
     string LedgerHeadSha256,
     bool PilotComplete,
     WorkbenchFailureCode? PrimaryFailureCode,
     ImmutableArray<WorkbenchFailureCode> BlockingReasons,
     ImmutableArray<PilotMarketSummary> Markets,
-    string ReportSha256);
+    string ReportSha256,
+    PilotWorkerValidationMode WorkerValidationMode =
+        PilotWorkerValidationMode.BoundWorker);
 
 public sealed record OfficialRuleSource(
     string Id,

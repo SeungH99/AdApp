@@ -1,4 +1,5 @@
 using LocalDocumentOrganizer.CorpusWorkbench.Contracts;
+using LocalDocumentOrganizer.CorpusWorkbench.Security;
 
 namespace LocalDocumentOrganizer.CorpusWorkbench.Commanding;
 
@@ -37,8 +38,6 @@ internal sealed record SchemaCommand(
 
 internal static class WorkbenchCommandLine
 {
-    private const int MaximumPathLength = 1024;
-
     internal static WorkbenchCommand Parse(string[]? arguments)
     {
         if (arguments is null || arguments.Length == 0)
@@ -182,32 +181,7 @@ internal static class WorkbenchCommandLine
 
     private static string RequireAbsoluteLocalPath(string value)
     {
-        if (value.Length is 0 or > MaximumPathLength
-            || value.IndexOf('\0') >= 0
-            || !Path.IsPathFullyQualified(value)
-            || value.StartsWith(@"\\", StringComparison.Ordinal)
-            || value.Length < 3
-            || !char.IsAsciiLetter(value[0])
-            || value[1] != ':'
-            || value[2] != Path.DirectorySeparatorChar)
-        {
-            throw InvalidArguments();
-        }
-
-        try
-        {
-            if (!string.Equals(
-                    Path.GetFullPath(value),
-                    value,
-                    StringComparison.Ordinal))
-            {
-                throw InvalidArguments();
-            }
-        }
-        catch (Exception exception) when (
-            exception is ArgumentException
-                or NotSupportedException
-                or PathTooLongException)
+        if (!CanonicalWindowsPath.IsAccepted(value))
         {
             throw InvalidArguments();
         }

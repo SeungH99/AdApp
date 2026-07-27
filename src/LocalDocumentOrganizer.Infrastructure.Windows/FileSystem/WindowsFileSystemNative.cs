@@ -22,6 +22,7 @@ internal static class WindowsFileSystemNative
     internal const uint FileAttributeDirectory = 0x00000010;
     internal const uint FileAttributeReparsePoint = 0x00000400;
     internal const uint FileListDirectory = 0x00000001;
+    internal const uint FileReadAttributes = 0x00000080;
 
     internal const uint FILE_RENAME_REPLACE_IF_EXISTS = 0x00000001;
     internal const uint FILE_RENAME_POSIX_SEMANTICS = 0x00000002;
@@ -289,6 +290,109 @@ internal static class WindowsFileSystemNative
         }
 
         throw CreateNativeException(error);
+    }
+
+    internal static SafeFileHandle OpenDirectoryPromotionHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            FileListDirectory | Delete,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        return handle;
+    }
+
+    internal static SafeFileHandle OpenDirectoryIdentityHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            FileReadAttributes,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        return handle;
+    }
+
+    internal static bool RenameHandleNoReplace(
+        SafeFileHandle handle,
+        string destinationCanonicalPath)
+    {
+        RequireUsableHandle(handle);
+        var fileName = destinationCanonicalPath.ToCharArray();
+        var fileNameBytes = checked(
+            (uint)(fileName.Length * sizeof(char)));
+        var headerSize = checked((int)Marshal.OffsetOf<
+            FILE_RENAME_INFO_EX>(
+            nameof(FILE_RENAME_INFO_EX.FileName)));
+        var bufferSize = checked(
+            Marshal.SizeOf<FILE_RENAME_INFO_EX>()
+            + (int)fileNameBytes);
+        var buffer = Marshal.AllocHGlobal(bufferSize);
+        try
+        {
+            for (var index = 0; index < bufferSize; index++)
+            {
+                Marshal.WriteByte(buffer, index, 0);
+            }
+
+            Marshal.WriteInt32(buffer, 0, 0);
+            Marshal.WriteIntPtr(
+                buffer,
+                IntPtr.Size == 8 ? 8 : 4,
+                IntPtr.Zero);
+            Marshal.WriteInt32(
+                buffer,
+                IntPtr.Size == 8 ? 16 : 8,
+                checked((int)fileNameBytes));
+            Marshal.Copy(
+                fileName,
+                0,
+                IntPtr.Add(buffer, headerSize),
+                fileName.Length);
+            if (SetFileInformationByHandle(
+                    handle,
+                    FileInfoByHandleClass.FileRenameInfoEx,
+                    buffer,
+                    checked((uint)bufferSize)))
+            {
+                return true;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            if (error is ErrorFileExists or ErrorAlreadyExists)
+            {
+                return false;
+            }
+
+            throw CreateNativeException(error);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
     }
 
     internal static SafeFileHandle OpenNewCrossVolumeDestinationHandle(

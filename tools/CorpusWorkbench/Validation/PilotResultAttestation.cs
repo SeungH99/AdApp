@@ -91,8 +91,8 @@ internal static class PilotResultAttestation
         ValidateString(scope.CatalogEpoch);
         ValidateString(scope.ContractId);
         ValidateString(result.RuleCatalogSha256);
-        ValidateString(result.WorkerPackageSha256);
         ValidateString(result.LedgerHeadSha256);
+        ValidateWorkerValidationState(result);
         if (scope.MarketIds.IsDefault
             || scope.MarketIds.Length > PilotCatalog.MarketIds.Length
             || result.Markets.IsDefault
@@ -145,8 +145,44 @@ internal static class PilotResultAttestation
                     "ruleCatalogSha256",
                     result.RuleCatalogSha256);
                 writer.WriteString(
-                    "workerPackageSha256",
-                    result.WorkerPackageSha256);
+                    "workerValidationMode",
+                    result.WorkerValidationMode
+                        == PilotWorkerValidationMode.BoundWorker
+                        ? "bound"
+                        : "pending");
+                if (result.WorkerPackageSha256 is { } workerHash)
+                {
+                    writer.WriteString(
+                        "workerPackageSha256",
+                        workerHash);
+                }
+                else
+                {
+                    writer.WriteNull("workerPackageSha256");
+                }
+
+                if (result.ValidationSnapshotSha256 is { } snapshot)
+                {
+                    writer.WriteString(
+                        "validationSnapshotSha256",
+                        snapshot);
+                }
+                else
+                {
+                    writer.WriteNull("validationSnapshotSha256");
+                }
+
+                if (result.ConfigurationIdentitySha256 is { } config)
+                {
+                    writer.WriteString(
+                        "configurationIdentitySha256",
+                        config);
+                }
+                else
+                {
+                    writer.WriteNull(
+                        "configurationIdentitySha256");
+                }
                 writer.WriteString(
                     "ledgerHeadSha256",
                     result.LedgerHeadSha256);
@@ -260,6 +296,38 @@ internal static class PilotResultAttestation
         {
             throw InvalidAttestation();
         }
+    }
+
+    private static void ValidateWorkerValidationState(
+        PilotValidationResult result)
+    {
+        if (result.WorkerValidationMode
+                == PilotWorkerValidationMode.BoundWorker
+            && PilotValidator.IsLowerSha256(
+                result.WorkerPackageSha256)
+            && result.ValidationSnapshotSha256 is null
+            && result.ConfigurationIdentitySha256 is null)
+        {
+            return;
+        }
+
+        if (result.WorkerValidationMode
+                == PilotWorkerValidationMode.PendingUnassigned
+            && result.WorkerPackageSha256 is null
+            && !result.PilotComplete
+            && result.PrimaryFailureCode
+                == WorkbenchFailureCode.CoverageIncomplete
+            && result.BlockingReasons.AsSpan().SequenceEqual(
+                [WorkbenchFailureCode.CoverageIncomplete])
+            && PilotValidator.IsLowerSha256(
+                result.ValidationSnapshotSha256)
+            && PilotValidator.IsLowerSha256(
+                result.ConfigurationIdentitySha256))
+        {
+            return;
+        }
+
+        throw InvalidAttestation();
     }
 
     private static WorkbenchException InvalidAttestation(

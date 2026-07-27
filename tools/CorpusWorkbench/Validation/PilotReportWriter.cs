@@ -115,7 +115,8 @@ public sealed class PilotReportWriter
             result.PrimaryFailureCode,
             canonicalReasons,
             canonicalMarkets,
-            ReportSha256: string.Empty);
+            ReportSha256: string.Empty,
+            result.WorkerValidationMode);
         var payload = SerializeCanonical(
             unhashed,
             includeReportHash: false);
@@ -153,8 +154,7 @@ public sealed class PilotReportWriter
                 != PilotCatalog.DirectReviewTargetPerMarket
             || !PilotValidator.IsLowerSha256(
                 result.RuleCatalogSha256)
-            || !PilotValidator.IsLowerSha256(
-                result.WorkerPackageSha256)
+            || !IsValidWorkerValidationState(result)
             || !PilotValidator.IsLowerSha256(
                 result.LedgerHeadSha256)
             || result.BlockingReasons.IsDefault
@@ -210,6 +210,23 @@ public sealed class PilotReportWriter
                 WorkbenchFailureCode.PrivacyLeakDetected);
         }
     }
+
+    private static bool IsValidWorkerValidationState(
+        PilotValidationResult result) =>
+        result.WorkerValidationMode switch
+        {
+            PilotWorkerValidationMode.BoundWorker =>
+                PilotValidator.IsLowerSha256(
+                    result.WorkerPackageSha256),
+            PilotWorkerValidationMode.PendingUnassigned =>
+                result.WorkerPackageSha256 is null
+                && !result.PilotComplete
+                && result.PrimaryFailureCode
+                    == WorkbenchFailureCode.CoverageIncomplete
+                && result.BlockingReasons.AsSpan().SequenceEqual(
+                    [WorkbenchFailureCode.CoverageIncomplete]),
+            _ => false,
+        };
 
     private static bool IsInvalidMarket(PilotMarketSummary market) =>
         market is null
@@ -287,8 +304,21 @@ public sealed class PilotReportWriter
                     "ruleCatalogSha256",
                     envelope.RuleCatalogSha256);
                 writer.WriteString(
-                    "workerPackageSha256",
-                    envelope.WorkerPackageSha256);
+                    "workerValidationMode",
+                    envelope.WorkerValidationMode
+                        == PilotWorkerValidationMode.BoundWorker
+                        ? "bound"
+                        : "pending");
+                if (envelope.WorkerPackageSha256 is { } workerHash)
+                {
+                    writer.WriteString(
+                        "workerPackageSha256",
+                        workerHash);
+                }
+                else
+                {
+                    writer.WriteNull("workerPackageSha256");
+                }
                 writer.WriteString(
                     "ledgerHeadSha256",
                     envelope.LedgerHeadSha256);

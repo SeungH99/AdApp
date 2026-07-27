@@ -12,6 +12,7 @@ using LocalDocumentOrganizer.CorpusWorkbench.Commanding;
 using LocalDocumentOrganizer.CorpusWorkbench.Contracts;
 using LocalDocumentOrganizer.CorpusWorkbench.Ingestion;
 using LocalDocumentOrganizer.CorpusWorkbench.Labels;
+using LocalDocumentOrganizer.CorpusWorkbench.Persistence;
 using LocalDocumentOrganizer.CorpusWorkbench.Rules;
 using LocalDocumentOrganizer.CorpusWorkbench.Review;
 using LocalDocumentOrganizer.CorpusWorkbench.Security;
@@ -19,6 +20,7 @@ using LocalDocumentOrganizer.CorpusWorkbench.Serialization;
 using LocalDocumentOrganizer.CorpusWorkbench.Validation;
 using LocalDocumentOrganizer.CorpusWorkbench.Vault;
 using LocalDocumentOrganizer.Infrastructure.Windows.FileSystem;
+using Microsoft.Data.Sqlite;
 using Microsoft.Win32.SafeHandles;
 
 namespace LocalDocumentOrganizer.CorpusWorkbench;
@@ -170,17 +172,18 @@ internal static class Program
 internal sealed class WorkbenchCommandExecutor
     : IWorkbenchCommandExecutor
 {
+    private readonly Action<WorkbenchInitializationFaultPoint>?
+        _injectInitializationFault;
+    private readonly Action<WorkbenchPendingValidationPoint>?
+        _observePendingValidation;
     private const string ConfigurationFileName =
         "workbench.configuration.json";
     private const string WorkerBindingFileName =
         "worker.binding.json";
-    private const int MaximumConfigurationBytes = 16 * 1024;
+    private const int MaximumConfigurationBytes =
+        AuthenticatedVaultEnvelope.MaximumEnvelopeBytes;
     private const int MaximumCatalogBytes = 128 * 1024;
     private const int MaximumReceiptBytes = 64 * 1024;
-    private const string PendingWorkerPackageDomain =
-        "corpus-workbench-pending-worker-package-v1\n";
-    private const string PendingWorkerExecutableDomain =
-        "corpus-workbench-pending-worker-executable-v1\n";
     private const string EmptyLedgerSha256 =
         "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -194,7 +197,8 @@ internal sealed class WorkbenchCommandExecutor
             + "\"type\":\"object\",\"additionalProperties\":false,"
             + "\"required\":[\"schemaVersion\",\"catalogEpoch\","
             + "\"contractId\",\"ruleCatalogSha256\","
-            + "\"workerPackageSha256\",\"ledgerHeadSha256\","
+            + "\"workerValidationMode\",\"workerPackageSha256\","
+            + "\"ledgerHeadSha256\","
             + "\"pilotComplete\",\"primaryFailureCode\","
             + "\"blockingReasons\",\"markets\",\"reportSha256\"],"
             + "\"properties\":{"
@@ -202,7 +206,8 @@ internal sealed class WorkbenchCommandExecutor
             + "\"catalogEpoch\":{\"type\":\"string\"},"
             + "\"contractId\":{\"const\":\"invoice-explicit-due-date-v1\"},"
             + "\"ruleCatalogSha256\":{\"$ref\":\"#/$defs/sha256\"},"
-            + "\"workerPackageSha256\":{\"$ref\":\"#/$defs/sha256\"},"
+            + "\"workerValidationMode\":{\"enum\":[\"bound\",\"pending\"]},"
+            + "\"workerPackageSha256\":{\"anyOf\":[{\"$ref\":\"#/$defs/sha256\"},{\"type\":\"null\"}]},"
             + "\"ledgerHeadSha256\":{\"$ref\":\"#/$defs/sha256\"},"
             + "\"pilotComplete\":{\"type\":\"boolean\"},"
             + "\"primaryFailureCode\":{\"type\":[\"string\",\"null\"]},"
@@ -220,6 +225,16 @@ internal sealed class WorkbenchCommandExecutor
             UnmappedMemberHandling =
                 JsonUnmappedMemberHandling.Disallow,
         };
+
+    internal WorkbenchCommandExecutor(
+        Action<WorkbenchInitializationFaultPoint>?
+            injectInitializationFault = null,
+        Action<WorkbenchPendingValidationPoint>?
+            observePendingValidation = null)
+    {
+        _injectInitializationFault = injectInitializationFault;
+        _observePendingValidation = observePendingValidation;
+    }
 
     public async Task ExecuteAsync(
         WorkbenchCommand command,
@@ -283,6 +298,7 @@ internal sealed class WorkbenchCommandExecutor
 
         var binding = await LoadWorkerBindingAsync(
                 vault,
+                configuration.AuthenticatedIdentitySha256,
                 cancellationToken)
             .ConfigureAwait(false)
             ?? throw new WorkbenchException(
@@ -340,21 +356,27 @@ internal sealed class WorkbenchCommandExecutor
         ReviewCommand command,
         CancellationToken cancellationToken)
     {
-        var configuration =
-            await LoadConfigurationFromRootAsync(
-                    command.VaultPath,
+        WorkbenchConfiguration configuration;
+        WorkerBinding binding;
+        await using (var vault = OpenInitializedVault(
+                         command.VaultPath))
+        {
+            configuration = await LoadConfigurationAsync(
+                    vault,
                     cancellationToken)
                 .ConfigureAwait(false);
+            binding = await LoadWorkerBindingAsync(
+                    vault,
+                    configuration.AuthenticatedIdentitySha256,
+                    cancellationToken)
+                .ConfigureAwait(false)
+                ?? throw new WorkbenchException(
+                    WorkbenchFailureCode.InvalidState);
+        }
+
         var ruleSet = await LoadEmbeddedRuleSetAsync(cancellationToken)
             .ConfigureAwait(false);
         RequireConfiguredRuleSet(configuration, ruleSet);
-
-        var binding = await LoadWorkerBindingFromRootAsync(
-                command.VaultPath,
-                cancellationToken)
-            .ConfigureAwait(false)
-            ?? throw new WorkbenchException(
-                WorkbenchFailureCode.InvalidState);
         await ReviewHost.RunAsync(
                 new ReviewHostOptions(
                     command.VaultPath,
@@ -423,6 +445,7 @@ internal sealed class WorkbenchCommandExecutor
 
             await PersistWorkerBindingAsync(
                     vault,
+                    configuration.AuthenticatedIdentitySha256,
                     binding,
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -468,11 +491,13 @@ internal sealed class WorkbenchCommandExecutor
 
     private static async Task PersistWorkerBindingAsync(
         CorpusVault vault,
+        string configurationIdentitySha256,
         WorkerBinding binding,
         CancellationToken cancellationToken)
     {
         var existing = await LoadWorkerBindingAsync(
                 vault,
+                configurationIdentitySha256,
                 cancellationToken)
             .ConfigureAwait(false);
         if (existing is not null)
@@ -481,9 +506,17 @@ internal sealed class WorkbenchCommandExecutor
             return;
         }
 
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(
+        var payload = JsonSerializer.SerializeToUtf8Bytes(
             binding,
             ConfigurationJson);
+        var bytes = await AuthenticatedVaultEnvelope.SealAsync(
+                vault,
+                new PilotAuthenticationService(vault),
+                AuthenticatedVaultEnvelopeKind.WorkerBinding,
+                payload,
+                configurationIdentitySha256,
+                cancellationToken)
+            .ConfigureAwait(false);
         try
         {
             await PublishNoReplaceAsync(
@@ -501,6 +534,7 @@ internal sealed class WorkbenchCommandExecutor
         {
             existing = await LoadWorkerBindingAsync(
                     vault,
+                    configurationIdentitySha256,
                     cancellationToken)
                 .ConfigureAwait(false);
             if (existing is null)
@@ -514,6 +548,7 @@ internal sealed class WorkbenchCommandExecutor
 
     private static async Task<WorkerBinding?> LoadWorkerBindingAsync(
         CorpusVault vault,
+        string configurationIdentitySha256,
         CancellationToken cancellationToken)
     {
         var store = vault.PreviewFileStore;
@@ -537,26 +572,25 @@ internal sealed class WorkbenchCommandExecutor
                 MaximumConfigurationBytes,
                 cancellationToken)
             .ConfigureAwait(false);
-        return ParseWorkerBinding(bytes);
-    }
-
-    private static async Task<WorkerBinding?>
-        LoadWorkerBindingFromRootAsync(
-        string vaultPath,
-        CancellationToken cancellationToken)
-    {
-        var path = Path.Combine(vaultPath, WorkerBindingFileName);
-        if (!File.Exists(path))
-        {
-            return null;
-        }
-
-        var bytes = await ReadStableFileAsync(
-                path,
-                MaximumConfigurationBytes,
+        var opened = await AuthenticatedVaultEnvelope.OpenAsync(
+                vault,
+                new PilotAuthenticationService(vault),
+                AuthenticatedVaultEnvelopeKind.WorkerBinding,
+                bytes,
+                configurationIdentitySha256,
                 cancellationToken)
             .ConfigureAwait(false);
-        return ParseWorkerBinding(bytes);
+        var binding = ParseWorkerBinding(opened.Payload);
+        var canonical = JsonSerializer.SerializeToUtf8Bytes(
+            binding,
+            ConfigurationJson);
+        if (!canonical.AsSpan().SequenceEqual(opened.Payload))
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.WorkerAttestationMismatch);
+        }
+
+        return binding;
     }
 
     private static WorkerBinding ParseWorkerBinding(byte[] bytes)
@@ -726,7 +760,7 @@ internal sealed class WorkbenchCommandExecutor
             .ConfigureAwait(false);
     }
 
-    private static async Task InitializeAsync(
+    private async Task InitializeAsync(
         InitCommand command,
         CancellationToken cancellationToken)
     {
@@ -765,35 +799,37 @@ internal sealed class WorkbenchCommandExecutor
                 WorkbenchFailureCode.InvalidArguments);
         }
 
-        using (var parentStore = new ApprovedRootFileStore(
-                   new ApprovedRootPathGuard(parent)))
-        {
-            parentStore.Revalidate();
-        }
+        using var parentStore = new ApprovedRootFileStore(
+            new ApprovedRootPathGuard(parent));
+        parentStore.Revalidate();
         var staging = Path.Combine(
             parent,
             $".{leaf}.initialize-{Guid.NewGuid():N}");
         CreatePrivateDirectory(staging);
+        VerifiedDirectoryPromotion? stagingDirectory = null;
         var published = false;
         try
         {
+            stagingDirectory =
+                parentStore.OpenDirectoryPromotionVerified(
+                    Path.GetFileName(staging));
             var configuration = new WorkbenchConfiguration(
                 "1",
                 command.Epoch,
                 ruleSet.PilotSha256,
                 supplied.Document.MarketId,
-                supplied.CatalogSha256);
+                supplied.CatalogSha256,
+                "corpus-workbench-v1",
+                PilotCatalog.ContractId,
+                PilotCatalog.MarketIds,
+                PilotCatalog.HeldOutTargetPerMarket,
+                PilotCatalog.DirectReviewTargetPerMarket,
+                ruleSet.Rules.ToImmutableSortedDictionary(
+                    static pair => pair.Key,
+                    static pair => pair.Value.CatalogSha256,
+                    StringComparer.Ordinal));
             await using (var vault = CorpusVault.OpenExisting(staging))
             {
-                var bytes = JsonSerializer.SerializeToUtf8Bytes(
-                    configuration,
-                    ConfigurationJson);
-                await PublishNoReplaceAsync(
-                        Path.Combine(staging, ConfigurationFileName),
-                        bytes,
-                        "configuration",
-                        cancellationToken)
-                    .ConfigureAwait(false);
                 var authentication =
                     new PilotAuthenticationService(vault);
                 var proof = await authentication.SignCheckpointAsync(
@@ -802,17 +838,61 @@ internal sealed class WorkbenchCommandExecutor
                         cancellationToken)
                     .ConfigureAwait(false);
                 CryptographicOperations.ZeroMemory(proof);
+                var payload = JsonSerializer.SerializeToUtf8Bytes(
+                    configuration,
+                    ConfigurationJson);
+                var bytes = await AuthenticatedVaultEnvelope.SealAsync(
+                        vault,
+                        authentication,
+                        AuthenticatedVaultEnvelopeKind.Configuration,
+                        payload,
+                        configurationIdentitySha256: null,
+                        cancellationToken,
+                        vaultIdentityRoot: command.VaultPath)
+                    .ConfigureAwait(false);
+                await PublishNoReplaceAsync(
+                        Path.Combine(staging, ConfigurationFileName),
+                        bytes,
+                        "configuration",
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                var readback = await LoadConfigurationAsync(
+                        vault,
+                        cancellationToken,
+                        command.VaultPath)
+                    .ConfigureAwait(false);
+                RequireSameConfiguration(configuration, readback);
+                _ = await vault.Store
+                    .ReadPristinePilotSnapshotAsync(cancellationToken)
+                    .ConfigureAwait(false);
             }
 
+            _injectInitializationFault?.Invoke(
+                WorkbenchInitializationFaultPoint
+                    .BeforeStagingVerification);
+            parentStore.RevalidateDirectoryPromotion(
+                stagingDirectory);
+            await VerifyInitializationContentAsync(
+                    staging,
+                    command.VaultPath,
+                    configuration,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            VerifyInitializationStaging(staging);
+            parentStore.RevalidateDirectoryPromotion(
+                stagingDirectory);
+            _injectInitializationFault?.Invoke(
+                WorkbenchInitializationFaultPoint.BeforePublish);
             cancellationToken.ThrowIfCancellationRequested();
-            if (Directory.Exists(command.VaultPath)
-                || File.Exists(command.VaultPath))
+            parentStore.Revalidate();
+            if (!parentStore.PromoteVerifiedDirectoryNoReplace(
+                    stagingDirectory,
+                    leaf))
             {
                 throw new WorkbenchException(
                     WorkbenchFailureCode.InvalidState);
             }
 
-            Directory.Move(staging, command.VaultPath);
             published = true;
         }
         catch (OperationCanceledException)
@@ -831,6 +911,7 @@ internal sealed class WorkbenchCommandExecutor
                 or CryptographicException
                 or System.Security.SecurityException
                 or ArgumentException
+                or SqliteException
                 or NotSupportedException)
         {
             throw new WorkbenchException(
@@ -839,21 +920,55 @@ internal sealed class WorkbenchCommandExecutor
         }
         finally
         {
-            if (!published && Directory.Exists(staging))
+            if (!published && stagingDirectory is not null)
             {
                 try
                 {
-                    DeletePrivateStagingDirectory(parent, staging);
+                    parentStore.RevalidateDirectoryPromotion(
+                        stagingDirectory);
+                    if (Directory.Exists(staging))
+                    {
+                        DeletePrivateStagingDirectory(
+                            parent,
+                            staging);
+                    }
                 }
                 catch
                 {
                     // The initialization failure remains primary.
                 }
             }
+
+            stagingDirectory?.Dispose();
         }
     }
 
-    private static async Task ValidateAsync(
+    private async Task ValidateAsync(
+        ValidateCommand command,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await ValidateCoreAsync(command, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (WorkbenchException exception)
+            when (exception.FailureCode
+                == WorkbenchFailureCode.InvalidState)
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.VaultBoundaryViolation,
+                exception);
+        }
+        catch (SqliteException exception)
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.VaultBoundaryViolation,
+                exception);
+        }
+    }
+
+    private async Task ValidateCoreAsync(
         ValidateCommand command,
         CancellationToken cancellationToken)
     {
@@ -873,33 +988,17 @@ internal sealed class WorkbenchCommandExecutor
         var scope = CreateScope(configuration);
         var binding = await LoadWorkerBindingAsync(
                 vault,
+                configuration.AuthenticatedIdentitySha256,
                 cancellationToken)
             .ConfigureAwait(false);
         if (binding is null)
         {
-            if (states.Count != 0)
-            {
-                throw new WorkbenchException(
-                    WorkbenchFailureCode
-                        .WorkerAttestationMismatch);
-            }
-
-            var pending = CreatePendingWorkerIdentity();
-            var pendingApproval = new ApprovalLedgerService(
-                vault,
-                scope,
-                ruleSet.Rules.Values,
-                pending,
-                TimeProvider.System,
-                injectFault: null);
-            await ValidateAndPublishAsync(
+            await ValidatePendingAndPublishAsync(
                     vault,
-                    pendingApproval,
+                    configuration,
                     scope,
                     ruleSet.PilotSha256,
-                    pending.Sha256,
                     command.OutputPath,
-                    requirePristinePending: true,
                     cancellationToken)
                 .ConfigureAwait(false);
             return;
@@ -928,7 +1027,6 @@ internal sealed class WorkbenchCommandExecutor
                     ruleSet.PilotSha256,
                     workspace.Identity.Sha256,
                     command.OutputPath,
-                    requirePristinePending: false,
                     cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -955,22 +1053,12 @@ internal sealed class WorkbenchCommandExecutor
         string ruleCatalogSha256,
         string workerPackageSha256,
         string outputPath,
-        bool requirePristinePending,
         CancellationToken cancellationToken)
     {
         var verification = await approval.VerifyAsync(
                 cancellationToken)
             .ConfigureAwait(false);
         if (!verification.IsValid)
-        {
-            throw new WorkbenchException(
-                WorkbenchFailureCode.ApprovalChainInvalid);
-        }
-
-        if (requirePristinePending
-            && !FixedHashEquals(
-                verification.LedgerHeadSha256,
-                EmptyLedgerSha256))
         {
             throw new WorkbenchException(
                 WorkbenchFailureCode.ApprovalChainInvalid);
@@ -986,16 +1074,6 @@ internal sealed class WorkbenchCommandExecutor
                 request,
                 cancellationToken)
             .ConfigureAwait(false);
-        if (requirePristinePending
-            && (result.PilotComplete
-            || !result.BlockingReasons.Contains(
-                WorkbenchFailureCode.CoverageIncomplete))
-            )
-        {
-            throw new WorkbenchException(
-                WorkbenchFailureCode.InvalidState);
-        }
-
         var writer = new PilotReportWriter(vault);
         await writer.WriteAsync(
                 result,
@@ -1007,6 +1085,98 @@ internal sealed class WorkbenchCommandExecutor
             throw new WorkbenchException(
                 WorkbenchFailureCode.CoverageIncomplete);
         }
+    }
+
+    private async Task ValidatePendingAndPublishAsync(
+        CorpusVault vault,
+        WorkbenchConfiguration configuration,
+        PilotScope scope,
+        string ruleCatalogSha256,
+        string outputPath,
+        CancellationToken cancellationToken)
+    {
+        _observePendingValidation?.Invoke(
+            WorkbenchPendingValidationPoint.BeforeSnapshot);
+        cancellationToken.ThrowIfCancellationRequested();
+        var snapshot = await vault.Store
+            .ReadPristinePilotSnapshotAsync(
+                cancellationToken,
+                point =>
+                {
+                    if (point
+                        == PristinePilotReadPoint.AfterCountsRead)
+                    {
+                        _observePendingValidation?.Invoke(
+                            WorkbenchPendingValidationPoint
+                                .DuringSnapshotAfterCountsRead);
+                    }
+                })
+            .ConfigureAwait(false);
+        _observePendingValidation?.Invoke(
+            WorkbenchPendingValidationPoint.AfterSnapshot);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (await LoadWorkerBindingAsync(
+                    vault,
+                    configuration.AuthenticatedIdentitySha256,
+                    cancellationToken)
+                .ConfigureAwait(false)
+            is not null)
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.WorkerAttestationMismatch);
+        }
+
+        _observePendingValidation?.Invoke(
+            WorkbenchPendingValidationPoint.AfterBindingCheck);
+        cancellationToken.ThrowIfCancellationRequested();
+        var summaries = scope.MarketIds
+            .Order(StringComparer.Ordinal)
+            .Select(static marketId => new PilotMarketSummary(
+                marketId,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                BatchApproved: false,
+                ImmutableDictionary<string, int>.Empty))
+            .ToImmutableArray();
+        var result = new PilotValidationResult(
+            PilotComplete: false,
+            WorkbenchFailureCode.CoverageIncomplete,
+            [WorkbenchFailureCode.CoverageIncomplete],
+            summaries,
+            ruleCatalogSha256,
+            WorkerPackageSha256: null,
+            EmptyLedgerSha256)
+        {
+            WorkerValidationMode =
+                PilotWorkerValidationMode.PendingUnassigned,
+            Scope = scope with
+            {
+                MarketIds =
+                [
+                    .. scope.MarketIds.Order(StringComparer.Ordinal),
+                ],
+            },
+            ValidationSnapshotSha256 = snapshot.SnapshotSha256,
+            ConfigurationIdentitySha256 =
+                configuration.AuthenticatedIdentitySha256,
+        };
+        result = await PilotResultAttestation.IssueAsync(
+                result,
+                new PilotAuthenticationService(vault),
+                cancellationToken)
+            .ConfigureAwait(false);
+        var writer = new PilotReportWriter(vault);
+        await writer.WriteAsync(
+                result,
+                outputPath,
+                cancellationToken)
+            .ConfigureAwait(false);
+        throw new WorkbenchException(
+            WorkbenchFailureCode.CoverageIncomplete);
     }
 
     private static PilotScope CreateScope(
@@ -1031,32 +1201,27 @@ internal sealed class WorkbenchCommandExecutor
                 out var seed)
             || !FixedHashEquals(
                 configuration.SeedCatalogSha256,
-                seed.CatalogSha256))
+                seed.CatalogSha256)
+            || configuration.RuleCatalogSha256ByMarket.Count
+                != ruleSet.Rules.Count
+            || ruleSet.Rules.Any(pair =>
+                !configuration.RuleCatalogSha256ByMarket.TryGetValue(
+                    pair.Key,
+                    out var configured)
+                || !FixedHashEquals(
+                    configured,
+                    pair.Value.CatalogSha256)))
         {
             throw new WorkbenchException(
                 WorkbenchFailureCode.StaleRuleSet);
         }
     }
 
-    private static CorpusWorkerPackageIdentity
-        CreatePendingWorkerIdentity() =>
-        new(
-            CorpusWorkerPackageIdentity.CanonicalManifestId,
-            CorpusWorkerPackageIdentity.CanonicalManifestVersion,
-            Convert.ToHexStringLower(
-                SHA256.HashData(
-                    Encoding.UTF8.GetBytes(
-                        PendingWorkerPackageDomain))),
-            "pending/unassigned-worker.exe",
-            Convert.ToHexStringLower(
-                SHA256.HashData(
-                    Encoding.UTF8.GetBytes(
-                        PendingWorkerExecutableDomain))));
-
     private static async Task<WorkbenchConfiguration>
         LoadConfigurationAsync(
         CorpusVault vault,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? vaultIdentityRoot = null)
     {
         var bytes = await ReadVaultFileAsync(
                 vault,
@@ -1064,26 +1229,30 @@ internal sealed class WorkbenchCommandExecutor
                 MaximumConfigurationBytes,
                 cancellationToken)
             .ConfigureAwait(false);
-        return ParseConfiguration(bytes);
-    }
-
-    private static async Task<WorkbenchConfiguration>
-        LoadConfigurationFromRootAsync(
-        string vaultPath,
-        CancellationToken cancellationToken)
-    {
-        if (!Directory.Exists(vaultPath))
+        var opened = await AuthenticatedVaultEnvelope.OpenAsync(
+                vault,
+                new PilotAuthenticationService(vault),
+                AuthenticatedVaultEnvelopeKind.Configuration,
+                bytes,
+                expectedConfigurationIdentitySha256: null,
+                cancellationToken,
+                vaultIdentityRoot)
+            .ConfigureAwait(false);
+        var configuration = ParseConfiguration(opened.Payload);
+        var canonical = JsonSerializer.SerializeToUtf8Bytes(
+            configuration,
+            ConfigurationJson);
+        if (!canonical.AsSpan().SequenceEqual(opened.Payload))
         {
             throw new WorkbenchException(
-                WorkbenchFailureCode.InvalidState);
+                WorkbenchFailureCode.VaultBoundaryViolation);
         }
 
-        var bytes = await ReadStableFileAsync(
-                Path.Combine(vaultPath, ConfigurationFileName),
-                MaximumConfigurationBytes,
-                cancellationToken)
-            .ConfigureAwait(false);
-        return ParseConfiguration(bytes);
+        return configuration with
+        {
+            AuthenticatedIdentitySha256 =
+                opened.PayloadIdentitySha256,
+        };
     }
 
     private static WorkbenchConfiguration ParseConfiguration(
@@ -1106,7 +1275,31 @@ internal sealed class WorkbenchCommandExecutor
                 || configuration.SeedMarketId
                     is not ("ko-KR" or "en-US")
                 || !IsLowerSha256(
-                    configuration.SeedCatalogSha256))
+                    configuration.SeedCatalogSha256)
+                || !string.Equals(
+                    configuration.ToolVersion,
+                    "corpus-workbench-v1",
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    configuration.ContractId,
+                    PilotCatalog.ContractId,
+                    StringComparison.Ordinal)
+                || configuration.MarketIds.IsDefault
+                || !configuration.MarketIds.AsSpan().SequenceEqual(
+                    PilotCatalog.MarketIds.AsSpan())
+                || configuration.HeldOutTargetPerMarket
+                    != PilotCatalog.HeldOutTargetPerMarket
+                || configuration.DirectReviewTargetPerMarket
+                    != PilotCatalog.DirectReviewTargetPerMarket
+                || configuration.RuleCatalogSha256ByMarket is null
+                || configuration.RuleCatalogSha256ByMarket.Count
+                    != PilotCatalog.MarketIds.Length
+                || configuration.RuleCatalogSha256ByMarket.Any(
+                    pair =>
+                        !PilotCatalog.MarketIds.Contains(
+                            pair.Key,
+                            StringComparer.Ordinal)
+                        || !IsLowerSha256(pair.Value)))
             {
                 throw new WorkbenchException(
                     WorkbenchFailureCode.InvalidState);
@@ -1154,6 +1347,7 @@ internal sealed class WorkbenchCommandExecutor
                 or StableSourceBoundaryException
                 or IOException
                 or UnauthorizedAccessException
+                or SqliteException
                 or System.Security.SecurityException
                 or ArgumentException
                 or NotSupportedException)
@@ -1313,7 +1507,6 @@ internal sealed class WorkbenchCommandExecutor
         var user = identity.User
             ?? throw new WorkbenchException(
                 WorkbenchFailureCode.VaultBoundaryViolation);
-        Directory.CreateDirectory(path);
         var security = new DirectorySecurity();
         security.SetAccessRuleProtection(
             isProtected: true,
@@ -1326,7 +1519,178 @@ internal sealed class WorkbenchCommandExecutor
                     | InheritanceFlags.ObjectInherit,
                 PropagationFlags.None,
                 AccessControlType.Allow));
-        new DirectoryInfo(path).SetAccessControl(security);
+        new DirectoryInfo(path).Create(security);
+    }
+
+    private static void VerifyInitializationStaging(string staging)
+    {
+        var expectedFiles = new HashSet<string>(
+            StringComparer.Ordinal)
+        {
+            "workbench.db",
+            "vault.keys",
+            "vault.keys.admission.lock",
+            "vault.keys.lock",
+            "vault.keys.rebuild.lock",
+            "vault.keys.writer-intent.lock",
+            ConfigurationFileName,
+        };
+        var expectedDirectories = new HashSet<string>(
+            StringComparer.Ordinal)
+        {
+            "objects",
+            "previews",
+            "checkpoints",
+        };
+        var entries = Directory.EnumerateFileSystemEntries(
+                staging,
+                "*",
+                SearchOption.TopDirectoryOnly)
+            .Take(
+                expectedFiles.Count
+                + expectedDirectories.Count
+                + 1)
+            .Select(Path.GetFileName)
+            .ToArray();
+        if (entries.Length
+                != expectedFiles.Count + expectedDirectories.Count
+            || entries.Any(static name => string.IsNullOrEmpty(name))
+            || entries.Any(name =>
+                !expectedFiles.Contains(name!)
+                && !expectedDirectories.Contains(name!)))
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.VaultBoundaryViolation);
+        }
+
+        var directory = new DirectoryInfo(staging);
+        using var identity = WindowsIdentity.GetCurrent();
+        var user = identity.User
+            ?? throw new WorkbenchException(
+                WorkbenchFailureCode.VaultBoundaryViolation);
+        var security = directory.GetAccessControl(
+            AccessControlSections.Access
+            | AccessControlSections.Owner);
+        if (!security.AreAccessRulesProtected
+            || security.GetOwner(typeof(SecurityIdentifier))
+                is not SecurityIdentifier owner
+            || !owner.Equals(user))
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.VaultBoundaryViolation);
+        }
+
+        var rules = security.GetAccessRules(
+                includeExplicit: true,
+                includeInherited: true,
+                typeof(SecurityIdentifier))
+            .Cast<FileSystemAccessRule>()
+            .ToArray();
+        if (rules.Length != 1
+            || rules[0].IdentityReference
+                is not SecurityIdentifier ruleIdentity
+            || !ruleIdentity.Equals(user)
+            || rules[0].AccessControlType
+                != AccessControlType.Allow
+            || (rules[0].FileSystemRights
+                & FileSystemRights.FullControl)
+                != FileSystemRights.FullControl
+            || rules[0].InheritanceFlags
+                != (InheritanceFlags.ContainerInherit
+                    | InheritanceFlags.ObjectInherit)
+            || rules[0].PropagationFlags
+                != PropagationFlags.None
+            || rules[0].IsInherited)
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.VaultBoundaryViolation);
+        }
+
+        using var store = new ApprovedRootFileStore(
+            new ApprovedRootPathGuard(staging));
+        foreach (var file in expectedFiles)
+        {
+            using var verified = store.OpenExistingVerified(file);
+            store.RevalidateExisting(verified, file);
+        }
+
+        foreach (var child in expectedDirectories)
+        {
+            store.RevalidateDirectoryVerified(child);
+        }
+
+        store.Revalidate();
+    }
+
+    private static async Task VerifyInitializationContentAsync(
+        string staging,
+        string finalVaultRoot,
+        WorkbenchConfiguration expectedConfiguration,
+        CancellationToken cancellationToken)
+    {
+        await using var vault = CorpusVault.OpenExisting(staging);
+        var configuration = await LoadConfigurationAsync(
+                vault,
+                cancellationToken,
+                finalVaultRoot)
+            .ConfigureAwait(false);
+        RequireSameConfiguration(
+            expectedConfiguration,
+            configuration);
+        _ = await vault.Store
+            .ReadPristinePilotSnapshotAsync(cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static void RequireSameConfiguration(
+        WorkbenchConfiguration expected,
+        WorkbenchConfiguration actual)
+    {
+        if (!string.Equals(
+                expected.SchemaVersion,
+                actual.SchemaVersion,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                expected.CatalogEpoch,
+                actual.CatalogEpoch,
+                StringComparison.Ordinal)
+            || !FixedHashEquals(
+                expected.PilotRuleCatalogSha256,
+                actual.PilotRuleCatalogSha256)
+            || !string.Equals(
+                expected.SeedMarketId,
+                actual.SeedMarketId,
+                StringComparison.Ordinal)
+            || !FixedHashEquals(
+                expected.SeedCatalogSha256,
+                actual.SeedCatalogSha256)
+            || !string.Equals(
+                expected.ToolVersion,
+                actual.ToolVersion,
+                StringComparison.Ordinal)
+            || !string.Equals(
+                expected.ContractId,
+                actual.ContractId,
+                StringComparison.Ordinal)
+            || !expected.MarketIds.AsSpan()
+                .SequenceEqual(actual.MarketIds.AsSpan())
+            || expected.HeldOutTargetPerMarket
+                != actual.HeldOutTargetPerMarket
+            || expected.DirectReviewTargetPerMarket
+                != actual.DirectReviewTargetPerMarket
+            || expected.RuleCatalogSha256ByMarket.Count
+                != actual.RuleCatalogSha256ByMarket.Count
+            || expected.RuleCatalogSha256ByMarket.Any(pair =>
+                !actual.RuleCatalogSha256ByMarket.TryGetValue(
+                    pair.Key,
+                    out var actualHash)
+                || !FixedHashEquals(pair.Value, actualHash))
+            || !IsLowerSha256(
+                actual.AuthenticatedIdentitySha256))
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.VaultBoundaryViolation);
+        }
     }
 
     private static void DeletePrivateStagingDirectory(
@@ -1361,29 +1725,7 @@ internal sealed class WorkbenchCommandExecutor
                 or '.');
 
     private static bool IsCanonicalLocalPath(string? value)
-    {
-        if (value is not { Length: >= 3 and <= 1024 }
-            || !Path.IsPathFullyQualified(value)
-            || value.StartsWith(@"\\", StringComparison.Ordinal)
-            || !char.IsAsciiLetter(value[0])
-            || value[1] != ':'
-            || value[2] != Path.DirectorySeparatorChar)
-        {
-            return false;
-        }
-
-        try
-        {
-            return string.Equals(
-                Path.GetFullPath(value),
-                value,
-                StringComparison.Ordinal);
-        }
-        catch
-        {
-            return false;
-        }
-    }
+        => CanonicalWindowsPath.IsAccepted(value);
 
     private static bool IsLowerSha256(string? value) =>
         value is { Length: 64 }
@@ -1525,7 +1867,19 @@ internal sealed record WorkbenchConfiguration(
     string CatalogEpoch,
     string PilotRuleCatalogSha256,
     string SeedMarketId,
-    string SeedCatalogSha256);
+    string SeedCatalogSha256,
+    string ToolVersion,
+    string ContractId,
+    ImmutableArray<string> MarketIds,
+    int HeldOutTargetPerMarket,
+    int DirectReviewTargetPerMarket,
+    ImmutableSortedDictionary<string, string>
+        RuleCatalogSha256ByMarket)
+{
+    [JsonIgnore]
+    internal string AuthenticatedIdentitySha256 { get; init; } =
+        string.Empty;
+}
 
 internal sealed record WorkerBinding(
     string SchemaVersion,
@@ -1549,3 +1903,17 @@ internal sealed record WorkerBinding(
 internal sealed record RuleSet(
     ImmutableDictionary<string, OfficialRuleCatalogSnapshot> Rules,
     string PilotSha256);
+
+internal enum WorkbenchInitializationFaultPoint
+{
+    BeforeStagingVerification = 0,
+    BeforePublish = 1,
+}
+
+internal enum WorkbenchPendingValidationPoint
+{
+    BeforeSnapshot = 0,
+    DuringSnapshotAfterCountsRead = 1,
+    AfterSnapshot = 2,
+    AfterBindingCheck = 3,
+}

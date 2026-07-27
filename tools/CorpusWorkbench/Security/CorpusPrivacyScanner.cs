@@ -21,6 +21,7 @@ public static class CorpusPrivacyScanner
             "catalogEpoch",
             "contractId",
             "ruleCatalogSha256",
+            "workerValidationMode",
             "workerPackageSha256",
             "ledgerHeadSha256",
             "pilotComplete",
@@ -124,7 +125,7 @@ public static class CorpusPrivacyScanner
             "contractId",
             PilotCatalog.ContractId);
         RequireSha256(root, "ruleCatalogSha256");
-        RequireSha256(root, "workerPackageSha256");
+        ValidateWorkerIdentity(root);
         RequireSha256(root, "ledgerHeadSha256");
         RequireBoolean(root, "pilotComplete");
         ValidateNullableFailureCode(root, "primaryFailureCode");
@@ -135,6 +136,28 @@ public static class CorpusPrivacyScanner
             root.GetProperty("markets"),
             cancellationToken);
         RequireSha256(root, "reportSha256");
+    }
+
+    private static void ValidateWorkerIdentity(JsonElement root)
+    {
+        var mode = RequireStringValue(
+            root,
+            "workerValidationMode");
+        var packageHash = root.GetProperty(
+            "workerPackageSha256");
+        if (string.Equals(mode, "pending", StringComparison.Ordinal)
+            && packageHash.ValueKind == JsonValueKind.Null)
+        {
+            return;
+        }
+
+        if (!string.Equals(mode, "bound", StringComparison.Ordinal)
+            || packageHash.ValueKind != JsonValueKind.String
+            || !Validation.PilotValidator.IsLowerSha256(
+                packageHash.GetString()))
+        {
+            throw PrivacyFailure();
+        }
     }
 
     private static void ValidateBlockingReasons(

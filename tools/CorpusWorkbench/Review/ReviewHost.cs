@@ -224,17 +224,11 @@ public static class ReviewHost
                         cancellationToken,
                         workerPackageRoot: workerPackageRoot)
                     .ConfigureAwait(false);
-            await using var session = await runner.StartAsync(
+            await RunOwnedDataSourceAsync(
                     options,
                     dataSource,
+                    runner,
                     cancellationToken)
-                .ConfigureAwait(false);
-            if (options.OpenBrowser)
-            {
-                OpenBrowser(session.NavigationUri);
-            }
-
-            await session.WaitForShutdownAsync(cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -250,6 +244,55 @@ public static class ReviewHost
         {
             throw new WorkbenchException(
                 WorkbenchFailureCode.InvalidState);
+        }
+    }
+
+    internal static async Task RunOwnedDataSourceAsync(
+        ReviewHostOptions options,
+        IReviewDataSource dataSource,
+        IReviewHostRunner runner,
+        CancellationToken cancellationToken,
+        Action<Uri>? openBrowser = null)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(dataSource);
+        ArgumentNullException.ThrowIfNull(runner);
+        IReviewHostRunSession session;
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            session = await runner.StartAsync(
+                    options,
+                    dataSource,
+                    cancellationToken)
+                .ConfigureAwait(false)
+                ?? throw new InvalidOperationException();
+        }
+        catch
+        {
+            try
+            {
+                await dataSource.DisposeAsync()
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // Preserve the runner start failure.
+            }
+
+            throw;
+        }
+
+        await using (session.ConfigureAwait(false))
+        {
+            if (options.OpenBrowser)
+            {
+                (openBrowser ?? OpenBrowser)(
+                    session.NavigationUri);
+            }
+
+            await session.WaitForShutdownAsync(cancellationToken)
+                .ConfigureAwait(false);
         }
     }
 
@@ -612,7 +655,6 @@ public static class ReviewHost
                     .ConfigureAwait(false);
             }
 
-            await dataSource.DisposeAsync().ConfigureAwait(false);
             sessionState.ZeroSecret();
             throw;
         }

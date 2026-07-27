@@ -13,6 +13,12 @@ internal sealed class PilotAuthenticationService
     private static readonly ReadOnlyMemory<byte> ResultKeyDomain =
         "LocalDocumentOrganizer/CorpusWorkbench/ResultAttestation/v1"u8
             .ToArray();
+    private static readonly ReadOnlyMemory<byte> ConfigurationKeyDomain =
+        "LocalDocumentOrganizer/CorpusWorkbench/ConfigurationEnvelope/v1"u8
+            .ToArray();
+    private static readonly ReadOnlyMemory<byte> WorkerBindingKeyDomain =
+        "LocalDocumentOrganizer/CorpusWorkbench/WorkerBindingEnvelope/v1"u8
+            .ToArray();
     private static readonly ConcurrentDictionary<string, SemaphoreSlim>
         CreationGates = new(StringComparer.OrdinalIgnoreCase);
 
@@ -80,6 +86,44 @@ internal sealed class PilotAuthenticationService
             ResultKeyDomain,
             canonicalResult,
             attestation,
+            cancellationToken);
+
+    internal ValueTask<byte[]> SignConfigurationEnvelopeAsync(
+        ReadOnlyMemory<byte> canonicalEnvelope,
+        CancellationToken cancellationToken) =>
+        ComputeAsync(
+            ConfigurationKeyDomain,
+            canonicalEnvelope,
+            allowCreate: true,
+            cancellationToken);
+
+    internal ValueTask<bool> VerifyConfigurationEnvelopeAsync(
+        ReadOnlyMemory<byte> canonicalEnvelope,
+        ReadOnlyMemory<byte> authenticationTag,
+        CancellationToken cancellationToken) =>
+        VerifyAsync(
+            ConfigurationKeyDomain,
+            canonicalEnvelope,
+            authenticationTag,
+            cancellationToken);
+
+    internal ValueTask<byte[]> SignWorkerBindingEnvelopeAsync(
+        ReadOnlyMemory<byte> canonicalEnvelope,
+        CancellationToken cancellationToken) =>
+        ComputeAsync(
+            WorkerBindingKeyDomain,
+            canonicalEnvelope,
+            allowCreate: false,
+            cancellationToken);
+
+    internal ValueTask<bool> VerifyWorkerBindingEnvelopeAsync(
+        ReadOnlyMemory<byte> canonicalEnvelope,
+        ReadOnlyMemory<byte> authenticationTag,
+        CancellationToken cancellationToken) =>
+        VerifyAsync(
+            WorkerBindingKeyDomain,
+            canonicalEnvelope,
+            authenticationTag,
             cancellationToken);
 
     private async ValueTask<bool> VerifyAsync(

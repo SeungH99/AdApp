@@ -383,6 +383,66 @@ public sealed class ApprovedRootFileStore : IDisposable
         }
     }
 
+    public void RevalidateDirectoryVerified(string relativePath)
+    {
+        var normalized = NormalizeRelativePath(relativePath);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            using var scope = _guard.OpenPinnedDirectoryPath(
+                GetAbsolutePath(normalized));
+            ValidateDirectoryScope(scope, normalized);
+            RevalidateCore();
+        }
+    }
+
+    public VerifiedDirectoryPromotion
+        OpenDirectoryPromotionVerified(string relativePath)
+    {
+        var normalized = NormalizeRelativePath(relativePath);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            var handle =
+                WindowsFileSystemNative
+                    .OpenDirectoryIdentityHandle(
+                        GetAbsolutePath(normalized));
+            try
+            {
+                var identity =
+                    WindowsFileSystemNative.GetFileIdInfo(handle);
+                var result = new VerifiedDirectoryPromotion(
+                    this,
+                    handle,
+                    identity,
+                    normalized);
+                ValidateDirectoryPromotionCore(result);
+                RevalidateCore();
+                return result;
+            }
+            catch
+            {
+                handle.Dispose();
+                throw;
+            }
+        }
+    }
+
+    public void RevalidateDirectoryPromotion(
+        VerifiedDirectoryPromotion directory)
+    {
+        ArgumentNullException.ThrowIfNull(directory);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            ValidateDirectoryPromotionCore(directory);
+            RevalidateCore();
+        }
+    }
+
     public void RevalidateDatabaseFileSet(string relativePath)
     {
         var normalized = NormalizeRelativePath(relativePath);
@@ -598,6 +658,82 @@ public sealed class ApprovedRootFileStore : IDisposable
             }
 
             return promoted;
+        }
+    }
+
+    public bool PromoteVerifiedDirectoryNoReplace(
+        VerifiedDirectoryPromotion source,
+        string destinationRelativePath)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        var destination =
+            NormalizeRelativePath(destinationRelativePath);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            ValidateDirectoryPromotionCore(source);
+            using var promotionHandle =
+                WindowsFileSystemNative
+                    .OpenDirectoryPromotionHandle(
+                        GetAbsolutePath(source.RelativePath));
+            RequireRootVolume(promotionHandle);
+            RequireSameIdentity(
+                source.Identity,
+                WindowsFileSystemNative.GetFileIdInfo(
+                    promotionHandle));
+            RequirePhysicalPath(
+                WindowsFileSystemNative.GetFinalPath(
+                    promotionHandle),
+                GetExpectedPhysicalPath(
+                    source.RelativePath));
+            var destinationParent =
+                Path.GetDirectoryName(GetAbsolutePath(destination))
+                ?? throw Boundary();
+            using var destinationParentScope =
+                _guard.OpenPinnedDirectoryPath(destinationParent);
+            ValidateDirectoryScope(
+                destinationParentScope,
+                GetRelativeParent(destination));
+            using (var existing =
+                   WindowsFileSystemNative.OpenBoundaryProbeHandle(
+                       GetAbsolutePath(destination)))
+            {
+                if (existing is not null)
+                {
+                    RevalidateCore();
+                    return false;
+                }
+            }
+
+            if (!WindowsFileSystemNative.RenameHandleNoReplace(
+                    promotionHandle,
+                    GetAbsolutePath(destination)))
+            {
+                RevalidateCore();
+                return false;
+            }
+
+            source.RelativePath = destination;
+            ValidateDirectoryPromotionCore(source);
+            RequireSameIdentity(
+                source.Identity,
+                WindowsFileSystemNative.GetFileIdInfo(
+                    promotionHandle));
+            RequirePhysicalPath(
+                WindowsFileSystemNative.GetFinalPath(
+                    promotionHandle),
+                GetExpectedPhysicalPath(destination));
+            promotionHandle.Dispose();
+            using var destinationScope =
+                _guard.OpenPinnedDirectoryPath(
+                    GetAbsolutePath(destination));
+            ValidateDirectoryScope(destinationScope, destination);
+            RequireSameIdentity(
+                source.Identity,
+                destinationScope.FinalIdentity);
+            RevalidateCore();
+            return true;
         }
     }
 
@@ -1020,6 +1156,40 @@ public sealed class ApprovedRootFileStore : IDisposable
         }
     }
 
+    private void ValidateDirectoryPromotionCore(
+        VerifiedDirectoryPromotion directory)
+    {
+        if (!ReferenceEquals(directory.Owner, this)
+            || directory.Handle.IsClosed
+            || directory.Handle.IsInvalid)
+        {
+            throw Boundary();
+        }
+
+        var attributes =
+            WindowsFileSystemNative.GetAttributeTagInfo(
+                directory.Handle);
+        if ((attributes.FileAttributes
+                & WindowsFileSystemNative
+                    .FileAttributeReparsePoint) != 0
+            || (attributes.FileAttributes
+                & WindowsFileSystemNative
+                    .FileAttributeDirectory) == 0)
+        {
+            throw Boundary();
+        }
+
+        RequireRootVolume(directory.Handle);
+        RequireSameIdentity(
+            directory.Identity,
+            WindowsFileSystemNative.GetFileIdInfo(
+                directory.Handle));
+        RequirePhysicalPath(
+            WindowsFileSystemNative.GetFinalPath(
+                directory.Handle),
+            GetExpectedPhysicalPath(directory.RelativePath));
+    }
+
     private void ThrowIfDisposed()
     {
         if (_rootScope is null)
@@ -1038,6 +1208,39 @@ public sealed class FileStoreEntryAlreadyExistsException : IOException
     internal FileStoreEntryAlreadyExistsException()
         : base("The approved-root entry already exists.")
     {
+    }
+}
+
+public sealed class VerifiedDirectoryPromotion : IDisposable
+{
+    private SafeFileHandle? _handle;
+
+    internal VerifiedDirectoryPromotion(
+        ApprovedRootFileStore owner,
+        SafeFileHandle handle,
+        WindowsFileSystemNative.FILE_ID_INFO identity,
+        string relativePath)
+    {
+        Owner = owner;
+        _handle = handle;
+        Identity = identity;
+        RelativePath = relativePath;
+    }
+
+    internal ApprovedRootFileStore Owner { get; }
+
+    internal SafeFileHandle Handle =>
+        _handle
+        ?? throw new ObjectDisposedException(
+            nameof(VerifiedDirectoryPromotion));
+
+    internal WindowsFileSystemNative.FILE_ID_INFO Identity { get; }
+
+    internal string RelativePath { get; set; }
+
+    public void Dispose()
+    {
+        Interlocked.Exchange(ref _handle, null)?.Dispose();
     }
 }
 

@@ -914,6 +914,75 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             },
             cancellationToken);
 
+    internal Task<PristinePilotSnapshot>
+        ReadPristinePilotSnapshotAsync(
+        CancellationToken cancellationToken,
+        Action<PristinePilotReadPoint>? observeRead = null) =>
+        ExecuteApprovalReadAsync(
+            async (connection, transaction) =>
+            {
+                observeRead?.Invoke(
+                    PristinePilotReadPoint.BeforeCountsRead);
+                cancellationToken.ThrowIfCancellationRequested();
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = """
+                    SELECT
+                      (SELECT COUNT(*) FROM source_receipts),
+                      (SELECT COUNT(*) FROM documents),
+                      (SELECT COUNT(*) FROM label_revisions),
+                      (SELECT COUNT(*) FROM approval_entries),
+                      (SELECT COUNT(*) FROM checkpoints),
+                      (SELECT COUNT(*) FROM sqlite_sequence);
+                    """;
+                await using var reader =
+                    await command.ExecuteReaderAsync(
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                if (!await reader.ReadAsync(cancellationToken)
+                        .ConfigureAwait(false))
+                {
+                    throw InvalidState();
+                }
+
+                var counts = new long[6];
+                for (var index = 0; index < counts.Length; index++)
+                {
+                    counts[index] = reader.GetInt64(index);
+                }
+
+                if (await reader.ReadAsync(cancellationToken)
+                        .ConfigureAwait(false))
+                {
+                    throw InvalidState();
+                }
+
+                observeRead?.Invoke(
+                    PristinePilotReadPoint.AfterCountsRead);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (counts.ContainsAnyExcept(0))
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.VaultBoundaryViolation);
+                }
+
+                var canonical =
+                    "corpus-workbench-pristine-snapshot-v1\n"
+                    + string.Join(
+                        '\n',
+                        counts.ToArray()
+                            .Select(static count =>
+                                count.ToString(
+                                    CultureInfo.InvariantCulture)))
+                    + "\n";
+                return new PristinePilotSnapshot(
+                    Convert.ToHexStringLower(
+                        SHA256.HashData(
+                            System.Text.Encoding.UTF8.GetBytes(
+                                canonical))));
+            },
+            cancellationToken);
+
     internal async Task<T> ExecuteApprovalWriteAsync<T>(
         Func<SqliteConnection, SqliteTransaction, Task<T>> operation,
         CancellationToken cancellationToken)
@@ -3246,6 +3315,15 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
 
     private static WorkbenchException InvalidState() =>
         new(WorkbenchFailureCode.InvalidState);
+}
+
+internal sealed record PristinePilotSnapshot(
+    string SnapshotSha256);
+
+internal enum PristinePilotReadPoint
+{
+    BeforeCountsRead,
+    AfterCountsRead,
 }
 
 internal enum PilotLabelReadPoint

@@ -244,25 +244,38 @@ public sealed class ApprovalLedgerService
             {
                 var ledger = await ReadLedgerAsync(
                         connection,
-                        transaction)
+                        transaction,
+                        MaximumPilotLedgerRowCount,
+                        cancellationToken,
+                        _observePilotRead)
                     .ConfigureAwait(false);
-                RequireValidLedger(ledger);
+                RequireValidLedger(
+                    ledger,
+                    cancellationToken,
+                    _observePilotRead);
                 var states =
-                    await _store.ReadAllApprovalLabelStatesAsync(
+                    await _store.ReadAllPilotLabelStatesAsync(
                             connection,
-                            transaction)
+                            transaction,
+                            PilotCatalog.HeldOutTargetPerMarket * 2,
+                            cancellationToken,
+                            ObservePilotLabelRead)
                         .ConfigureAwait(false);
                 var selection = SelectBatchBindings(
                     decision.MarketId,
                     ledger.Rows,
                     states,
-                    requireExactDirectCount: true);
+                    requireExactDirectCount: true,
+                    cancellationToken);
                 RequireBatchDecisionTime(
                     decision.ApprovedAtUtc,
                     ledger.Rows,
-                    selection);
+                    selection,
+                    cancellationToken);
                 var actualSummary =
-                    ComputeBatchSummarySha256(selection.Delegated);
+                    ComputeBatchSummarySha256(
+                        selection.Delegated,
+                        cancellationToken);
                 if (!FixedEquals(
                         actualSummary,
                         decision.BatchSummarySha256))
@@ -283,7 +296,9 @@ public sealed class ApprovalLedgerService
                         connection,
                         transaction,
                         ledger,
-                        payload)
+                        payload,
+                        cancellationToken,
+                        MaximumPilotLedgerRowCount)
                     .ConfigureAwait(false);
             },
             cancellationToken).ConfigureAwait(false);
@@ -311,13 +326,22 @@ public sealed class ApprovalLedgerService
             {
                 var ledger = await ReadLedgerAsync(
                         connection,
-                        transaction)
+                        transaction,
+                        MaximumPilotLedgerRowCount,
+                        cancellationToken,
+                        _observePilotRead)
                     .ConfigureAwait(false);
-                RequireValidLedger(ledger);
+                RequireValidLedger(
+                    ledger,
+                    cancellationToken,
+                    _observePilotRead);
                 var states =
-                    await _store.ReadAllApprovalLabelStatesAsync(
+                    await _store.ReadAllPilotLabelStatesAsync(
                             connection,
-                            transaction)
+                            transaction,
+                            PilotCatalog.HeldOutTargetPerMarket * 2,
+                            cancellationToken,
+                            ObservePilotLabelRead)
                         .ConfigureAwait(false);
                 var existing = ledger.Rows
                     .Where(row =>
@@ -334,7 +358,12 @@ public sealed class ApprovalLedgerService
                     if (IsCurrentBatchApproval(
                             existing,
                             ledger.Rows,
-                            states))
+                            states,
+                            cancellationToken)
+                        && string.Equals(
+                            existing.Payload!.ReviewerId,
+                            reviewerId,
+                            StringComparison.Ordinal))
                     {
                         return existing.ToEntry();
                     }
@@ -347,7 +376,8 @@ public sealed class ApprovalLedgerService
                     marketId,
                     ledger.Rows,
                     states,
-                    requireExactDirectCount: true);
+                    requireExactDirectCount: true,
+                    cancellationToken);
                 var referencedIds = selection.Delegated
                     .Concat(selection.Direct)
                     .Select(static item => item.EntryId)
@@ -363,9 +393,12 @@ public sealed class ApprovalLedgerService
                 RequireBatchDecisionTime(
                     approvedAtUtc,
                     ledger.Rows,
-                    selection);
+                    selection,
+                    cancellationToken);
                 var summary =
-                    ComputeBatchSummarySha256(selection.Delegated);
+                    ComputeBatchSummarySha256(
+                        selection.Delegated,
+                        cancellationToken);
                 var decision = new BatchApprovalDecision(
                     marketId,
                     reviewerId,
@@ -382,7 +415,9 @@ public sealed class ApprovalLedgerService
                         connection,
                         transaction,
                         ledger,
-                        payload)
+                        payload,
+                        cancellationToken,
+                        MaximumPilotLedgerRowCount)
                     .ConfigureAwait(false);
             },
             cancellationToken).ConfigureAwait(false);
@@ -841,7 +876,10 @@ public sealed class ApprovalLedgerService
                         connection,
                         transaction)
                     .ConfigureAwait(false);
-                RequireValidLedger(ledger);
+                RequireValidLedger(
+                    ledger,
+                    cancellationToken,
+                    _observePilotRead);
                 var state =
                     await _store.ReadApprovalLabelStateAsync(
                             connection,
@@ -881,7 +919,8 @@ public sealed class ApprovalLedgerService
                         connection,
                         transaction,
                         ledger,
-                        payload)
+                        payload,
+                        cancellationToken)
                     .ConfigureAwait(false);
             },
             cancellationToken);
@@ -890,8 +929,11 @@ public sealed class ApprovalLedgerService
         SqliteConnection connection,
         SqliteTransaction transaction,
         ApprovalLedgerSnapshot ledger,
-        ApprovalDecisionPayload payload)
+        ApprovalDecisionPayload payload,
+        CancellationToken cancellationToken = default,
+        int? maximumLedgerRowCount = null)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var rows = ledger.Rows;
         var canonical = CanonicalApprovalDecision.Serialize(payload);
         var entryId = CreateEntryId(canonical);
@@ -910,7 +952,8 @@ public sealed class ApprovalLedgerService
                 throw InvalidState();
             }
 
-            await VerifyWorkerAsync(CancellationToken.None)
+            cancellationToken.ThrowIfCancellationRequested();
+            await VerifyWorkerAsync(cancellationToken)
                 .ConfigureAwait(false);
             return exact.ToEntry();
         }
@@ -954,7 +997,7 @@ public sealed class ApprovalLedgerService
                 SqliteType.Blob);
             canonicalParameter.Value = canonical;
             if (await command.ExecuteNonQueryAsync(
-                    CancellationToken.None)
+                    cancellationToken)
                 .ConfigureAwait(false) != 1)
             {
                 throw InvalidState();
@@ -972,16 +1015,23 @@ public sealed class ApprovalLedgerService
                     sequence,
                     rows.Count + 1L,
                     entryId,
-                    entrySha256))
+                    entrySha256),
+                cancellationToken)
             .ConfigureAwait(false);
         _injectFault?.Invoke(
             ApprovalLedgerFaultPoint.AfterInsertBeforeCommit);
         var appended = await ReadLedgerAsync(
                 connection,
-                transaction)
+                transaction,
+                maximumLedgerRowCount,
+                cancellationToken,
+                _observePilotRead)
             .ConfigureAwait(false);
-        RequireValidLedger(appended);
-        await VerifyWorkerAsync(CancellationToken.None)
+        RequireValidLedger(
+            appended,
+            cancellationToken,
+            _observePilotRead);
+        await VerifyWorkerAsync(cancellationToken)
             .ConfigureAwait(false);
         return ApprovalLedgerRow.Valid(
                 sequence,
@@ -1285,18 +1335,22 @@ public sealed class ApprovalLedgerService
     private static void RequireBatchDecisionTime(
         DateTimeOffset approvedAtUtc,
         IReadOnlyList<ApprovalLedgerRow> rows,
-        BatchSelection selection)
+        BatchSelection selection,
+        CancellationToken cancellationToken = default)
     {
         var referencedIds = selection.Delegated
             .Concat(selection.Direct)
             .Select(static item => item.EntryId)
             .ToHashSet(StringComparer.Ordinal);
-        if (rows.Any(row =>
-                referencedIds.Contains(row.EntryId)
-                && row.Payload is { } payload
-                && approvedAtUtc < payload.ApprovedAtUtc))
+        foreach (var row in rows)
         {
-            throw InvalidArguments();
+            cancellationToken.ThrowIfCancellationRequested();
+            if (referencedIds.Contains(row.EntryId)
+                && row.Payload is { } payload
+                && approvedAtUtc < payload.ApprovedAtUtc)
+            {
+                throw InvalidArguments();
+            }
         }
     }
 
@@ -1841,7 +1895,8 @@ public sealed class ApprovalLedgerService
     private static async Task WriteAnchorAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
-        ApprovalLedgerAnchor anchor)
+        ApprovalLedgerAnchor anchor,
+        CancellationToken cancellationToken)
     {
         var canonical =
             CanonicalApprovalLedgerAnchor.Serialize(anchor);
@@ -1871,7 +1926,7 @@ public sealed class ApprovalLedgerService
             "$canonical_json",
             SqliteType.Blob);
         canonicalParameter.Value = canonical;
-        if (await command.ExecuteNonQueryAsync(CancellationToken.None)
+        if (await command.ExecuteNonQueryAsync(cancellationToken)
                 .ConfigureAwait(false) != 1)
         {
             throw InvalidState();
@@ -1931,11 +1986,21 @@ public sealed class ApprovalLedgerService
     }
 
     private void RequireValidLedger(
-        ApprovalLedgerSnapshot ledger)
+        ApprovalLedgerSnapshot ledger,
+        CancellationToken cancellationToken,
+        Action<ApprovalPilotReadPoint>? observePilotRead)
     {
-        var invalid = FindChainFailures(ledger.Rows);
-        FindLedgerSemanticFailures(ledger.Rows, invalid);
+        var invalid = FindChainFailures(
+            ledger.Rows,
+            cancellationToken,
+            observePilotRead);
+        FindLedgerSemanticFailures(
+            ledger.Rows,
+            invalid,
+            cancellationToken,
+            observePilotRead);
         FindAnchorFailures(ledger, invalid);
+        cancellationToken.ThrowIfCancellationRequested();
         if (invalid.Count != 0)
         {
             throw new WorkbenchException(
