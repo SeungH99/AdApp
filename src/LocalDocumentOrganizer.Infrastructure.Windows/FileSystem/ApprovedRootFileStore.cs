@@ -443,6 +443,310 @@ public sealed class ApprovedRootFileStore : IDisposable
         }
     }
 
+    public VerifiedDirectoryCleanup OpenDirectoryCleanupGuardian(
+        VerifiedDirectoryPromotion directory)
+    {
+        ArgumentNullException.ThrowIfNull(directory);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            ValidateDirectoryPromotionCore(directory);
+            var handle = WindowsFileSystemNative
+                .OpenDirectoryCleanupGuardianHandle(
+                    GetAbsolutePath(directory.RelativePath));
+            try
+            {
+                var cleanup = new VerifiedDirectoryCleanup(
+                    this,
+                    handle,
+                    directory.Identity,
+                    directory.RelativePath);
+                ValidateDirectoryCleanupCore(cleanup);
+                RevalidateCore();
+                return cleanup;
+            }
+            catch
+            {
+                handle.Dispose();
+                throw;
+            }
+        }
+    }
+
+    public bool QuarantineDirectoryNoReplace(
+        VerifiedDirectoryPromotion directory,
+        VerifiedDirectoryCleanup cleanup,
+        string destinationRelativePath)
+    {
+        ArgumentNullException.ThrowIfNull(directory);
+        ArgumentNullException.ThrowIfNull(cleanup);
+        var destination =
+            NormalizeRelativePath(destinationRelativePath);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            ValidateDirectoryPromotionCore(directory);
+            ValidateDirectoryCleanupCore(cleanup);
+            RequireSameIdentity(directory.Identity, cleanup.Identity);
+            if (!string.Equals(
+                    directory.RelativePath,
+                    cleanup.RelativePath,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    GetRelativeParent(cleanup.RelativePath),
+                    GetRelativeParent(destination),
+                    StringComparison.Ordinal))
+            {
+                throw Boundary();
+            }
+
+            var destinationParent =
+                Path.GetDirectoryName(GetAbsolutePath(destination))
+                ?? throw Boundary();
+            using var destinationParentScope =
+                _guard.OpenPinnedDirectoryPath(destinationParent);
+            ValidateDirectoryScope(
+                destinationParentScope,
+                GetRelativeParent(destination));
+            if (!WindowsFileSystemNative.RenameHandleNoReplace(
+                    cleanup.Handle,
+                    GetAbsolutePath(destination)))
+            {
+                ValidateDirectoryCleanupCore(cleanup);
+                RevalidateCore();
+                return false;
+            }
+
+            directory.RelativePath = destination;
+            cleanup.RelativePath = destination;
+            ValidateDirectoryCleanupCore(cleanup);
+            ValidateDirectoryPromotionCore(directory);
+            RevalidateCore();
+            return true;
+        }
+    }
+
+    public void DeleteBoundedOwnedDirectoryTree(
+        VerifiedDirectoryCleanup cleanup,
+        IReadOnlySet<string> allowedFilePaths,
+        IReadOnlySet<string> allowedDirectoryPaths,
+        int maximumEntryCount,
+        long maximumTotalBytes,
+        TimeSpan maximumDuration)
+    {
+        ArgumentNullException.ThrowIfNull(cleanup);
+        ArgumentNullException.ThrowIfNull(allowedFilePaths);
+        ArgumentNullException.ThrowIfNull(allowedDirectoryPaths);
+        if (maximumEntryCount < 0
+            || maximumTotalBytes < 0
+            || maximumDuration <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumEntryCount));
+        }
+
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            ValidateDirectoryCleanupCore(cleanup);
+            var started = Stopwatch.GetTimestamp();
+            var opened = new List<OwnedCleanupEntry>(
+                Math.Min(maximumEntryCount, 32));
+            try
+            {
+                var entryCount = 0;
+                long totalBytes = 0;
+                var directories =
+                    new Queue<(string StorePath, string OwnedPath)>();
+                directories.Enqueue((cleanup.RelativePath, string.Empty));
+                while (directories.Count != 0)
+                {
+                    var parent = directories.Dequeue();
+                    foreach (var path in
+                             Directory.EnumerateFileSystemEntries(
+                                 GetAbsolutePath(parent.StorePath),
+                                 "*",
+                                 SearchOption.TopDirectoryOnly))
+                    {
+                        entryCount = checked(entryCount + 1);
+                        if (entryCount > maximumEntryCount
+                            || Stopwatch.GetElapsedTime(started)
+                                > maximumDuration)
+                        {
+                            throw Boundary();
+                        }
+
+                        var name = Path.GetFileName(path);
+                        if (string.IsNullOrEmpty(name))
+                        {
+                            throw Boundary();
+                        }
+
+                        var relativePath = NormalizeRelativePath(
+                            Path.Combine(parent.StorePath, name));
+                        var ownedPath = string.IsNullOrEmpty(
+                            parent.OwnedPath)
+                            ? name
+                            : Path.Combine(parent.OwnedPath, name);
+                        SafeFileHandle? handle = null;
+                        try
+                        {
+                            handle = WindowsFileSystemNative
+                                .OpenCleanupEntryHandle(
+                                    GetAbsolutePath(relativePath));
+                            var attributes =
+                                WindowsFileSystemNative
+                                    .GetAttributeTagInfo(handle);
+                            if ((attributes.FileAttributes
+                                    & WindowsFileSystemNative
+                                        .FileAttributeReparsePoint) != 0)
+                            {
+                                throw Boundary();
+                            }
+
+                            var isDirectory =
+                                (attributes.FileAttributes
+                                    & WindowsFileSystemNative
+                                        .FileAttributeDirectory) != 0;
+                            RequireRootVolume(handle);
+                            RequirePhysicalPath(
+                                WindowsFileSystemNative.GetFinalPath(
+                                    handle),
+                                GetExpectedPhysicalPath(relativePath));
+                            if (WindowsFileSystemNative.GetLinkCount(
+                                    handle)
+                                != 1)
+                            {
+                                throw Boundary();
+                            }
+
+                            if (isDirectory)
+                            {
+                                if (!allowedDirectoryPaths.Contains(
+                                        ownedPath))
+                                {
+                                    throw Boundary();
+                                }
+
+                                directories.Enqueue(
+                                    (relativePath, ownedPath));
+                            }
+                            else
+                            {
+                                if (!allowedFilePaths.Contains(
+                                        ownedPath))
+                                {
+                                    throw Boundary();
+                                }
+
+                                var length =
+                                    RandomAccess.GetLength(handle);
+                                if (length < 0)
+                                {
+                                    throw Boundary();
+                                }
+
+                                totalBytes = checked(
+                                    totalBytes + length);
+                                if (totalBytes > maximumTotalBytes)
+                                {
+                                    throw Boundary();
+                                }
+                            }
+
+                            opened.Add(
+                                new OwnedCleanupEntry(
+                                    handle,
+                                    relativePath,
+                                    ownedPath,
+                                    isDirectory));
+                            handle = null;
+                        }
+                        finally
+                        {
+                            handle?.Dispose();
+                        }
+                    }
+                }
+
+                if (Stopwatch.GetElapsedTime(started)
+                    > maximumDuration)
+                {
+                    throw Boundary();
+                }
+
+                ValidateDirectoryCleanupCore(cleanup);
+                foreach (var entry in opened.Where(
+                             static entry => !entry.IsDirectory))
+                {
+                    DeleteCleanupEntry(entry);
+                }
+
+                foreach (var entry in opened
+                             .Where(static entry => entry.IsDirectory)
+                             .OrderByDescending(static entry =>
+                                 entry.OwnedRelativePath.Count(
+                                     static character =>
+                                         character
+                                         == Path.DirectorySeparatorChar)))
+                {
+                    if (Directory.EnumerateFileSystemEntries(
+                            GetAbsolutePath(entry.RelativePath),
+                            "*",
+                            SearchOption.TopDirectoryOnly)
+                        .Take(1)
+                        .Any())
+                    {
+                        throw Boundary();
+                    }
+
+                    DeleteCleanupEntry(entry);
+                }
+
+                ValidateDirectoryCleanupCore(cleanup);
+                if (Directory.EnumerateFileSystemEntries(
+                        GetAbsolutePath(cleanup.RelativePath),
+                        "*",
+                        SearchOption.TopDirectoryOnly)
+                    .Take(1)
+                    .Any()
+                    || Stopwatch.GetElapsedTime(started)
+                        > maximumDuration)
+                {
+                    throw Boundary();
+                }
+
+                WindowsFileSystemNative.MarkDeleteOnClose(
+                    cleanup.Handle);
+                cleanup.MarkDeletePending();
+            }
+            catch (Exception exception) when (
+                exception is IOException
+                    or UnauthorizedAccessException
+                    or OverflowException
+                    or System.Security.SecurityException)
+            {
+                throw Boundary();
+            }
+            finally
+            {
+                foreach (var entry in opened)
+                {
+                    entry.Dispose();
+                }
+            }
+        }
+    }
+
+    private static void DeleteCleanupEntry(OwnedCleanupEntry entry)
+    {
+        WindowsFileSystemNative.MarkDeleteOnClose(entry.Handle);
+        entry.Dispose();
+    }
+
     public void RevalidateDatabaseFileSet(string relativePath)
     {
         var normalized = NormalizeRelativePath(relativePath);
@@ -1190,6 +1494,40 @@ public sealed class ApprovedRootFileStore : IDisposable
             GetExpectedPhysicalPath(directory.RelativePath));
     }
 
+    private void ValidateDirectoryCleanupCore(
+        VerifiedDirectoryCleanup cleanup)
+    {
+        if (!ReferenceEquals(cleanup.Owner, this)
+            || cleanup.Handle.IsClosed
+            || cleanup.Handle.IsInvalid
+            || cleanup.DeletePending)
+        {
+            throw Boundary();
+        }
+
+        var attributes =
+            WindowsFileSystemNative.GetAttributeTagInfo(cleanup.Handle);
+        if ((attributes.FileAttributes
+                & WindowsFileSystemNative
+                    .FileAttributeReparsePoint) != 0
+            || (attributes.FileAttributes
+                & WindowsFileSystemNative
+                    .FileAttributeDirectory) == 0
+            || WindowsFileSystemNative.GetLinkCount(cleanup.Handle)
+                != 1)
+        {
+            throw Boundary();
+        }
+
+        RequireRootVolume(cleanup.Handle);
+        RequireSameIdentity(
+            cleanup.Identity,
+            WindowsFileSystemNative.GetFileIdInfo(cleanup.Handle));
+        RequirePhysicalPath(
+            WindowsFileSystemNative.GetFinalPath(cleanup.Handle),
+            GetExpectedPhysicalPath(cleanup.RelativePath));
+    }
+
     private void ThrowIfDisposed()
     {
         if (_rootScope is null)
@@ -1237,6 +1575,79 @@ public sealed class VerifiedDirectoryPromotion : IDisposable
     internal WindowsFileSystemNative.FILE_ID_INFO Identity { get; }
 
     internal string RelativePath { get; set; }
+
+    public void Dispose()
+    {
+        Interlocked.Exchange(ref _handle, null)?.Dispose();
+    }
+}
+
+public sealed class VerifiedDirectoryCleanup : IDisposable
+{
+    private SafeFileHandle? _handle;
+    private int _deletePending;
+
+    internal VerifiedDirectoryCleanup(
+        ApprovedRootFileStore owner,
+        SafeFileHandle handle,
+        WindowsFileSystemNative.FILE_ID_INFO identity,
+        string relativePath)
+    {
+        Owner = owner;
+        _handle = handle;
+        Identity = identity;
+        RelativePath = relativePath;
+    }
+
+    internal ApprovedRootFileStore Owner { get; }
+
+    internal SafeFileHandle Handle =>
+        _handle
+        ?? throw new ObjectDisposedException(
+            nameof(VerifiedDirectoryCleanup));
+
+    internal WindowsFileSystemNative.FILE_ID_INFO Identity { get; }
+
+    internal string RelativePath { get; set; }
+
+    internal bool DeletePending =>
+        Volatile.Read(ref _deletePending) != 0;
+
+    internal void MarkDeletePending() =>
+        Volatile.Write(ref _deletePending, 1);
+
+    public void Dispose()
+    {
+        Interlocked.Exchange(ref _handle, null)?.Dispose();
+    }
+}
+
+internal sealed class OwnedCleanupEntry : IDisposable
+{
+    private SafeFileHandle? _handle;
+
+    internal OwnedCleanupEntry(
+        SafeFileHandle handle,
+        string relativePath,
+        string ownedRelativePath,
+        bool isDirectory)
+    {
+        _handle = handle;
+        RelativePath = relativePath;
+        OwnedRelativePath = ownedRelativePath;
+        IsDirectory = isDirectory;
+    }
+
+    internal SafeFileHandle Handle =>
+        _handle
+        ?? throw new ObjectDisposedException(
+            nameof(OwnedCleanupEntry));
+
+    internal string RelativePath { get; }
+
+    internal string OwnedRelativePath { get; }
+
+    internal bool IsDirectory { get; }
 
     public void Dispose()
     {

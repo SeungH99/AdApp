@@ -176,6 +176,8 @@ internal sealed class WorkbenchCommandExecutor
         _injectInitializationFault;
     private readonly Action<WorkbenchPendingValidationPoint>?
         _observePendingValidation;
+    private readonly Func<int, string>?
+        _createInitializationQuarantineName;
     private const string ConfigurationFileName =
         "workbench.configuration.json";
     private const string WorkerBindingFileName =
@@ -184,6 +186,36 @@ internal sealed class WorkbenchCommandExecutor
         AuthenticatedVaultEnvelope.MaximumEnvelopeBytes;
     private const int MaximumCatalogBytes = 128 * 1024;
     private const int MaximumReceiptBytes = 64 * 1024;
+    private const int MaximumInitializationCleanupEntries = 13;
+    private const long MaximumInitializationCleanupBytes =
+        8L * 1024 * 1024;
+    private const int MaximumInitializationQuarantineAttempts = 8;
+    private static readonly TimeSpan
+        MaximumInitializationCleanupDuration =
+            TimeSpan.FromSeconds(10);
+    private static readonly IReadOnlySet<string>
+        InitializationCleanupFileNames =
+            new HashSet<string>(StringComparer.Ordinal)
+            {
+                "workbench.db",
+                "vault.keys",
+                "vault.keys.admission.lock",
+                "vault.keys.lock",
+                "vault.keys.rebuild.lock",
+                "vault.keys.writer-intent.lock",
+                ConfigurationFileName,
+            };
+    private static readonly IReadOnlySet<string>
+        InitializationCleanupDirectoryNames =
+            new HashSet<string>(StringComparer.Ordinal)
+            {
+                "objects",
+                Path.Combine("objects", ".staging"),
+                Path.Combine("objects", "sha256"),
+                "previews",
+                Path.Combine("previews", ".staging"),
+                "checkpoints",
+            };
     private const string EmptyLedgerSha256 =
         "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -230,10 +262,14 @@ internal sealed class WorkbenchCommandExecutor
         Action<WorkbenchInitializationFaultPoint>?
             injectInitializationFault = null,
         Action<WorkbenchPendingValidationPoint>?
-            observePendingValidation = null)
+            observePendingValidation = null,
+        Func<int, string>?
+            createInitializationQuarantineName = null)
     {
         _injectInitializationFault = injectInitializationFault;
         _observePendingValidation = observePendingValidation;
+        _createInitializationQuarantineName =
+            createInitializationQuarantineName;
     }
 
     public async Task ExecuteAsync(
@@ -924,14 +960,10 @@ internal sealed class WorkbenchCommandExecutor
             {
                 try
                 {
-                    parentStore.RevalidateDirectoryPromotion(
-                        stagingDirectory);
-                    if (Directory.Exists(staging))
-                    {
-                        DeletePrivateStagingDirectory(
-                            parent,
-                            staging);
-                    }
+                    CleanupFailedInitialization(
+                        parentStore,
+                        stagingDirectory,
+                        leaf);
                 }
                 catch
                 {
@@ -941,6 +973,68 @@ internal sealed class WorkbenchCommandExecutor
 
             stagingDirectory?.Dispose();
         }
+    }
+
+    private void CleanupFailedInitialization(
+        ApprovedRootFileStore parentStore,
+        VerifiedDirectoryPromotion stagingDirectory,
+        string vaultLeaf)
+    {
+        _injectInitializationFault?.Invoke(
+            WorkbenchInitializationFaultPoint
+                .BeforeCleanupGuardianAcquisition);
+        using var cleanup =
+            parentStore.OpenDirectoryCleanupGuardian(
+                stagingDirectory);
+        var quarantined = false;
+        for (var attempt = 0;
+             attempt < MaximumInitializationQuarantineAttempts;
+             attempt++)
+        {
+            var quarantineName =
+                _createInitializationQuarantineName?.Invoke(attempt)
+                ?? $".{vaultLeaf}.cleanup-"
+                + RandomNumberGenerator.GetHexString(
+                    32,
+                    lowercase: true);
+            if (!quarantineName.StartsWith(
+                    $".{vaultLeaf}.cleanup-",
+                    StringComparison.Ordinal)
+                || quarantineName.Contains(
+                    Path.DirectorySeparatorChar)
+                || quarantineName.Contains(
+                    Path.AltDirectorySeparatorChar))
+            {
+                throw new WorkbenchException(
+                    WorkbenchFailureCode.VaultBoundaryViolation);
+            }
+
+            if (parentStore.QuarantineDirectoryNoReplace(
+                    stagingDirectory,
+                    cleanup,
+                    quarantineName))
+            {
+                quarantined = true;
+                break;
+            }
+        }
+
+        if (!quarantined)
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.VaultBoundaryViolation);
+        }
+
+        _injectInitializationFault?.Invoke(
+            WorkbenchInitializationFaultPoint
+                .AfterCleanupQuarantine);
+        parentStore.DeleteBoundedOwnedDirectoryTree(
+            cleanup,
+            InitializationCleanupFileNames,
+            InitializationCleanupDirectoryNames,
+            MaximumInitializationCleanupEntries,
+            MaximumInitializationCleanupBytes,
+            MaximumInitializationCleanupDuration);
     }
 
     private async Task ValidateAsync(
@@ -1693,24 +1787,6 @@ internal sealed class WorkbenchCommandExecutor
         }
     }
 
-    private static void DeletePrivateStagingDirectory(
-        string expectedParent,
-        string staging)
-    {
-        var parent = Path.TrimEndingDirectorySeparator(
-            Path.GetFullPath(expectedParent));
-        var candidate = Path.TrimEndingDirectorySeparator(
-            Path.GetFullPath(staging));
-        var relative = Path.GetRelativePath(parent, candidate);
-        if (relative.StartsWith(".", StringComparison.Ordinal)
-            && relative.Contains(".initialize-", StringComparison.Ordinal)
-            && !relative.Contains(Path.DirectorySeparatorChar)
-            && !relative.Contains(Path.AltDirectorySeparatorChar))
-        {
-            Directory.Delete(candidate, recursive: true);
-        }
-    }
-
     private static bool IsSafeToken(
         string? value,
         int maximumLength) =>
@@ -1908,6 +1984,8 @@ internal enum WorkbenchInitializationFaultPoint
 {
     BeforeStagingVerification = 0,
     BeforePublish = 1,
+    AfterCleanupQuarantine = 2,
+    BeforeCleanupGuardianAcquisition = 3,
 }
 
 internal enum WorkbenchPendingValidationPoint

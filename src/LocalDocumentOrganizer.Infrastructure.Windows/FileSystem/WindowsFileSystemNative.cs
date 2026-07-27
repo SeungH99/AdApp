@@ -314,6 +314,50 @@ internal static class WindowsFileSystemNative
         return handle;
     }
 
+    internal static SafeFileHandle OpenDirectoryCleanupGuardianHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            FileListDirectory | FileReadAttributes | Delete,
+            FileShareRead | FileShareWrite,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        return handle;
+    }
+
+    internal static SafeFileHandle OpenCleanupEntryHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            FileReadAttributes | Delete,
+            FileShareRead | FileShareWrite,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        return handle;
+    }
+
     internal static SafeFileHandle OpenDirectoryIdentityHandle(
         string canonicalPath)
     {
