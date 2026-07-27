@@ -31,7 +31,8 @@ namespace LocalDocumentOrganizer.CorpusWorkbench.Review;
 public sealed record ReviewHostOptions(
     string VaultRoot,
     string ReviewerId,
-    bool OpenBrowser);
+    bool OpenBrowser,
+    string CatalogEpoch = "local-review-v1");
 
 [JsonConverter(typeof(StrictReviewDecisionKindConverter))]
 public enum ReviewDecisionKind
@@ -131,6 +132,22 @@ internal interface IReviewDataSource : IAsyncDisposable
         CancellationToken cancellationToken);
 }
 
+internal interface IReviewHostRunSession : IAsyncDisposable
+{
+    Uri NavigationUri { get; }
+
+    Task WaitForShutdownAsync(
+        CancellationToken cancellationToken);
+}
+
+internal interface IReviewHostRunner
+{
+    Task<IReviewHostRunSession> StartAsync(
+        ReviewHostOptions options,
+        IReviewDataSource dataSource,
+        CancellationToken cancellationToken);
+}
+
 public static class ReviewHost
 {
     internal const string SessionHeaderName =
@@ -173,17 +190,41 @@ public static class ReviewHost
 
     public static async Task RunAsync(
         ReviewHostOptions options,
+        CancellationToken cancellationToken) =>
+        await RunAsync(
+                options,
+                workerPackageRoot: null,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    internal static async Task RunAsync(
+        ReviewHostOptions options,
+        string? workerPackageRoot,
+        CancellationToken cancellationToken) =>
+        await RunAsync(
+                options,
+                workerPackageRoot,
+                new ProductionReviewHostRunner(),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    internal static async Task RunAsync(
+        ReviewHostOptions options,
+        string? workerPackageRoot,
+        IReviewHostRunner runner,
         CancellationToken cancellationToken)
     {
         try
         {
             ValidateOptions(options);
+            ArgumentNullException.ThrowIfNull(runner);
             var dataSource =
                 await CorpusReviewDataSource.OpenAsync(
                         options,
-                        cancellationToken)
+                        cancellationToken,
+                        workerPackageRoot: workerPackageRoot)
                     .ConfigureAwait(false);
-            await using var session = await StartAsync(
+            await using var session = await runner.StartAsync(
                     options,
                     dataSource,
                     cancellationToken)
@@ -210,6 +251,20 @@ public static class ReviewHost
             throw new WorkbenchException(
                 WorkbenchFailureCode.InvalidState);
         }
+    }
+
+    private sealed class ProductionReviewHostRunner
+        : IReviewHostRunner
+    {
+        public async Task<IReviewHostRunSession> StartAsync(
+            ReviewHostOptions options,
+            IReviewDataSource dataSource,
+            CancellationToken cancellationToken) =>
+            await ReviewHost.StartAsync(
+                    options,
+                    dataSource,
+                    cancellationToken)
+                .ConfigureAwait(false);
     }
 
     internal static async Task<ReviewHostSession> StartAsync(
@@ -787,7 +842,8 @@ public static class ReviewHost
     {
         if (options is null
             || !Path.IsPathFullyQualified(options.VaultRoot)
-            || !IsNormalizedIdentifier(options.ReviewerId))
+            || !IsNormalizedIdentifier(options.ReviewerId)
+            || !IsNormalizedIdentifier(options.CatalogEpoch))
         {
             throw new WorkbenchException(
                 WorkbenchFailureCode.InvalidArguments);
@@ -826,7 +882,8 @@ public static class ReviewHost
     private sealed class RequestBodyTooLargeException : Exception;
 }
 
-internal sealed class ReviewHostSession : IAsyncDisposable
+internal sealed class ReviewHostSession :
+    IReviewHostRunSession
 {
     private WebApplication? _application;
     private IReviewDataSource? _dataSource;
@@ -854,6 +911,8 @@ internal sealed class ReviewHostSession : IAsyncDisposable
 
     internal Uri NavigationUri { get; }
 
+    Uri IReviewHostRunSession.NavigationUri => NavigationUri;
+
     internal async Task WaitForShutdownAsync(
         CancellationToken cancellationToken)
     {
@@ -863,6 +922,10 @@ internal sealed class ReviewHostSession : IAsyncDisposable
         await application.WaitForShutdownAsync(cancellationToken)
             .ConfigureAwait(false);
     }
+
+    Task IReviewHostRunSession.WaitForShutdownAsync(
+        CancellationToken cancellationToken) =>
+        WaitForShutdownAsync(cancellationToken);
 
     internal void BeginShutdown() =>
         Volatile.Read(ref _sessionState)?.Deactivate();
@@ -985,8 +1048,6 @@ internal sealed class ReviewSessionState
 
 internal sealed class CorpusReviewDataSource : IReviewDataSource
 {
-    private const string CatalogEpoch = "local-review-v1";
-
     private readonly SemaphoreSlim _mutation = new(1, 1);
     private readonly ApprovalLedgerService _approval;
     private readonly string _reviewerId;
@@ -1059,7 +1120,7 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
                     WorkbenchFailureCode.WorkerAttestationMismatch);
             }
 
-            var scope = CreateScope();
+            var scope = CreateScope(options.CatalogEpoch);
             var sampleIdsByMarket = await LoadAndValidateSamplesAsync(
                     vault,
                     scope,
@@ -1172,7 +1233,7 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
                     WorkbenchFailureCode.InvalidArguments);
             }
 
-            var scope = CreateScope();
+            var scope = CreateScope(options.CatalogEpoch);
             var proofs = new List<ReviewSampleProof>(
                 PilotCatalog.MarketIds.Length);
             foreach (var marketId in PilotCatalog.MarketIds)
@@ -1960,10 +2021,10 @@ internal sealed class CorpusReviewDataSource : IReviewDataSource
         return result.ToImmutable();
     }
 
-    private static PilotScope CreateScope() =>
+    private static PilotScope CreateScope(string catalogEpoch) =>
         new(
             PilotCatalog.SchemaVersion,
-            CatalogEpoch,
+            catalogEpoch,
             PilotCatalog.ContractId,
             PilotCatalog.MarketIds,
             PilotCatalog.HeldOutTargetPerMarket,

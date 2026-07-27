@@ -289,6 +289,105 @@ public sealed class ApprovalLedgerService
             cancellationToken).ConfigureAwait(false);
     }
 
+    internal async Task<ApprovalEntry> RecordBatchApprovalAsync(
+        string marketId,
+        string reviewerId,
+        CancellationToken cancellationToken)
+    {
+        ValidateActor(reviewerId);
+        if (!_context.RuleCatalogs.ContainsKey(marketId))
+        {
+            throw InvalidArguments();
+        }
+
+        var observedAtUtc = _timeProvider.GetUtcNow()
+            .ToUniversalTime();
+        ValidateDecisionTime(observedAtUtc);
+        await VerifyWorkerAsync(cancellationToken)
+            .ConfigureAwait(false);
+        reviewerId = reviewerId.Normalize();
+        return await _store.ExecuteApprovalWriteAsync(
+            async (connection, transaction) =>
+            {
+                var ledger = await ReadLedgerAsync(
+                        connection,
+                        transaction)
+                    .ConfigureAwait(false);
+                RequireValidLedger(ledger);
+                var states =
+                    await _store.ReadAllApprovalLabelStatesAsync(
+                            connection,
+                            transaction)
+                        .ConfigureAwait(false);
+                var existing = ledger.Rows
+                    .Where(row =>
+                        row.Payload?.Mode
+                            == ApprovalMode.BatchApproval
+                        && string.Equals(
+                            row.Payload.MarketId,
+                            marketId,
+                            StringComparison.Ordinal))
+                    .OrderByDescending(static row => row.Sequence)
+                    .FirstOrDefault();
+                if (existing is not null)
+                {
+                    if (IsCurrentBatchApproval(
+                            existing,
+                            ledger.Rows,
+                            states))
+                    {
+                        return existing.ToEntry();
+                    }
+
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.ApprovalChainInvalid);
+                }
+
+                var selection = SelectBatchBindings(
+                    marketId,
+                    ledger.Rows,
+                    states,
+                    requireExactDirectCount: true);
+                var referencedIds = selection.Delegated
+                    .Concat(selection.Direct)
+                    .Select(static item => item.EntryId)
+                    .ToHashSet(StringComparer.Ordinal);
+                var approvedAtUtc = ledger.Rows
+                    .Where(row =>
+                        referencedIds.Contains(row.EntryId)
+                        && row.Payload is not null)
+                    .Select(static row =>
+                        row.Payload!.ApprovedAtUtc)
+                    .Append(observedAtUtc)
+                    .Max();
+                RequireBatchDecisionTime(
+                    approvedAtUtc,
+                    ledger.Rows,
+                    selection);
+                var summary =
+                    ComputeBatchSummarySha256(selection.Delegated);
+                var decision = new BatchApprovalDecision(
+                    marketId,
+                    reviewerId,
+                    summary,
+                    approvedAtUtc);
+                var payload = ApprovalDecisionPayload.Batch(
+                    decision,
+                    _context.Scope,
+                    _context.RuleCatalogs[marketId],
+                    _context.WorkerIdentity,
+                    selection.Delegated,
+                    selection.Direct);
+                return await AppendAsync(
+                        connection,
+                        transaction,
+                        ledger,
+                        payload)
+                    .ConfigureAwait(false);
+            },
+            cancellationToken).ConfigureAwait(false);
+    }
+
     public Task<ApprovalVerificationResult> VerifyAsync(
         CancellationToken cancellationToken) =>
         VerifyCoreAsync(
