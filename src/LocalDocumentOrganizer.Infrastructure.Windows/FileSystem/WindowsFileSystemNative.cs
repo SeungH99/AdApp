@@ -49,12 +49,14 @@ internal static class WindowsFileSystemNative
     private const uint InvalidFileAttributes = uint.MaxValue;
     private const uint MoveFileWriteThrough = 0x00000008;
 
-    internal static SafeFileHandle OpenVerifiedSourceHandle(string canonicalPath)
+    internal static SafeFileHandle OpenVerifiedSourceHandle(
+        string canonicalPath,
+        bool allowDelete)
     {
         RequireWindows();
         var handle = CreateFile(
             ToExtendedPath(canonicalPath),
-            GenericRead,
+            GenericRead | (allowDelete ? Delete : 0),
             FileShareRead,
             IntPtr.Zero,
             OpenExisting,

@@ -117,7 +117,10 @@ public sealed class ApprovedRootPathGuard
                 Path.GetPathRoot(canonical)
                     ?? throw new FileSystemBoundaryException("The path root is invalid."))
             .ToArray();
-        return OpenVerifiedSource(canonical, components);
+        return OpenVerifiedSource(
+            canonical,
+            components,
+            allowDelete: true);
     }
 
     public VerifiedStableSource OpenVerifiedSourceFromApprovedRoot(
@@ -128,12 +131,16 @@ public sealed class ApprovedRootPathGuard
                 canonical,
                 ApprovedRoot)
             .ToArray();
-        return OpenVerifiedSource(canonical, components);
+        return OpenVerifiedSource(
+            canonical,
+            components,
+            allowDelete: false);
     }
 
     private static VerifiedStableSource OpenVerifiedSource(
         string canonical,
-        string[] components)
+        string[] components,
+        bool allowDelete)
     {
         var pinnedAncestors = new List<SafeFileHandle>(Math.Max(0, components.Length - 1));
         var ownershipTransferred = false;
@@ -180,7 +187,9 @@ public sealed class ApprovedRootPathGuard
             }
 
             var sourceHandle =
-                WindowsFileSystemNative.OpenVerifiedSourceHandle(canonical);
+                WindowsFileSystemNative.OpenVerifiedSourceHandle(
+                    canonical,
+                    allowDelete);
             var proof = VerifiedStableSource.Create(
                 sourceHandle,
                 pinnedAncestors);
