@@ -1,8 +1,10 @@
 # Empirical Corpus Workbench Design
 
-Date: 2026-07-26  
-Status: Approved for implementation planning  
-Branch: `release-issue-7`  
+Date: 2026-07-26
+
+Status: Approved for implementation planning
+
+Branch: `release-issue-7`
 Issue: [#8](https://github.com/SeungH99/AdApp/issues/8)
 
 ## 1. Purpose
