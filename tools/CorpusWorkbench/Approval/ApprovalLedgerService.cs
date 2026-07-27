@@ -462,7 +462,8 @@ public sealed class ApprovalLedgerService
                             connection,
                             transaction,
                             PilotCatalog.HeldOutTargetPerMarket * 2,
-                            cancellationToken)
+                            cancellationToken,
+                            ObservePilotLabelRead)
                         .ConfigureAwait(false);
                 var verification = VerifyLedger(
                     ledger,
@@ -488,6 +489,30 @@ public sealed class ApprovalLedgerService
         await VerifyWorkerAsync(cancellationToken)
             .ConfigureAwait(false);
         return result;
+    }
+
+    private void ObservePilotLabelRead(PilotLabelReadPoint point)
+    {
+        if (_observePilotRead is null)
+        {
+            return;
+        }
+
+        _observePilotRead(point switch
+        {
+            PilotLabelReadPoint.DuringDocumentRowRead =>
+                ApprovalPilotReadPoint.DuringDocumentRowRead,
+            PilotLabelReadPoint.AfterDocumentShape =>
+                ApprovalPilotReadPoint.AfterDocumentShape,
+            PilotLabelReadPoint.DuringRevisionRowRead =>
+                ApprovalPilotReadPoint.DuringRevisionRowRead,
+            PilotLabelReadPoint.AfterRevisionShape =>
+                ApprovalPilotReadPoint.AfterRevisionShape,
+            PilotLabelReadPoint.DuringRevisionParse =>
+                ApprovalPilotReadPoint.DuringRevisionParse,
+            _ => throw new WorkbenchException(
+                WorkbenchFailureCode.InvalidState),
+        });
     }
 
     private ApprovalVerificationResult VerifyLedger(
@@ -2863,6 +2888,11 @@ internal enum ApprovalPilotReadPoint
 {
     AfterLedgerRowRead,
     AfterLedgerBeforeStates,
+    DuringDocumentRowRead,
+    AfterDocumentShape,
+    DuringRevisionRowRead,
+    AfterRevisionShape,
+    DuringRevisionParse,
     DuringChainVerification,
     DuringSemanticVerification,
     DuringProjection,

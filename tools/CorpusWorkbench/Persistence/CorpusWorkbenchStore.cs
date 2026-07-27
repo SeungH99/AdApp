@@ -34,6 +34,11 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
     private const int MaximumPilotRevisionCanonicalBytes = 64 * 1024;
     private const int MaximumPilotRevisionFieldCount = 6;
     private const int MaximumPilotEvidenceBoxesPerField = 256;
+    private const int MaximumPilotFieldIdCharacters = 128;
+    private const int MaximumPilotNormalizedValueCharacters = 1024;
+    private const int MaximumPilotRuleIdCharacters = 256;
+    private const int MaximumPilotWorkerIdentityCharacters = 512;
+    private const double MaximumPilotEvidenceCoordinate = 1_000_000d;
 
     private const string SchemaSql = """
         CREATE TABLE IF NOT EXISTS source_receipts (
@@ -816,7 +821,8 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         SqliteConnection connection,
         SqliteTransaction transaction,
         int maximumCount,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<PilotLabelReadPoint>? observePilotRead = null)
     {
         if (maximumCount < 0)
         {
@@ -845,6 +851,8 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             while (await reader.ReadAsync(cancellationToken)
                        .ConfigureAwait(false))
             {
+                observePilotRead?.Invoke(
+                    PilotLabelReadPoint.DuringDocumentRowRead);
                 cancellationToken.ThrowIfCancellationRequested();
                 if (documentIds.Count >= maximumCount)
                 {
@@ -876,7 +884,8 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                         connection,
                         transaction,
                         documentId,
-                        cancellationToken)
+                        cancellationToken,
+                        observePilotRead)
                     .ConfigureAwait(false));
         }
 
@@ -1598,13 +1607,15 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         SqliteConnection connection,
         SqliteTransaction transaction,
         string documentId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<PilotLabelReadPoint>? observePilotRead)
     {
         var persisted = await ReadPilotPersistedImportAsync(
                 connection,
                 transaction,
                 documentId,
-                cancellationToken)
+                cancellationToken,
+                observePilotRead)
             .ConfigureAwait(false)
             ?? throw InvalidState();
         if (!string.Equals(
@@ -1653,6 +1664,8 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             while (await reader.ReadAsync(cancellationToken)
                        .ConfigureAwait(false))
             {
+                observePilotRead?.Invoke(
+                    PilotLabelReadPoint.DuringRevisionRowRead);
                 cancellationToken.ThrowIfCancellationRequested();
                 if (revisions.Count >= MaximumPilotLabelRevisionCount)
                 {
@@ -1692,6 +1705,8 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                     throw InvalidState();
                 }
 
+                observePilotRead?.Invoke(
+                    PilotLabelReadPoint.AfterRevisionShape);
                 cancellationToken.ThrowIfCancellationRequested();
                 var revisionId = reader.GetString(2);
                 cancellationToken.ThrowIfCancellationRequested();
@@ -1708,6 +1723,8 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                 LabelRevision revision;
                 try
                 {
+                    observePilotRead?.Invoke(
+                        PilotLabelReadPoint.DuringRevisionParse);
                     cancellationToken.ThrowIfCancellationRequested();
                     revision = WorkbenchJson.Parse(
                         canonical,
@@ -1789,7 +1806,8 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         SqliteConnection connection,
         SqliteTransaction transaction,
         string documentId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<PilotLabelReadPoint>? observePilotRead)
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
@@ -1877,6 +1895,8 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             throw InvalidState();
         }
 
+        observePilotRead?.Invoke(
+            PilotLabelReadPoint.AfterDocumentShape);
         cancellationToken.ThrowIfCancellationRequested();
         var persistedDocumentId = reader.GetString(2);
         cancellationToken.ThrowIfCancellationRequested();
@@ -1936,12 +1956,124 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
     }
 
     private static bool HasBoundedPilotRevisionShape(
-        LabelRevision revision) =>
-        !revision.Fields.IsDefault
-        && revision.Fields.Length <= MaximumPilotRevisionFieldCount
-        && revision.Fields.All(static field =>
-            !field.Evidence.IsDefault
-            && field.Evidence.Length <= MaximumPilotEvidenceBoxesPerField);
+        LabelRevision? revision)
+    {
+        if (revision is null
+            || !IsBoundedPilotIdentity(
+                revision.RevisionId,
+                MaximumPilotRevisionIdCharacters)
+            || !IsBoundedPilotIdentity(
+                revision.DocumentId,
+                MaximumPilotDocumentIdCharacters)
+            || !IsLowerPilotSha256(revision.DocumentSha256)
+            || !IsBoundedPilotIdentity(
+                revision.MarketId,
+                MaximumPilotMarketIdCharacters)
+            || !IsBoundedPilotIdentity(
+                revision.ContractId,
+                MaximumPilotContractIdCharacters)
+            || !IsBoundedPilotNullableIdentity(
+                revision.PreviousRevisionId,
+                MaximumPilotRevisionIdCharacters)
+            || !IsBoundedPilotNullableSha256(
+                revision.PreviousRevisionSha256)
+            || (revision.PreviousRevisionId is null)
+                != (revision.PreviousRevisionSha256 is null)
+            || !IsLowerPilotSha256(revision.RuleCatalogSha256)
+            || !IsBoundedPilotIdentity(
+                revision.WorkerPackageManifestId,
+                MaximumPilotWorkerIdentityCharacters)
+            || !IsBoundedPilotIdentity(
+                revision.WorkerPackageManifestVersion,
+                MaximumPilotWorkerIdentityCharacters)
+            || !IsLowerPilotSha256(revision.WorkerPackageSha256)
+            || !IsBoundedPilotIdentity(
+                revision.WorkerExecutableRelativePath,
+                MaximumPilotWorkerIdentityCharacters)
+            || !IsLowerPilotSha256(revision.WorkerExecutableSha256)
+            || !IsLowerPilotSha256(revision.RevisionSha256)
+            || revision.Fields.IsDefault
+            || revision.Fields.Length > MaximumPilotRevisionFieldCount)
+        {
+            return false;
+        }
+
+        foreach (var field in revision.Fields)
+        {
+            if (field is null
+                || !IsBoundedPilotIdentity(
+                    field.FieldId,
+                    MaximumPilotFieldIdCharacters)
+                || field.NormalizedValue is null
+                || field.NormalizedValue.Length is 0
+                    or > MaximumPilotNormalizedValueCharacters
+                || !IsBoundedPilotIdentity(
+                    field.RuleId,
+                    MaximumPilotRuleIdCharacters)
+                || field.Evidence.IsDefault
+                || field.Evidence.Length
+                    > MaximumPilotEvidenceBoxesPerField)
+            {
+                return false;
+            }
+
+            foreach (var evidence in field.Evidence)
+            {
+                if (evidence is null
+                    || evidence.SourceIndex is < 0 or >= 256
+                    || !IsSupportedPilotEvidenceCoordinate(
+                        evidence.X,
+                        allowZero: true)
+                    || !IsSupportedPilotEvidenceCoordinate(
+                        evidence.Y,
+                        allowZero: true)
+                    || !IsSupportedPilotEvidenceCoordinate(
+                        evidence.Width,
+                        allowZero: false)
+                    || !IsSupportedPilotEvidenceCoordinate(
+                        evidence.Height,
+                        allowZero: false)
+                    || evidence.X + evidence.Width
+                        > MaximumPilotEvidenceCoordinate
+                    || evidence.Y + evidence.Height
+                        > MaximumPilotEvidenceCoordinate)
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsBoundedPilotIdentity(
+        string? value,
+        int maximumLength) =>
+        value is not null
+        && value.Length is > 0
+        && value.Length <= maximumLength;
+
+    private static bool IsBoundedPilotNullableIdentity(
+        string? value,
+        int maximumLength) =>
+        value is null || IsBoundedPilotIdentity(value, maximumLength);
+
+    private static bool IsBoundedPilotNullableSha256(string? value) =>
+        value is null || IsLowerPilotSha256(value);
+
+    private static bool IsLowerPilotSha256(string? value) =>
+        value is not null
+        && value.Length == MaximumPilotSha256Characters
+        && value.All(static character =>
+            character is >= '0' and <= '9'
+                or >= 'a' and <= 'f');
+
+    private static bool IsSupportedPilotEvidenceCoordinate(
+        double value,
+        bool allowZero) =>
+        double.IsFinite(value)
+        && (allowZero ? value >= 0 : value > 0)
+        && value <= MaximumPilotEvidenceCoordinate;
 
     private static bool IsBoundedPilotText(
         SqliteDataReader reader,
@@ -3114,6 +3246,15 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
 
     private static WorkbenchException InvalidState() =>
         new(WorkbenchFailureCode.InvalidState);
+}
+
+internal enum PilotLabelReadPoint
+{
+    DuringDocumentRowRead,
+    AfterDocumentShape,
+    DuringRevisionRowRead,
+    AfterRevisionShape,
+    DuringRevisionParse,
 }
 
 internal sealed record PersistedImport(
