@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local corpus review</title>
+  <link rel="stylesheet" href="/review.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Corpus workbench</p>
+      <h1>Document review</h1>
+    </div>
+    <div class="local-badge" aria-label="This review session is local only">
+      <span aria-hidden="true"></span>
+      Local only
+    </div>
+  </header>
+
+  <main>
+    <section class="status-row" aria-labelledby="review-progress">
+      <div>
+        <p id="market" class="market">—</p>
+        <p id="review-progress" class="progress">Loading review…</p>
+      </div>
+      <a id="official-rule" class="rule-link" target="_blank" rel="noopener noreferrer">
+        View official rule
+      </a>
+    </section>
+
+    <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+    <section id="review-workspace" class="workspace" hidden>
+      <section class="document-panel" aria-labelledby="document-heading">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Source preview</p>
+            <h2 id="document-heading">Document</h2>
+          </div>
+          <div class="page-controls" aria-label="Page navigation">
+            <button id="previous-page" type="button">Previous</button>
+            <span id="page-label">Page 1</span>
+            <button id="next-page" type="button">Next</button>
+          </div>
+        </div>
+        <div id="preview-frame" class="preview-frame">
+          <div class="preview-stage">
+            <img id="page-preview" alt="Current document page">
+            <svg id="evidence-layer" class="evidence-layer" aria-hidden="true"></svg>
+          </div>
+        </div>
+      </section>
+
+      <section class="fields-panel" aria-labelledby="fields-heading">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Normalized output</p>
+            <h2 id="fields-heading">Six required fields</h2>
+          </div>
+          <p id="rule-version" class="rule-version"></p>
+        </div>
+        <form id="review-form">
+          <div id="fields" class="fields"></div>
+          <fieldset>
+            <legend>Decision</legend>
+            <div class="decision-grid">
+              <button class="decision approve" type="submit" data-decision="approveExact">
+                Approve exact
+              </button>
+              <button class="decision correct" type="submit" data-decision="correctAndApprove">
+                Correct and approve
+              </button>
+              <button class="decision reject" type="submit" data-decision="rejectDocument">
+                Reject document
+              </button>
+              <button class="decision defer" type="submit" data-decision="defer">
+                Defer
+              </button>
+            </div>
+          </fieldset>
+        </form>
+      </section>
+    </section>
+  </main>
+
+  <script type="module" src="/review.js"></script>
+</body>
+</html>

@@ -117,7 +117,10 @@ public sealed class ApprovedRootPathGuard
                 Path.GetPathRoot(canonical)
                     ?? throw new FileSystemBoundaryException("The path root is invalid."))
             .ToArray();
-        return OpenVerifiedSource(canonical, components);
+        return OpenVerifiedSource(
+            canonical,
+            components,
+            allowDelete: true);
     }
 
     public VerifiedStableSource OpenVerifiedSourceFromApprovedRoot(
@@ -128,12 +131,16 @@ public sealed class ApprovedRootPathGuard
                 canonical,
                 ApprovedRoot)
             .ToArray();
-        return OpenVerifiedSource(canonical, components);
+        return OpenVerifiedSource(
+            canonical,
+            components,
+            allowDelete: false);
     }
 
     private static VerifiedStableSource OpenVerifiedSource(
         string canonical,
-        string[] components)
+        string[] components,
+        bool allowDelete)
     {
         var pinnedAncestors = new List<SafeFileHandle>(Math.Max(0, components.Length - 1));
         var ownershipTransferred = false;
@@ -180,7 +187,9 @@ public sealed class ApprovedRootPathGuard
             }
 
             var sourceHandle =
-                WindowsFileSystemNative.OpenVerifiedSourceHandle(canonical);
+                WindowsFileSystemNative.OpenVerifiedSourceHandle(
+                    canonical,
+                    allowDelete);
             var proof = VerifiedStableSource.Create(
                 sourceHandle,
                 pinnedAncestors);
@@ -340,6 +349,12 @@ internal sealed class PinnedDirectoryPathScope : IDisposable
     internal string CanonicalPath { get; }
 
     internal WindowsFileSystemNative.FILE_ID_INFO FinalIdentity { get; }
+
+    internal SafeFileHandle FinalHandle =>
+        _handles.Count != 0
+            ? _handles[^1]
+            : throw new ObjectDisposedException(
+                nameof(PinnedDirectoryPathScope));
 
     public void Dispose() => DisposeHandles(_handles);
 

@@ -139,6 +139,52 @@ public sealed class VaultKeyRingStore
         return state.ToMetadata();
     }
 
+    public async ValueTask<TResult> UseDomainSeparatedSubkeyAsync<TResult>(
+        ReadOnlyMemory<byte> domain,
+        Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<TResult>>
+            callback,
+        CancellationToken cancellationToken)
+    {
+        if (domain.Length is < 16 or > 128
+            || !domain.Span.StartsWith(
+                "LocalDocumentOrganizer/"u8)
+            || domain.Span.IndexOfAnyExceptInRange(
+                (byte)0x21,
+                (byte)0x7e) >= 0)
+        {
+            throw new ArgumentException(
+                "The subkey domain is invalid.",
+                nameof(domain));
+        }
+
+        ArgumentNullException.ThrowIfNull(callback);
+        cancellationToken.ThrowIfCancellationRequested();
+        byte[]? image = null;
+        byte[]? subkey = null;
+        try
+        {
+            image = await ReadCanonicalAsync(cancellationToken)
+                .ConfigureAwait(false);
+            using var state = Deserialize(image);
+            subkey = DeriveKey(state.Root, domain.Span);
+            cancellationToken.ThrowIfCancellationRequested();
+            return await callback(subkey, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            if (subkey is not null)
+            {
+                CryptographicOperations.ZeroMemory(subkey);
+            }
+
+            if (image is not null)
+            {
+                CryptographicOperations.ZeroMemory(image);
+            }
+        }
+    }
+
     internal async Task EnsureCurrentFormatAsync(
         VaultMaintenanceLease lease,
         CancellationToken cancellationToken)

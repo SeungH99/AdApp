@@ -22,6 +22,7 @@ internal static class WindowsFileSystemNative
     internal const uint FileAttributeDirectory = 0x00000010;
     internal const uint FileAttributeReparsePoint = 0x00000400;
     internal const uint FileListDirectory = 0x00000001;
+    internal const uint FileReadAttributes = 0x00000080;
 
     internal const uint FILE_RENAME_REPLACE_IF_EXISTS = 0x00000001;
     internal const uint FILE_RENAME_POSIX_SEMANTICS = 0x00000002;
@@ -37,18 +38,25 @@ internal static class WindowsFileSystemNative
     private const int ErrorFileNotFound = 2;
     private const int ErrorPathNotFound = 3;
     private const int ErrorAccessDenied = 5;
+    private const int ErrorSharingViolation = 32;
+    private const int ErrorLockViolation = 33;
+    private const int ErrorFileExists = 80;
     private const int ErrorInvalidFunction = 1;
     private const int ErrorNotSupported = 50;
     private const int ErrorInvalidParameter = 87;
+    private const int ErrorAlreadyExists = 183;
     private const int ErrorIoIncomplete = 996;
     private const uint InvalidFileAttributes = uint.MaxValue;
+    private const uint MoveFileWriteThrough = 0x00000008;
 
-    internal static SafeFileHandle OpenVerifiedSourceHandle(string canonicalPath)
+    internal static SafeFileHandle OpenVerifiedSourceHandle(
+        string canonicalPath,
+        bool allowDelete)
     {
         RequireWindows();
         var handle = CreateFile(
             ToExtendedPath(canonicalPath),
-            GenericRead,
+            GenericRead | (allowDelete ? Delete : 0),
             FileShareRead,
             IntPtr.Zero,
             OpenExisting,
@@ -77,6 +85,359 @@ internal static class WindowsFileSystemNative
         {
             handle.Dispose();
             throw;
+        }
+    }
+
+    internal static SafeFileHandle OpenNewVerifiedFileHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            GenericRead | GenericWrite | Delete,
+            shareMode: 0,
+            IntPtr.Zero,
+            CreateNew,
+            FileFlagOpenReparsePoint | FileFlagSequentialScan,
+            IntPtr.Zero);
+        if (!handle.IsInvalid)
+        {
+            return handle;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        handle.Dispose();
+        if (error is ErrorFileExists or ErrorAlreadyExists)
+        {
+            throw new FileStoreEntryAlreadyExistsException();
+        }
+
+        throw CreateNativeException(error);
+    }
+
+    internal static SafeFileHandle OpenNewPromotableVerifiedFileHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            GenericRead | GenericWrite | Delete,
+            FileShareRead | FileShareDelete,
+            IntPtr.Zero,
+            CreateNew,
+            FileFlagOpenReparsePoint | FileFlagSequentialScan,
+            IntPtr.Zero);
+        if (!handle.IsInvalid)
+        {
+            return handle;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        handle.Dispose();
+        if (error is ErrorFileExists or ErrorAlreadyExists)
+        {
+            throw new FileStoreEntryAlreadyExistsException();
+        }
+
+        throw CreateNativeException(error);
+    }
+
+    internal static SafeFileHandle? OpenBoundaryProbeHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            desiredAccess: 0,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            if (error is ErrorFileNotFound or ErrorPathNotFound)
+            {
+                return null;
+            }
+
+            throw CreateNativeException(error);
+        }
+
+        return handle;
+    }
+
+    internal static SafeFileHandle? TryOpenOwnedExistingFileHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            GenericRead | Delete,
+            FileShareRead,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint | FileFlagSequentialScan,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            if (error is ErrorFileNotFound
+                or ErrorPathNotFound
+                or ErrorSharingViolation
+                or ErrorLockViolation)
+            {
+                return null;
+            }
+
+            throw CreateNativeException(error);
+        }
+
+        try
+        {
+            var information = GetAttributeTagInfo(handle);
+            if ((information.FileAttributes
+                    & (FileAttributeDirectory
+                        | FileAttributeReparsePoint)) != 0)
+            {
+                throw new FileSystemBoundaryException(
+                    "The owned entry is not an approved regular file.");
+            }
+
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    internal static bool MoveNoReplace(
+        string sourceCanonicalPath,
+        string destinationCanonicalPath)
+    {
+        RequireWindows();
+        if (MoveFileEx(
+                ToExtendedPath(sourceCanonicalPath),
+                ToExtendedPath(destinationCanonicalPath),
+                MoveFileWriteThrough))
+        {
+            return true;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        if (error is ErrorFileExists or ErrorAlreadyExists)
+        {
+            return false;
+        }
+
+        throw CreateNativeException(error);
+    }
+
+    internal static SafeFileHandle OpenVerifiedMutableFileHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            GenericRead,
+            FileShareRead | FileShareWrite,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        try
+        {
+            var information = GetAttributeTagInfo(handle);
+            if ((information.FileAttributes
+                    & (FileAttributeDirectory
+                        | FileAttributeReparsePoint)) != 0)
+            {
+                throw new FileSystemBoundaryException(
+                    "The mutable entry is not an approved regular file.");
+            }
+
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    internal static void EnsureDirectoryEntry(string canonicalPath)
+    {
+        RequireWindows();
+        if (CreateDirectory(ToExtendedPath(canonicalPath), IntPtr.Zero))
+        {
+            return;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        if (error is ErrorFileExists or ErrorAlreadyExists)
+        {
+            return;
+        }
+
+        throw CreateNativeException(error);
+    }
+
+    internal static SafeFileHandle OpenDirectoryPromotionHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            FileListDirectory | Delete,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        return handle;
+    }
+
+    internal static SafeFileHandle OpenDirectoryCleanupGuardianHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            FileListDirectory | FileReadAttributes | Delete,
+            FileShareRead | FileShareWrite,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        return handle;
+    }
+
+    internal static SafeFileHandle OpenCleanupEntryHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            FileReadAttributes | Delete,
+            FileShareRead | FileShareWrite,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        return handle;
+    }
+
+    internal static SafeFileHandle OpenDirectoryIdentityHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            FileReadAttributes,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        return handle;
+    }
+
+    internal static bool RenameHandleNoReplace(
+        SafeFileHandle handle,
+        string destinationCanonicalPath)
+    {
+        RequireUsableHandle(handle);
+        var fileName = destinationCanonicalPath.ToCharArray();
+        var fileNameBytes = checked(
+            (uint)(fileName.Length * sizeof(char)));
+        var headerSize = checked((int)Marshal.OffsetOf<
+            FILE_RENAME_INFO_EX>(
+            nameof(FILE_RENAME_INFO_EX.FileName)));
+        var bufferSize = checked(
+            Marshal.SizeOf<FILE_RENAME_INFO_EX>()
+            + (int)fileNameBytes);
+        var buffer = Marshal.AllocHGlobal(bufferSize);
+        try
+        {
+            for (var index = 0; index < bufferSize; index++)
+            {
+                Marshal.WriteByte(buffer, index, 0);
+            }
+
+            Marshal.WriteInt32(buffer, 0, 0);
+            Marshal.WriteIntPtr(
+                buffer,
+                IntPtr.Size == 8 ? 8 : 4,
+                IntPtr.Zero);
+            Marshal.WriteInt32(
+                buffer,
+                IntPtr.Size == 8 ? 16 : 8,
+                checked((int)fileNameBytes));
+            Marshal.Copy(
+                fileName,
+                0,
+                IntPtr.Add(buffer, headerSize),
+                fileName.Length);
+            if (SetFileInformationByHandle(
+                    handle,
+                    FileInfoByHandleClass.FileRenameInfoEx,
+                    buffer,
+                    checked((uint)bufferSize)))
+            {
+                return true;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            if (error is ErrorFileExists or ErrorAlreadyExists)
+            {
+                return false;
+            }
+
+            throw CreateNativeException(error);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
         }
     }
 
@@ -492,6 +853,65 @@ internal static class WindowsFileSystemNative
         return information;
     }
 
+    internal static string GetFinalPath(SafeFileHandle handle)
+    {
+        RequireUsableHandle(handle);
+        var buffer = new StringBuilder(512);
+        var length = GetFinalPathNameByHandle(
+            handle,
+            buffer,
+            checked((uint)buffer.Capacity),
+            flags: 0);
+        if (length == 0)
+        {
+            throw CreateNativeException(Marshal.GetLastPInvokeError());
+        }
+
+        if (length >= buffer.Capacity)
+        {
+            buffer = new StringBuilder(checked((int)length + 1));
+            length = GetFinalPathNameByHandle(
+                handle,
+                buffer,
+                checked((uint)buffer.Capacity),
+                flags: 0);
+            if (length == 0 || length >= buffer.Capacity)
+            {
+                throw CreateNativeException(Marshal.GetLastPInvokeError());
+            }
+        }
+
+        var path = RemoveExtendedPrefix(buffer.ToString());
+        string canonical;
+        try
+        {
+            canonical = Path.GetFullPath(path);
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException
+                or NotSupportedException
+                or PathTooLongException)
+        {
+            throw new FileSystemBoundaryException(
+                "A file handle reported an invalid physical path.",
+                exception);
+        }
+
+        var root = Path.GetPathRoot(canonical);
+        if (string.IsNullOrEmpty(root))
+        {
+            throw new FileSystemBoundaryException(
+                "A file handle reported an invalid physical root.");
+        }
+
+        return string.Equals(
+                canonical,
+                root,
+                StringComparison.OrdinalIgnoreCase)
+            ? root
+            : Path.TrimEndingDirectorySeparator(canonical);
+    }
+
     internal static StableSourceSnapshot GetStableSourceSnapshot(
         SafeFileHandle handle)
     {
@@ -689,6 +1109,64 @@ internal static class WindowsFileSystemNative
         }
     }
 
+    internal static void MarkDeleteOnClose(SafeFileHandle handle)
+    {
+        RequireUsableHandle(handle);
+        var extended = new FILE_DISPOSITION_INFO_EX
+        {
+            Flags = FILE_DISPOSITION_DELETE
+                | FILE_DISPOSITION_ON_CLOSE
+                | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE,
+        };
+        var extendedSize = Marshal.SizeOf<FILE_DISPOSITION_INFO_EX>();
+        var buffer = Marshal.AllocHGlobal(extendedSize);
+        try
+        {
+            Marshal.StructureToPtr(extended, buffer, fDeleteOld: false);
+            if (SetFileInformationByHandle(
+                    handle,
+                    FileInfoByHandleClass.FileDispositionInfoEx,
+                    buffer,
+                    checked((uint)extendedSize)))
+            {
+                return;
+            }
+
+            var error = Marshal.GetLastPInvokeError();
+            if (error is not ErrorInvalidParameter and not ErrorNotSupported)
+            {
+                throw CreateNativeException(error);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+
+        var legacy = new FILE_DISPOSITION_INFO
+        {
+            DeleteFile = true,
+        };
+        var legacySize = Marshal.SizeOf<FILE_DISPOSITION_INFO>();
+        buffer = Marshal.AllocHGlobal(legacySize);
+        try
+        {
+            Marshal.StructureToPtr(legacy, buffer, fDeleteOld: false);
+            if (!SetFileInformationByHandle(
+                    handle,
+                    FileInfoByHandleClass.FileDispositionInfo,
+                    buffer,
+                    checked((uint)legacySize)))
+            {
+                throw CreateNativeException(Marshal.GetLastPInvokeError());
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
     internal static string ToExtendedPath(string canonicalPath)
     {
         if (canonicalPath.StartsWith(@"\\?\", StringComparison.Ordinal))
@@ -696,6 +1174,20 @@ internal static class WindowsFileSystemNative
         if (canonicalPath.StartsWith(@"\\", StringComparison.Ordinal))
             return @"\\?\UNC\" + canonicalPath[2..];
         return @"\\?\" + canonicalPath;
+    }
+
+    private static string RemoveExtendedPrefix(string path)
+    {
+        const string uncPrefix = @"\\?\UNC\";
+        const string extendedPrefix = @"\\?\";
+        if (path.StartsWith(uncPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return @"\\" + path[uncPrefix.Length..];
+        }
+
+        return path.StartsWith(extendedPrefix, StringComparison.Ordinal)
+            ? path[extendedPrefix.Length..]
+            : path;
     }
 
     private static void RequireUsableHandle(SafeFileHandle handle)
@@ -712,9 +1204,12 @@ internal static class WindowsFileSystemNative
     }
 
     private static Exception CreateNativeException(int error) =>
-        new FileSystemBoundaryException(
-            "A native file-system boundary operation failed.",
-            new Win32Exception(error));
+        error is ErrorSharingViolation or ErrorLockViolation
+            ? new FileSystemTransientShareOrLockException(
+                new Win32Exception(error))
+            : new FileSystemBoundaryException(
+                "A native file-system boundary operation failed.",
+                new Win32Exception(error));
 
     [DllImport(
         "kernel32.dll",
@@ -729,6 +1224,38 @@ internal static class WindowsFileSystemNative
         uint creationDisposition,
         uint flagsAndAttributes,
         IntPtr templateFile);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "CreateDirectoryW",
+        CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateDirectory(
+        string path,
+        IntPtr securityAttributes);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "MoveFileExW",
+        CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool MoveFileEx(
+        string existingFileName,
+        string newFileName,
+        uint flags);
+
+    [DllImport(
+        "kernel32.dll",
+        EntryPoint = "GetFinalPathNameByHandleW",
+        CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandle(
+        SafeFileHandle file,
+        StringBuilder filePath,
+        uint filePathLength,
+        uint flags);
 
     [DllImport(
         "kernel32.dll",
@@ -1020,7 +1547,7 @@ internal static class WindowsFileSystemNative
     }
 }
 
-public sealed class FileSystemBoundaryException : IOException
+public class FileSystemBoundaryException : IOException
 {
     internal FileSystemBoundaryException(string message)
         : base(message)
@@ -1029,6 +1556,18 @@ public sealed class FileSystemBoundaryException : IOException
 
     internal FileSystemBoundaryException(string message, Exception innerException)
         : base(message, innerException)
+    {
+    }
+}
+
+public sealed class FileSystemTransientShareOrLockException
+    : FileSystemBoundaryException
+{
+    internal FileSystemTransientShareOrLockException(
+        Exception innerException)
+        : base(
+            "A native file-system boundary operation is temporarily unavailable.",
+            innerException)
     {
     }
 }
