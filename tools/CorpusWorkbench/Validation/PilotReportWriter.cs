@@ -14,22 +14,12 @@ public sealed class PilotReportWriter
     private const string ReportHashDomain =
         "corpus-workbench-report-v1\n";
     internal const int MaximumReportBytes = 64 * 1024;
-    private readonly PilotAuthenticationService? _authentication;
+    private readonly PilotAuthenticationService _authentication;
     private readonly Action<PilotReportFaultPoint>? _injectFault;
-
-    public PilotReportWriter()
-    {
-    }
 
     public PilotReportWriter(CorpusWorkbench.Vault.CorpusVault vault)
     {
         _authentication = new PilotAuthenticationService(vault);
-    }
-
-    internal PilotReportWriter(
-        Action<PilotReportFaultPoint>? injectFault)
-    {
-        _injectFault = injectFault;
     }
 
     internal PilotReportWriter(
@@ -93,12 +83,6 @@ public sealed class PilotReportWriter
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(result);
-        if (_authentication is null)
-        {
-            throw new WorkbenchException(
-                WorkbenchFailureCode.InvalidState);
-        }
-
         await PilotResultAttestation.VerifyAsync(
                 result,
                 _authentication,

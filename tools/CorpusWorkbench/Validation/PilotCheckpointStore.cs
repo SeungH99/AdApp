@@ -32,17 +32,8 @@ public sealed class PilotCheckpointStore
     private readonly PilotAuthenticationService _authentication;
     private readonly Func<
         CancellationToken,
-        ValueTask<PilotRuntimeTrustState>>? _loadTrustedState;
+        ValueTask<PilotRuntimeTrustState>> _loadTrustedState;
     private readonly Action<PilotCheckpointFaultPoint>? _injectFault;
-
-    public PilotCheckpointStore(CorpusVault vault)
-        : this(
-            vault,
-            new PilotAuthenticationService(vault),
-            loadTrustedState: null,
-            injectFault: null)
-    {
-    }
 
     public PilotCheckpointStore(
         CorpusVault vault,
@@ -59,21 +50,10 @@ public sealed class PilotCheckpointStore
 
     internal PilotCheckpointStore(
         CorpusVault vault,
-        Action<PilotCheckpointFaultPoint>? injectFault)
-        : this(
-            vault,
-            new PilotAuthenticationService(vault),
-            loadTrustedState: null,
-            injectFault)
-    {
-    }
-
-    internal PilotCheckpointStore(
-        CorpusVault vault,
         PilotAuthenticationService authentication,
         Func<
             CancellationToken,
-            ValueTask<PilotRuntimeTrustState>>? loadTrustedState,
+            ValueTask<PilotRuntimeTrustState>> loadTrustedState,
         Action<PilotCheckpointFaultPoint>? injectFault)
     {
         _vault = vault
@@ -81,7 +61,9 @@ public sealed class PilotCheckpointStore
         _authentication = authentication
             ?? throw new ArgumentNullException(
                 nameof(authentication));
-        _loadTrustedState = loadTrustedState;
+        _loadTrustedState = loadTrustedState
+            ?? throw new ArgumentNullException(
+                nameof(loadTrustedState));
         _injectFault = injectFault;
     }
 
@@ -174,7 +156,7 @@ public sealed class PilotCheckpointStore
                     "$authentication_tag",
                     SqliteType.Blob).Value = authenticationTag;
                 if (await insert.ExecuteNonQueryAsync(
-                            CancellationToken.None)
+                            cancellationToken)
                         .ConfigureAwait(false) != 2)
                 {
                     throw InvalidCheckpoint();
@@ -286,11 +268,6 @@ public sealed class PilotCheckpointStore
         PilotValidationRequest request,
         CancellationToken cancellationToken)
     {
-        if (_loadTrustedState is null)
-        {
-            throw InvalidCheckpoint();
-        }
-
         PilotRuntimeTrustState trusted;
         try
         {
@@ -344,7 +321,16 @@ public sealed class PilotCheckpointStore
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT checkpoint_id, scope_sha256, canonical_json
+            SELECT
+              typeof(checkpoint_id),
+              length(checkpoint_id),
+              checkpoint_id,
+              typeof(scope_sha256),
+              length(scope_sha256),
+              scope_sha256,
+              typeof(canonical_json),
+              length(canonical_json),
+              canonical_json
             FROM checkpoints
             WHERE checkpoint_id IN (
               $checkpoint_id,
@@ -358,19 +344,55 @@ public sealed class PilotCheckpointStore
             "$authentication_checkpoint_id",
             AuthenticationCheckpointId);
         await using var reader = await command.ExecuteReaderAsync(
-                CancellationToken.None)
+                cancellationToken)
             .ConfigureAwait(false);
         var rows = new Dictionary<
             string,
             (string Identity, byte[] Payload)>(
             StringComparer.Ordinal);
-        while (await reader.ReadAsync(CancellationToken.None)
+        while (await reader.ReadAsync(cancellationToken)
                    .ConfigureAwait(false))
         {
-            if (reader.GetValue(0) is not string checkpointId
-                || reader.GetValue(1) is not string identity
-                || reader.GetValue(2) is not byte[] payload
-                || !rows.TryAdd(
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!IsSqliteType(reader, 0, "text")
+                || reader.GetValue(1) is not long checkpointIdLength
+                || checkpointIdLength != CheckpointId.Length
+                    && checkpointIdLength
+                        != AuthenticationCheckpointId.Length
+                || !IsSqliteText(
+                    reader,
+                    typeOrdinal: 3,
+                    lengthOrdinal: 4,
+                    minimumLength: 64,
+                    maximumLength: 64))
+            {
+                throw InvalidCheckpoint();
+            }
+
+            var checkpointId = reader.GetString(2);
+            var maximumPayloadLength = checkpointId switch
+            {
+                CheckpointId => MaximumCanonicalBytes,
+                AuthenticationCheckpointId => 32,
+                _ => 0,
+            };
+            if (maximumPayloadLength == 0
+                || !IsSqliteBlob(
+                    reader,
+                    typeOrdinal: 6,
+                    lengthOrdinal: 7,
+                    maximumLength: maximumPayloadLength))
+            {
+                throw InvalidCheckpoint();
+            }
+
+            _injectFault?.Invoke(
+                PilotCheckpointFaultPoint
+                    .AfterMetadataBeforeMaterialization);
+            cancellationToken.ThrowIfCancellationRequested();
+            var identity = reader.GetString(5);
+            var payload = reader.GetFieldValue<byte[]>(8);
+            if (!rows.TryAdd(
                     checkpointId,
                     (identity, payload)))
             {
@@ -448,6 +470,37 @@ public sealed class PilotCheckpointStore
 
         return checkpoint;
     }
+
+    private static bool IsSqliteText(
+        SqliteDataReader reader,
+        int typeOrdinal,
+        int lengthOrdinal,
+        int minimumLength,
+        int maximumLength) =>
+        IsSqliteType(reader, typeOrdinal, "text")
+        && reader.GetValue(lengthOrdinal) is long length
+        && length >= minimumLength
+        && length <= maximumLength;
+
+    private static bool IsSqliteBlob(
+        SqliteDataReader reader,
+        int typeOrdinal,
+        int lengthOrdinal,
+        int maximumLength) =>
+        IsSqliteType(reader, typeOrdinal, "blob")
+        && reader.GetValue(lengthOrdinal) is long length
+        && length > 0
+        && length <= maximumLength;
+
+    private static bool IsSqliteType(
+        SqliteDataReader reader,
+        int ordinal,
+        string expected) =>
+        reader.GetValue(ordinal) is string actual
+        && string.Equals(
+            actual,
+            expected,
+            StringComparison.Ordinal);
 
     private static byte[] CreateAuthenticationInput(
         string checkpointIdentity,
@@ -691,6 +744,7 @@ public sealed class PilotCheckpointStore
 internal enum PilotCheckpointFaultPoint
 {
     AfterInsertBeforeCommit = 0,
+    AfterMetadataBeforeMaterialization = 1,
 }
 
 internal sealed record PilotRuntimeTrustState(

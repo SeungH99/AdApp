@@ -45,11 +45,16 @@ public sealed class PilotValidator
     {
         ArgumentNullException.ThrowIfNull(vault);
         ArgumentNullException.ThrowIfNull(approvalLedger);
+        if (!approvalLedger.IsBoundTo(vault))
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.InvalidArguments);
+        }
+
         _authentication = new PilotAuthenticationService(vault);
         _trustedIdentity =
             PilotValidationTrustIdentity.From(approvalLedger);
         _load = cancellationToken => LoadAsync(
-            vault,
             approvalLedger,
             cancellationToken);
     }
@@ -447,41 +452,28 @@ public sealed class PilotValidator
     }
 
     private static async ValueTask<PilotValidationSnapshot> LoadAsync(
-        CorpusVault vault,
         ApprovalLedgerService approvalLedger,
         CancellationToken cancellationToken)
     {
-        var states = await vault.Store.ExecuteApprovalReadAsync(
-                (connection, transaction) =>
-                    vault.Store.ReadAllApprovalLabelStatesAsync(
-                        connection,
-                        transaction,
-                        MaximumPilotDocumentCount,
-                        cancellationToken),
-                cancellationToken)
-            .ConfigureAwait(false);
-        var verification = await approvalLedger.VerifyAsync(
-                MaximumPilotDocumentCount,
-                cancellationToken)
-            .ConfigureAwait(false);
-        var approvals = verification.IsValid
-            ? await approvalLedger.GetOwnerApprovalViewAsync(
-                    MaximumPilotDocumentCount,
+        var trusted =
+            await approvalLedger.ReadPilotValidationSnapshotAsync(
                     cancellationToken)
-                .ConfigureAwait(false)
-            : new OwnerApprovalView(
-                verification.LedgerHeadSha256,
-                []);
+                .ConfigureAwait(false);
+        var verification = trusted.Verification;
+        var approvals = trusted.Approvals;
         var approvalByDocument = approvals.Documents.ToDictionary(
             static item => item.DocumentId,
             static item => ParseApprovalMode(item.ApprovalMode),
             StringComparer.Ordinal);
-        var documents = states.Select(state =>
+        var documents = ImmutableArray.CreateBuilder<
+            PilotValidationDocument>(trusted.States.Count);
+        foreach (var state in trusted.States)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             approvalByDocument.TryGetValue(
                 state.Document.DocumentId,
                 out var mode);
-            return new PilotValidationDocument(
+            documents.Add(new PilotValidationDocument(
                 state.Document.DocumentId,
                 state.Document.ContentSha256,
                 state.Document.SourceFamilyId,
@@ -491,10 +483,11 @@ public sealed class PilotValidator
                 state.PreviousRevision?.RuleCatalogSha256,
                 state.PreviousRevision?.WorkerPackageSha256,
                 state.PreviousRevision?.Fields ?? [],
-                mode);
-        }).ToImmutableArray();
+                mode));
+        }
+
         return new PilotValidationSnapshot(
-            documents,
+            documents.MoveToImmutable(),
             VaultBoundaryValid: true,
             verification.IsValid,
             verification.LedgerHeadSha256);

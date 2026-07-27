@@ -749,12 +749,16 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             command.CommandText = """
                 SELECT document_id
                 FROM documents
-                ORDER BY document_id;
+                ORDER BY document_id
+                LIMIT $limit;
                 """;
+            command.Parameters.AddWithValue(
+                "$limit",
+                checked((long)maximumCount + 1L));
             await using var reader =
-                await command.ExecuteReaderAsync(CancellationToken.None)
+                await command.ExecuteReaderAsync(cancellationToken)
                     .ConfigureAwait(false);
-            while (await reader.ReadAsync(CancellationToken.None)
+            while (await reader.ReadAsync(cancellationToken)
                        .ConfigureAwait(false))
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -764,7 +768,14 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                         WorkbenchFailureCode.InvalidArguments);
                 }
 
-                documentIds.Add(reader.GetString(0));
+                if (reader.GetValue(0) is not string documentId
+                    || documentId.Length
+                        != "document-".Length + 64)
+                {
+                    throw InvalidState();
+                }
+
+                documentIds.Add(documentId);
             }
         }
 
@@ -777,7 +788,7 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                         connection,
                         transaction,
                         documentId,
-                        CancellationToken.None)
+                        cancellationToken)
                     .ConfigureAwait(false));
         }
 
@@ -868,7 +879,7 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
                 .ConfigureAwait(false);
             ValidateSchema(connection, transaction);
             RevalidateDatabaseSet();
-            await transaction.CommitAsync(CancellationToken.None)
+            await transaction.CommitAsync(cancellationToken)
                 .ConfigureAwait(false);
             return result;
         }

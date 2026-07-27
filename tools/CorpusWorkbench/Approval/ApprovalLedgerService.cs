@@ -31,6 +31,11 @@ public sealed record OwnerApprovalView(
     string LedgerHeadSha256,
     ImmutableArray<OwnerApprovedDocument> Documents);
 
+internal sealed record PilotApprovalValidationSnapshot(
+    IReadOnlyList<LabelDraftState> States,
+    ApprovalVerificationResult Verification,
+    OwnerApprovalView Approvals);
+
 public sealed record DirectReviewDecision(
     string DocumentId,
     string LabelRevisionId,
@@ -51,6 +56,9 @@ public sealed record BatchApprovalDecision(
 
 public sealed class ApprovalLedgerService
 {
+    internal const int MaximumPilotLedgerRowCount = 512;
+    private const int MaximumCanonicalBytes = 64 * 1024;
+    private const int MaximumAnchorCanonicalBytes = 4 * 1024;
     private const string GenesisSha256 =
         "0000000000000000000000000000000000000000000000000000000000000000";
     private const string EntryDomain = "corpus-approval-entry-v1\n";
@@ -76,6 +84,7 @@ public sealed class ApprovalLedgerService
     private readonly TimeProvider _timeProvider;
     private readonly CorpusWorkbenchStore _store;
     private readonly Func<CancellationToken, Task> _verifyWorker;
+    private readonly Action<ApprovalPilotReadPoint>? _observePilotRead;
 
     internal PilotScope TrustedPilotScope => _context.Scope;
 
@@ -88,6 +97,10 @@ public sealed class ApprovalLedgerService
 
     internal string TrustedWorkerPackageSha256 =>
         _context.WorkerIdentity.Sha256;
+
+    internal bool IsBoundTo(CorpusVault vault) =>
+        vault is not null
+        && ReferenceEquals(_store, vault.Store);
 
     public ApprovalLedgerService(
         CorpusVault vault,
@@ -137,6 +150,7 @@ public sealed class ApprovalLedgerService
             ?? throw new ArgumentNullException(nameof(timeProvider));
         _injectFault = injectFault;
         _verifyWorker = workerWorkspace.VerifyAsync;
+        _observePilotRead = null;
     }
 
     internal ApprovalLedgerService(
@@ -145,7 +159,8 @@ public sealed class ApprovalLedgerService
         IEnumerable<OfficialRuleCatalogSnapshot> rules,
         CorpusWorkerPackageIdentity workerIdentity,
         TimeProvider timeProvider,
-        Action<ApprovalLedgerFaultPoint>? injectFault)
+        Action<ApprovalLedgerFaultPoint>? injectFault,
+        Action<ApprovalPilotReadPoint>? observePilotRead = null)
     {
         ArgumentNullException.ThrowIfNull(vault);
         ArgumentNullException.ThrowIfNull(scope);
@@ -160,6 +175,7 @@ public sealed class ApprovalLedgerService
         _timeProvider = timeProvider;
         _injectFault = injectFault;
         _verifyWorker = static _ => Task.CompletedTask;
+        _observePilotRead = observePilotRead;
     }
 
     public async Task<ApprovalEntry> RecordDirectReviewAsync(
@@ -275,10 +291,22 @@ public sealed class ApprovalLedgerService
 
     public Task<ApprovalVerificationResult> VerifyAsync(
         CancellationToken cancellationToken) =>
-        VerifyAsync(int.MaxValue, cancellationToken);
+        VerifyCoreAsync(
+            int.MaxValue,
+            maximumLedgerRowCount: null,
+            cancellationToken);
 
-    internal async Task<ApprovalVerificationResult> VerifyAsync(
+    internal Task<ApprovalVerificationResult> VerifyAsync(
         int maximumDocumentCount,
+        CancellationToken cancellationToken) =>
+        VerifyCoreAsync(
+            maximumDocumentCount,
+            MaximumPilotLedgerRowCount,
+            cancellationToken);
+
+    private async Task<ApprovalVerificationResult> VerifyCoreAsync(
+        int maximumDocumentCount,
+        int? maximumLedgerRowCount,
         CancellationToken cancellationToken)
     {
         if (maximumDocumentCount < 0)
@@ -294,52 +322,42 @@ public sealed class ApprovalLedgerService
             {
                 var ledger = await ReadLedgerAsync(
                         connection,
-                        transaction)
+                        transaction,
+                        maximumLedgerRowCount,
+                        cancellationToken,
+                        _observePilotRead)
                     .ConfigureAwait(false);
-                var rows = ledger.Rows;
-                var invalid = FindChainFailures(rows);
-                FindLedgerSemanticFailures(rows, invalid);
-                FindAnchorFailures(ledger, invalid);
+                var states = Array.Empty<LabelDraftState>();
                 try
                 {
-                    var states =
+                    states =
+                    [
+                        ..
                         await _store.ReadAllApprovalLabelStatesAsync(
                                 connection,
                                 transaction,
                                 maximumDocumentCount,
                                 cancellationToken)
-                            .ConfigureAwait(false);
-                    FindCurrentStateFailures(
-                        rows,
-                        states,
-                        invalid);
+                            .ConfigureAwait(false),
+                    ];
                 }
                 catch (WorkbenchException)
                 {
-                    AddAllEntryIds(rows, invalid);
+                    return InvalidVerification(ledger);
                 }
                 catch (Exception exception) when (
                     exception is JsonException
                         or FormatException
                         or CryptographicException)
                 {
-                    AddAllEntryIds(rows, invalid);
+                    return InvalidVerification(ledger);
                 }
 
-                var ordered = invalid
-                    .OrderBy(
-                        entryId => EntrySequence(rows, entryId))
-                    .ThenBy(
-                        static entryId => entryId,
-                        StringComparer.Ordinal)
-                    .ToImmutableArray();
-                return new ApprovalVerificationResult(
-                    ordered.IsEmpty,
-                    ordered.IsEmpty
-                        ? null
-                        : WorkbenchFailureCode.ApprovalChainInvalid,
-                    LedgerHead(ledger),
-                    ordered);
+                return VerifyLedger(
+                    ledger,
+                    states,
+                    cancellationToken,
+                    _observePilotRead);
             },
             cancellationToken).ConfigureAwait(false);
         await VerifyWorkerAsync(cancellationToken)
@@ -349,10 +367,22 @@ public sealed class ApprovalLedgerService
 
     public Task<OwnerApprovalView> GetOwnerApprovalViewAsync(
         CancellationToken cancellationToken) =>
-        GetOwnerApprovalViewAsync(int.MaxValue, cancellationToken);
+        GetOwnerApprovalViewCoreAsync(
+            int.MaxValue,
+            maximumLedgerRowCount: null,
+            cancellationToken);
 
-    internal async Task<OwnerApprovalView> GetOwnerApprovalViewAsync(
+    internal Task<OwnerApprovalView> GetOwnerApprovalViewAsync(
         int maximumDocumentCount,
+        CancellationToken cancellationToken) =>
+        GetOwnerApprovalViewCoreAsync(
+            maximumDocumentCount,
+            MaximumPilotLedgerRowCount,
+            cancellationToken);
+
+    private async Task<OwnerApprovalView> GetOwnerApprovalViewCoreAsync(
+        int maximumDocumentCount,
+        int? maximumLedgerRowCount,
         CancellationToken cancellationToken)
     {
         if (maximumDocumentCount < 0)
@@ -368,18 +398,11 @@ public sealed class ApprovalLedgerService
             {
                 var ledger = await ReadLedgerAsync(
                         connection,
-                        transaction)
+                        transaction,
+                        maximumLedgerRowCount,
+                        cancellationToken,
+                        _observePilotRead)
                     .ConfigureAwait(false);
-                var rows = ledger.Rows;
-                var invalid = FindChainFailures(rows);
-                FindLedgerSemanticFailures(rows, invalid);
-                FindAnchorFailures(ledger, invalid);
-                if (invalid.Count != 0)
-                {
-                    throw new WorkbenchException(
-                        WorkbenchFailureCode.ApprovalChainInvalid);
-                }
-
                 var states =
                     await _store.ReadAllApprovalLabelStatesAsync(
                             connection,
@@ -387,74 +410,27 @@ public sealed class ApprovalLedgerService
                             maximumDocumentCount,
                             cancellationToken)
                         .ConfigureAwait(false);
-                var currentByDocument = states.ToDictionary(
-                    static state => state.Document.DocumentId,
-                    StringComparer.Ordinal);
-
-                var approved =
-                    new Dictionary<string, OwnerApprovedDocument>(
-                        StringComparer.Ordinal);
-                foreach (var row in LatestDocumentRows(
-                             rows,
-                             ApprovalMode.DirectReview))
+                var invalid = FindChainFailures(
+                    ledger.Rows,
+                    cancellationToken,
+                    _observePilotRead);
+                FindLedgerSemanticFailures(
+                    ledger.Rows,
+                    invalid,
+                    cancellationToken,
+                    _observePilotRead);
+                FindAnchorFailures(ledger, invalid);
+                if (invalid.Count != 0)
                 {
-                    var payload = row.Payload!;
-                    if (!IsCurrentDocumentApproval(
-                            payload,
-                            currentByDocument))
-                    {
-                        continue;
-                    }
-
-                    approved[payload.DocumentId!] =
-                        new OwnerApprovedDocument(
-                            payload.DocumentId!,
-                            payload.LabelRevisionId!,
-                            nameof(ApprovalMode.DirectReview),
-                            row.EntryId);
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.ApprovalChainInvalid);
                 }
 
-                foreach (var batch in rows
-                             .Where(static row =>
-                                 row.Payload?.Mode
-                                     == ApprovalMode.BatchApproval)
-                             .GroupBy(
-                                 static row =>
-                                     row.Payload!.MarketId,
-                                 StringComparer.Ordinal)
-                             .Select(static group => group
-                                 .OrderByDescending(
-                                     static row => row.Sequence)
-                                 .First()))
-                {
-                    if (!IsCurrentBatchApproval(
-                            batch,
-                            rows,
-                            states))
-                    {
-                        continue;
-                    }
-
-                    foreach (var delegated in
-                             batch.Payload!.DelegatedEntries)
-                    {
-                        approved.TryAdd(
-                            delegated.DocumentId,
-                            new OwnerApprovedDocument(
-                                delegated.DocumentId,
-                                delegated.LabelRevisionId,
-                                nameof(ApprovalMode.BatchApproval),
-                                batch.EntryId));
-                    }
-                }
-
-                return new OwnerApprovalView(
-                    LedgerHead(ledger),
-                    [
-                        .. approved.Values.OrderBy(
-                            static item => item.DocumentId,
-                            StringComparer.Ordinal),
-                    ]);
+                return BuildOwnerApprovalView(
+                    ledger,
+                    states,
+                    cancellationToken,
+                    _observePilotRead);
             },
             cancellationToken).ConfigureAwait(false);
         await VerifyWorkerAsync(cancellationToken)
@@ -462,23 +438,251 @@ public sealed class ApprovalLedgerService
         return result;
     }
 
+    internal async Task<PilotApprovalValidationSnapshot>
+        ReadPilotValidationSnapshotAsync(
+        CancellationToken cancellationToken)
+    {
+        await VerifyWorkerAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var result = await _store.ExecuteApprovalReadAsync(
+            async (connection, transaction) =>
+            {
+                var ledger = await ReadLedgerAsync(
+                        connection,
+                        transaction,
+                        MaximumPilotLedgerRowCount,
+                        cancellationToken,
+                        _observePilotRead)
+                    .ConfigureAwait(false);
+                _observePilotRead?.Invoke(
+                    ApprovalPilotReadPoint.AfterLedgerBeforeStates);
+                cancellationToken.ThrowIfCancellationRequested();
+                var states =
+                    await _store.ReadAllApprovalLabelStatesAsync(
+                            connection,
+                            transaction,
+                            PilotCatalog.HeldOutTargetPerMarket * 2,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                var verification = VerifyLedger(
+                    ledger,
+                    states,
+                    cancellationToken,
+                    _observePilotRead);
+                var approvals = verification.IsValid
+                    ? BuildOwnerApprovalView(
+                        ledger,
+                        states,
+                        cancellationToken,
+                        _observePilotRead)
+                    : new OwnerApprovalView(
+                        verification.LedgerHeadSha256,
+                        []);
+                cancellationToken.ThrowIfCancellationRequested();
+                return new PilotApprovalValidationSnapshot(
+                    states,
+                    verification,
+                    approvals);
+            },
+            cancellationToken).ConfigureAwait(false);
+        await VerifyWorkerAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return result;
+    }
+
+    private ApprovalVerificationResult VerifyLedger(
+        ApprovalLedgerSnapshot ledger,
+        IReadOnlyList<LabelDraftState> states,
+        CancellationToken cancellationToken,
+        Action<ApprovalPilotReadPoint>? observePilotRead)
+    {
+        var rows = ledger.Rows;
+        var invalid = FindChainFailures(
+            rows,
+            cancellationToken,
+            observePilotRead);
+        FindLedgerSemanticFailures(
+            rows,
+            invalid,
+            cancellationToken,
+            observePilotRead);
+        FindAnchorFailures(ledger, invalid);
+        FindCurrentStateFailures(
+            rows,
+            states,
+            invalid,
+            cancellationToken,
+            observePilotRead);
+        cancellationToken.ThrowIfCancellationRequested();
+        var ordered = invalid
+            .OrderBy(entryId => EntrySequence(rows, entryId))
+            .ThenBy(
+                static entryId => entryId,
+                StringComparer.Ordinal)
+            .ToImmutableArray();
+        return new ApprovalVerificationResult(
+            ordered.IsEmpty,
+            ordered.IsEmpty
+                ? null
+                : WorkbenchFailureCode.ApprovalChainInvalid,
+            LedgerHead(ledger),
+            ordered);
+    }
+
+    private static ApprovalVerificationResult InvalidVerification(
+        ApprovalLedgerSnapshot ledger)
+    {
+        var invalid = new HashSet<string>(StringComparer.Ordinal);
+        AddAllEntryIds(ledger.Rows, invalid);
+        return new ApprovalVerificationResult(
+            false,
+            WorkbenchFailureCode.ApprovalChainInvalid,
+            LedgerHead(ledger),
+            [
+                .. invalid.OrderBy(
+                    entryId => EntrySequence(ledger.Rows, entryId)),
+            ]);
+    }
+
+    private OwnerApprovalView BuildOwnerApprovalView(
+        ApprovalLedgerSnapshot ledger,
+        IReadOnlyList<LabelDraftState> states,
+        CancellationToken cancellationToken,
+        Action<ApprovalPilotReadPoint>? observePilotRead)
+    {
+        var currentByDocument =
+            new Dictionary<string, LabelDraftState>(
+                states.Count,
+                StringComparer.Ordinal);
+        foreach (var state in states)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            currentByDocument.Add(
+                state.Document.DocumentId,
+                state);
+        }
+
+        var approved =
+            new Dictionary<string, OwnerApprovedDocument>(
+                StringComparer.Ordinal);
+        foreach (var row in LatestDocumentRows(
+                     ledger.Rows,
+                     ApprovalMode.DirectReview,
+                     marketId: null,
+                     cancellationToken))
+        {
+            observePilotRead?.Invoke(
+                ApprovalPilotReadPoint.DuringProjection);
+            cancellationToken.ThrowIfCancellationRequested();
+            var payload = row.Payload!;
+            if (!IsCurrentDocumentApproval(
+                    payload,
+                    currentByDocument,
+                    cancellationToken))
+            {
+                continue;
+            }
+
+            approved[payload.DocumentId!] =
+                new OwnerApprovedDocument(
+                    payload.DocumentId!,
+                    payload.LabelRevisionId!,
+                    nameof(ApprovalMode.DirectReview),
+                    row.EntryId);
+        }
+
+        var latestBatches =
+            new Dictionary<string, ApprovalLedgerRow>(
+                StringComparer.Ordinal);
+        foreach (var row in ledger.Rows)
+        {
+            observePilotRead?.Invoke(
+                ApprovalPilotReadPoint.DuringProjection);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (row.Payload?.Mode == ApprovalMode.BatchApproval
+                && (!latestBatches.TryGetValue(
+                        row.Payload.MarketId,
+                        out var current)
+                    || row.Sequence > current.Sequence))
+            {
+                latestBatches[row.Payload.MarketId] = row;
+            }
+        }
+
+        foreach (var batch in latestBatches.Values)
+        {
+            observePilotRead?.Invoke(
+                ApprovalPilotReadPoint.DuringProjection);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!IsCurrentBatchApproval(
+                    batch,
+                    ledger.Rows,
+                    states,
+                    cancellationToken))
+            {
+                continue;
+            }
+
+            foreach (var delegated in
+                     batch.Payload!.DelegatedEntries)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                approved.TryAdd(
+                    delegated.DocumentId,
+                    new OwnerApprovedDocument(
+                        delegated.DocumentId,
+                        delegated.LabelRevisionId,
+                        nameof(ApprovalMode.BatchApproval),
+                        batch.EntryId));
+            }
+        }
+
+        return new OwnerApprovalView(
+            LedgerHead(ledger),
+            [
+                .. approved.Values.OrderBy(
+                    static item => item.DocumentId,
+                    StringComparer.Ordinal),
+            ]);
+    }
+
     internal static string ComputeBatchSummarySha256(
-        IEnumerable<ApprovalEntryReference> delegatedEntries)
+        IEnumerable<ApprovalEntryReference> delegatedEntries) =>
+        ComputeBatchSummarySha256(
+            delegatedEntries,
+            CancellationToken.None);
+
+    private static string ComputeBatchSummarySha256(
+        IEnumerable<ApprovalEntryReference> delegatedEntries,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(delegatedEntries);
-        var entries = delegatedEntries
-            .OrderBy(
-                static item => item.DocumentId,
-                StringComparer.Ordinal)
-            .ThenBy(
-                static item => item.EntryId,
-                StringComparer.Ordinal)
-            .ToArray();
-        if (entries.Select(static item => item.DocumentId)
-            .Distinct(StringComparer.Ordinal)
-            .Count() != entries.Length)
+        var entries = new List<ApprovalEntryReference>();
+        foreach (var entry in delegatedEntries)
         {
-            throw InvalidState();
+            cancellationToken.ThrowIfCancellationRequested();
+            entries.Add(entry);
+        }
+
+        entries.Sort(static (left, right) =>
+        {
+            var documentOrder = string.CompareOrdinal(
+                left.DocumentId,
+                right.DocumentId);
+            return documentOrder != 0
+                ? documentOrder
+                : string.CompareOrdinal(
+                    left.EntryId,
+                    right.EntryId);
+        });
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in entries)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!seen.Add(entry.DocumentId))
+            {
+                throw InvalidState();
+            }
         }
 
         using var stream = new MemoryStream();
@@ -488,6 +692,7 @@ public sealed class ApprovalLedgerService
             writer.WriteStartArray();
             foreach (var entry in entries)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 WriteReference(writer, entry);
             }
 
@@ -667,30 +872,67 @@ public sealed class ApprovalLedgerService
     private void FindCurrentStateFailures(
         IReadOnlyList<ApprovalLedgerRow> rows,
         IReadOnlyList<LabelDraftState> states,
-        ISet<string> invalid)
+        ISet<string> invalid,
+        CancellationToken cancellationToken,
+        Action<ApprovalPilotReadPoint>? observePilotRead)
     {
-        var currentByDocument = states.ToDictionary(
-            static state => state.Document.DocumentId,
-            StringComparer.Ordinal);
-        var latestDocumentDecisions = rows
-            .Where(static row =>
-                row.Payload?.Mode is ApprovalMode.DirectReview
-                    or ApprovalMode.DelegatedLabel)
-            .GroupBy(
-                static row => (
-                    row.Payload!.Mode,
-                    row.Payload.DocumentId),
-                EqualityComparer<(ApprovalMode, string?)>.Default)
-            .Select(static group =>
-                group.OrderByDescending(static row => row.Sequence)
-                    .First());
-        foreach (var row in latestDocumentDecisions)
+        var currentByDocument =
+            new Dictionary<string, LabelDraftState>(
+                states.Count,
+                StringComparer.Ordinal);
+        foreach (var state in states)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            currentByDocument.Add(
+                state.Document.DocumentId,
+                state);
+        }
+
+        var latestDocumentDecisions =
+            new Dictionary<(ApprovalMode, string), ApprovalLedgerRow>();
+        var latestBatches =
+            new Dictionary<string, ApprovalLedgerRow>(
+                StringComparer.Ordinal);
+        foreach (var row in rows)
+        {
+            observePilotRead?.Invoke(
+                ApprovalPilotReadPoint.DuringSemanticVerification);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (row.Payload?.Mode is ApprovalMode.DirectReview
+                    or ApprovalMode.DelegatedLabel
+                && row.Payload.DocumentId is { } documentId)
+            {
+                var key = (row.Payload.Mode, documentId);
+                if (!latestDocumentDecisions.TryGetValue(
+                        key,
+                        out var existing)
+                    || row.Sequence > existing.Sequence)
+                {
+                    latestDocumentDecisions[key] = row;
+                }
+            }
+            else if (row.Payload?.Mode
+                         == ApprovalMode.BatchApproval
+                     && (!latestBatches.TryGetValue(
+                             row.Payload.MarketId,
+                             out var existingBatch)
+                         || row.Sequence > existingBatch.Sequence))
+            {
+                latestBatches[row.Payload.MarketId] = row;
+            }
+        }
+
+        foreach (var row in latestDocumentDecisions.Values)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
             var payload = row.Payload!;
             if (!currentByDocument.TryGetValue(
                     payload.DocumentId!,
                     out var state)
-                || !MatchesCurrent(payload, state))
+                || !MatchesCurrent(
+                    payload,
+                    state,
+                    cancellationToken))
             {
                 invalid.Add(row.DiagnosticId);
                 continue;
@@ -712,17 +954,9 @@ public sealed class ApprovalLedgerService
             }
         }
 
-        var latestBatches = rows
-            .Where(static row =>
-                row.Payload?.Mode == ApprovalMode.BatchApproval)
-            .GroupBy(
-                static row => row.Payload!.MarketId,
-                StringComparer.Ordinal)
-            .Select(static group =>
-                group.OrderByDescending(static row => row.Sequence)
-                    .First());
-        foreach (var batch in latestBatches)
+        foreach (var batch in latestBatches.Values)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
                 var payload = batch.Payload!;
@@ -730,9 +964,12 @@ public sealed class ApprovalLedgerService
                     payload.MarketId,
                     rows,
                     states,
-                    requireExactDirectCount: true);
+                    requireExactDirectCount: true,
+                    cancellationToken);
                 var summary =
-                    ComputeBatchSummarySha256(selected.Delegated);
+                    ComputeBatchSummarySha256(
+                        selected.Delegated,
+                        cancellationToken);
                 if (!FixedEquals(
                         summary,
                         payload.BatchSummarySha256!)
@@ -754,12 +991,16 @@ public sealed class ApprovalLedgerService
 
     private bool IsCurrentDocumentApproval(
         ApprovalDecisionPayload payload,
-        IReadOnlyDictionary<string, LabelDraftState> currentByDocument)
+        IReadOnlyDictionary<string, LabelDraftState> currentByDocument,
+        CancellationToken cancellationToken = default)
     {
         if (!currentByDocument.TryGetValue(
                 payload.DocumentId!,
                 out var state)
-            || !MatchesCurrent(payload, state))
+            || !MatchesCurrent(
+                payload,
+                state,
+                cancellationToken))
         {
             return false;
         }
@@ -786,7 +1027,8 @@ public sealed class ApprovalLedgerService
     private bool IsCurrentBatchApproval(
         ApprovalLedgerRow batch,
         IReadOnlyList<ApprovalLedgerRow> rows,
-        IReadOnlyList<LabelDraftState> states)
+        IReadOnlyList<LabelDraftState> states,
+        CancellationToken cancellationToken = default)
     {
         try
         {
@@ -795,8 +1037,11 @@ public sealed class ApprovalLedgerService
                 payload.MarketId,
                 rows,
                 states,
-                requireExactDirectCount: true);
-            var summary = ComputeBatchSummarySha256(selected.Delegated);
+                requireExactDirectCount: true,
+                cancellationToken);
+            var summary = ComputeBatchSummarySha256(
+                selected.Delegated,
+                cancellationToken);
             return FixedEquals(summary, payload.BatchSummarySha256!)
                 && payload.DelegatedEntries.AsSpan()
                     .SequenceEqual(selected.Delegated.AsSpan())
@@ -814,7 +1059,8 @@ public sealed class ApprovalLedgerService
         string marketId,
         IReadOnlyList<ApprovalLedgerRow> rows,
         IReadOnlyList<LabelDraftState> states,
-        bool requireExactDirectCount)
+        bool requireExactDirectCount,
+        CancellationToken cancellationToken = default)
     {
         if (!_context.RuleCatalogs.ContainsKey(marketId))
         {
@@ -822,31 +1068,42 @@ public sealed class ApprovalLedgerService
                 WorkbenchFailureCode.StaleRuleSet);
         }
 
-        var current = states
-            .Where(state => string.Equals(
-                state.Document.MarketId,
-                marketId,
-                StringComparison.Ordinal))
-            .ToDictionary(
-                static state => state.Document.DocumentId,
-                StringComparer.Ordinal);
+        var current = new Dictionary<string, LabelDraftState>(
+            StringComparer.Ordinal);
+        foreach (var state in states)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (string.Equals(
+                    state.Document.MarketId,
+                    marketId,
+                    StringComparison.Ordinal))
+            {
+                current.Add(state.Document.DocumentId, state);
+            }
+        }
         var directRows = LatestDocumentRows(
             rows,
             ApprovalMode.DirectReview,
-            marketId);
+            marketId,
+            cancellationToken);
         var delegatedRows = LatestDocumentRows(
             rows,
             ApprovalMode.DelegatedLabel,
-            marketId);
+            marketId,
+            cancellationToken);
 
         var direct = ImmutableArray.CreateBuilder<
             ApprovalEntryReference>();
         foreach (var row in directRows)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!current.TryGetValue(
                     row.Payload!.DocumentId!,
                     out var state)
-                || !MatchesCurrent(row.Payload, state))
+                || !MatchesCurrent(
+                    row.Payload,
+                    state,
+                    cancellationToken))
             {
                 throw new WorkbenchException(
                     WorkbenchFailureCode.InsufficientDirectReview);
@@ -873,10 +1130,14 @@ public sealed class ApprovalLedgerService
             ApprovalEntryReference>();
         foreach (var row in delegatedRows)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!current.TryGetValue(
                     row.Payload!.DocumentId!,
                     out var state)
-                || !MatchesCurrent(row.Payload, state))
+                || !MatchesCurrent(
+                    row.Payload,
+                    state,
+                    cancellationToken))
             {
                 throw InvalidState();
             }
@@ -918,40 +1179,41 @@ public sealed class ApprovalLedgerService
     private static IReadOnlyList<ApprovalLedgerRow>
         LatestDocumentRows(
         IReadOnlyList<ApprovalLedgerRow> rows,
-        ApprovalMode mode) =>
-        rows.Where(row => row.Payload?.Mode == mode)
-            .GroupBy(
-                static row => row.Payload!.DocumentId!,
-                StringComparer.Ordinal)
-            .Select(static group =>
-                group.OrderByDescending(static row => row.Sequence)
-                    .First())
-            .OrderBy(
-                static row => row.Payload!.DocumentId,
-                StringComparer.Ordinal)
-            .ToArray();
-
-    private static IReadOnlyList<ApprovalLedgerRow>
-        LatestDocumentRows(
-        IReadOnlyList<ApprovalLedgerRow> rows,
         ApprovalMode mode,
-        string marketId) =>
-        rows.Where(row =>
-                row.Payload?.Mode == mode
-                && string.Equals(
-                    row.Payload.MarketId,
-                    marketId,
-                    StringComparison.Ordinal))
-            .GroupBy(
-                static row => row.Payload!.DocumentId!,
-                StringComparer.Ordinal)
-            .Select(static group =>
-                group.OrderByDescending(static row => row.Sequence)
-                    .First())
-            .OrderBy(
+        string? marketId,
+        CancellationToken cancellationToken = default)
+    {
+        var latest = new Dictionary<string, ApprovalLedgerRow>(
+            StringComparer.Ordinal);
+        foreach (var row in rows)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (row.Payload?.Mode != mode
+                || row.Payload.DocumentId is not { } documentId
+                || marketId is not null
+                    && !string.Equals(
+                        row.Payload.MarketId,
+                        marketId,
+                        StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (!latest.TryGetValue(documentId, out var existing)
+                || row.Sequence > existing.Sequence)
+            {
+                latest[documentId] = row;
+            }
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return
+        [
+            .. latest.Values.OrderBy(
                 static row => row.Payload!.DocumentId,
-                StringComparer.Ordinal)
-            .ToArray();
+                StringComparer.Ordinal),
+        ];
+    }
 
     private void RequireCurrentBinding(LabelDraftState state)
     {
@@ -979,7 +1241,8 @@ public sealed class ApprovalLedgerService
 
     private bool MatchesCurrent(
         ApprovalDecisionPayload payload,
-        LabelDraftState state)
+        LabelDraftState state,
+        CancellationToken cancellationToken = default)
     {
         var revision = state.PreviousRevision;
         return revision is not null
@@ -1000,7 +1263,10 @@ public sealed class ApprovalLedgerService
                 payload.LabelRevisionSha256,
                 revision.RevisionSha256,
                 StringComparison.Ordinal)
-            && FieldsEqual(payload.Fields, revision.Fields);
+            && FieldsEqual(
+                payload.Fields,
+                revision.Fields,
+                cancellationToken);
     }
 
     private bool IsCurrentContext(
@@ -1067,7 +1333,8 @@ public sealed class ApprovalLedgerService
 
     private static bool FieldsEqual(
         ImmutableArray<LabeledField> left,
-        ImmutableArray<LabeledField> right)
+        ImmutableArray<LabeledField> right,
+        CancellationToken cancellationToken = default)
     {
         if (left.IsDefault
             || right.IsDefault
@@ -1078,6 +1345,7 @@ public sealed class ApprovalLedgerService
 
         for (var index = 0; index < left.Length; index++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var leftField = left[index];
             var rightField = right[index];
             if (!string.Equals(
@@ -1113,35 +1381,113 @@ public sealed class ApprovalLedgerService
     private static async Task<IReadOnlyList<ApprovalLedgerRow>>
         ReadRowsAsync(
         SqliteConnection connection,
-        SqliteTransaction? transaction)
+        SqliteTransaction? transaction,
+        int? maximumRowCount,
+        CancellationToken cancellationToken,
+        Action<ApprovalPilotReadPoint>? observePilotRead)
     {
+        if (maximumRowCount is < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumRowCount));
+        }
+
         var rows = new List<ApprovalLedgerRow>();
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
             SELECT
+              typeof(sequence),
               sequence,
+              typeof(entry_id),
+              length(entry_id),
               entry_id,
+              typeof(previous_entry_sha256),
+              length(previous_entry_sha256),
               previous_entry_sha256,
+              typeof(entry_sha256),
+              length(entry_sha256),
               entry_sha256,
+              typeof(canonical_json),
+              length(canonical_json),
               canonical_json
             FROM approval_entries
-            ORDER BY sequence;
+            ORDER BY sequence
             """;
+        if (maximumRowCount is { } maximum)
+        {
+            command.CommandText += "\nLIMIT $limit;";
+            command.Parameters.AddWithValue(
+                "$limit",
+                checked((long)maximum + 1L));
+        }
+        else
+        {
+            command.CommandText += ";";
+        }
+
         await using var reader =
-            await command.ExecuteReaderAsync(CancellationToken.None)
+            await command.ExecuteReaderAsync(cancellationToken)
                 .ConfigureAwait(false);
-        while (await reader.ReadAsync(CancellationToken.None)
+        while (await reader.ReadAsync(cancellationToken)
                    .ConfigureAwait(false))
         {
-            var sequence = reader.GetInt64(0);
-            var entryId = reader.GetValue(1) as string
-                ?? string.Empty;
-            var previous = reader.GetValue(2) as string
-                ?? string.Empty;
-            var entryHash = reader.GetValue(3) as string
-                ?? string.Empty;
-            if (reader.GetValue(4) is not byte[] canonical)
+            observePilotRead?.Invoke(
+                ApprovalPilotReadPoint.AfterLedgerRowRead);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (maximumRowCount is { } rowLimit
+                && rows.Count >= rowLimit)
+            {
+                throw new WorkbenchException(
+                    WorkbenchFailureCode.InvalidArguments);
+            }
+
+            var sequenceValid =
+                IsSqliteType(reader, 0, "integer")
+                && reader.GetValue(1) is long;
+            var entryIdValid = IsBoundedSqliteText(
+                reader,
+                2,
+                3,
+                "approval-".Length + 64,
+                "approval-".Length + 64);
+            var previousValid = IsBoundedSqliteText(
+                reader,
+                5,
+                6,
+                64,
+                64);
+            var entryHashValid = IsBoundedSqliteText(
+                reader,
+                8,
+                9,
+                64,
+                64);
+            var canonicalValid =
+                maximumRowCount is null
+                    ? IsSqliteType(reader, 11, "blob")
+                    : IsBoundedSqliteBlob(
+                        reader,
+                        11,
+                        12,
+                        MaximumCanonicalBytes);
+            var sequence = sequenceValid
+                ? reader.GetInt64(1)
+                : 0;
+            var entryId = entryIdValid
+                ? reader.GetString(4)
+                : string.Empty;
+            var previous = previousValid
+                ? reader.GetString(7)
+                : string.Empty;
+            var entryHash = entryHashValid
+                ? reader.GetString(10)
+                : string.Empty;
+            if (!sequenceValid
+                || !entryIdValid
+                || !previousValid
+                || !entryHashValid
+                || !canonicalValid)
             {
                 rows.Add(
                     ApprovalLedgerRow.Invalid(
@@ -1153,8 +1499,10 @@ public sealed class ApprovalLedgerService
                 continue;
             }
 
+            var canonical = reader.GetFieldValue<byte[]>(13);
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var payload =
                     CanonicalApprovalDecision.Parse(canonical);
                 rows.Add(
@@ -1187,15 +1535,39 @@ public sealed class ApprovalLedgerService
     private static async Task<ApprovalLedgerSnapshot>
         ReadLedgerAsync(
         SqliteConnection connection,
-        SqliteTransaction transaction)
-    {
-        var rows = await ReadRowsAsync(connection, transaction)
+        SqliteTransaction transaction) =>
+        await ReadLedgerAsync(
+                connection,
+                transaction,
+                maximumRowCount: null,
+                CancellationToken.None,
+                observePilotRead: null)
             .ConfigureAwait(false);
-        var anchor = await ReadAnchorAsync(connection, transaction)
+
+    private static async Task<ApprovalLedgerSnapshot>
+        ReadLedgerAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int? maximumRowCount,
+        CancellationToken cancellationToken,
+        Action<ApprovalPilotReadPoint>? observePilotRead)
+    {
+        var rows = await ReadRowsAsync(
+                connection,
+                transaction,
+                maximumRowCount,
+                cancellationToken,
+                observePilotRead)
+            .ConfigureAwait(false);
+        var anchor = await ReadAnchorAsync(
+                connection,
+                transaction,
+                cancellationToken)
             .ConfigureAwait(false);
         var sequence = await ReadSqliteSequenceAsync(
                 connection,
-                transaction)
+                transaction,
+                cancellationToken)
             .ConfigureAwait(false);
         return new ApprovalLedgerSnapshot(rows, anchor, sequence);
     }
@@ -1203,12 +1575,19 @@ public sealed class ApprovalLedgerService
     private static async Task<ApprovalLedgerAnchorState>
         ReadAnchorAsync(
         SqliteConnection connection,
-        SqliteTransaction transaction)
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT scope_sha256, canonical_json
+            SELECT
+              typeof(scope_sha256),
+              length(scope_sha256),
+              scope_sha256,
+              typeof(canonical_json),
+              length(canonical_json),
+              canonical_json
             FROM checkpoints
             WHERE checkpoint_id=$checkpoint_id;
             """;
@@ -1216,16 +1595,31 @@ public sealed class ApprovalLedgerService
             "$checkpoint_id",
             AnchorCheckpointId);
         await using var reader =
-            await command.ExecuteReaderAsync(CancellationToken.None)
+            await command.ExecuteReaderAsync(cancellationToken)
                 .ConfigureAwait(false);
-        if (!await reader.ReadAsync(CancellationToken.None)
+        if (!await reader.ReadAsync(cancellationToken)
                 .ConfigureAwait(false))
         {
             return ApprovalLedgerAnchorState.Missing;
         }
 
-        var scopeSha256 = reader.GetValue(0) as string ?? string.Empty;
-        var canonical = reader.GetValue(1) as byte[] ?? [];
+        if (!IsBoundedSqliteText(reader, 0, 1, 64, 64)
+            || !IsBoundedSqliteBlob(
+                reader,
+                3,
+                4,
+                MaximumAnchorCanonicalBytes))
+        {
+            return new ApprovalLedgerAnchorState(
+                true,
+                string.Empty,
+                [],
+                null,
+                false);
+        }
+
+        var scopeSha256 = reader.GetString(2);
+        var canonical = reader.GetFieldValue<byte[]>(5);
         try
         {
             return new ApprovalLedgerAnchorState(
@@ -1252,7 +1646,8 @@ public sealed class ApprovalLedgerService
     private static async Task<SqliteSequenceState>
         ReadSqliteSequenceAsync(
         SqliteConnection connection,
-        SqliteTransaction transaction)
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
@@ -1262,14 +1657,15 @@ public sealed class ApprovalLedgerService
             WHERE name='approval_entries';
             """;
         await using var reader =
-            await command.ExecuteReaderAsync(CancellationToken.None)
+            await command.ExecuteReaderAsync(cancellationToken)
                 .ConfigureAwait(false);
         var count = 0;
         long? sequence = null;
         var valuesValid = true;
-        while (await reader.ReadAsync(CancellationToken.None)
+        while (await reader.ReadAsync(cancellationToken)
                    .ConfigureAwait(false))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             count++;
             if (reader.GetValue(0) is long value)
             {
@@ -1286,6 +1682,37 @@ public sealed class ApprovalLedgerService
             sequence,
             valuesValid);
     }
+
+    private static bool IsBoundedSqliteText(
+        SqliteDataReader reader,
+        int typeOrdinal,
+        int lengthOrdinal,
+        int minimumLength,
+        int maximumLength) =>
+        IsSqliteType(reader, typeOrdinal, "text")
+        && reader.GetValue(lengthOrdinal) is long length
+        && length >= minimumLength
+        && length <= maximumLength;
+
+    private static bool IsBoundedSqliteBlob(
+        SqliteDataReader reader,
+        int typeOrdinal,
+        int lengthOrdinal,
+        int maximumLength) =>
+        IsSqliteType(reader, typeOrdinal, "blob")
+        && reader.GetValue(lengthOrdinal) is long length
+        && length > 0
+        && length <= maximumLength;
+
+    private static bool IsSqliteType(
+        SqliteDataReader reader,
+        int ordinal,
+        string expected) =>
+        reader.GetValue(ordinal) is string actual
+        && string.Equals(
+            actual,
+            expected,
+            StringComparison.Ordinal);
 
     private static async Task WriteAnchorAsync(
         SqliteConnection connection,
@@ -1328,13 +1755,18 @@ public sealed class ApprovalLedgerService
     }
 
     private static HashSet<string> FindChainFailures(
-        IReadOnlyList<ApprovalLedgerRow> rows)
+        IReadOnlyList<ApprovalLedgerRow> rows,
+        CancellationToken cancellationToken = default,
+        Action<ApprovalPilotReadPoint>? observePilotRead = null)
     {
         var invalid = new HashSet<string>(StringComparer.Ordinal);
         var expectedPrevious = GenesisSha256;
         long expectedSequence = 1;
         foreach (var row in rows)
         {
+            observePilotRead?.Invoke(
+                ApprovalPilotReadPoint.DuringChainVerification);
+            cancellationToken.ThrowIfCancellationRequested();
             var valid = row.Sequence == expectedSequence
                 && row.CanonicalValid
                 && IsSafeEntryId(row.EntryId)
@@ -1355,7 +1787,9 @@ public sealed class ApprovalLedgerService
                         HashEntry(
                             row.PreviousEntrySha256,
                             row.Canonical))
-                    && IsValidPayload(row.Payload!);
+                    && IsValidPayload(
+                        row.Payload!,
+                        cancellationToken);
             }
 
             if (!valid)
@@ -1436,7 +1870,8 @@ public sealed class ApprovalLedgerService
     }
 
     private static bool IsValidPayload(
-        ApprovalDecisionPayload payload)
+        ApprovalDecisionPayload payload,
+        CancellationToken cancellationToken = default)
     {
         if (payload.SchemaVersion != "1"
             || string.IsNullOrWhiteSpace(payload.ScopeId)
@@ -1476,13 +1911,16 @@ public sealed class ApprovalLedgerService
                     payload.MarketId,
                     StringComparison.Ordinal)
                 && IsCanonicalReferences(
-                    payload.DelegatedEntries)
+                    payload.DelegatedEntries,
+                    cancellationToken)
                 && IsCanonicalReferences(
-                    payload.DirectReviewEntries)
+                    payload.DirectReviewEntries,
+                    cancellationToken)
                 && FixedEquals(
                     payload.BatchSummarySha256!,
                     ComputeBatchSummarySha256(
-                        payload.DelegatedEntries));
+                        payload.DelegatedEntries,
+                        cancellationToken));
         }
 
         if (payload.Mode is not (
@@ -1523,49 +1961,66 @@ public sealed class ApprovalLedgerService
     }
 
     private static bool IsCanonicalReferences(
-        ImmutableArray<ApprovalEntryReference> references)
+        ImmutableArray<ApprovalEntryReference> references,
+        CancellationToken cancellationToken = default)
     {
-        var ordered = references
-            .OrderBy(
-                static item => item.DocumentId,
-                StringComparer.Ordinal)
-            .ToArray();
+        var ordered = references.ToArray();
+        Array.Sort(
+            ordered,
+            static (left, right) => string.CompareOrdinal(
+                left.DocumentId,
+                right.DocumentId));
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var item in ordered)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!seen.Add(item.DocumentId)
+                || !IsSafeEntryId(item.EntryId)
+                || !IsLowerSha256(item.EntrySha256)
+                || !IsLowerSha256(item.DocumentSha256)
+                || !IsLowerSha256(item.LabelRevisionSha256)
+                || !IsLowerSha256(item.RuleCatalogSha256)
+                || !CorpusWorkerPackageManifest
+                    .IsCanonicalExecutionIdentity(
+                        new CorpusWorkerPackageIdentity(
+                            item.WorkerPackageManifestId,
+                            item.WorkerPackageManifestVersion,
+                            item.WorkerPackageSha256,
+                            item.WorkerExecutableRelativePath,
+                            item.WorkerExecutableSha256)))
+            {
+                return false;
+            }
+        }
+
         return ordered.AsSpan().SequenceEqual(references.AsSpan())
-            && ordered
-                .Select(static item => item.DocumentId)
-                .Distinct(StringComparer.Ordinal)
-                .Count() == ordered.Length
-            && ordered.All(
-                static item =>
-                    IsSafeEntryId(item.EntryId)
-                    && IsLowerSha256(item.EntrySha256)
-                    && IsLowerSha256(item.DocumentSha256)
-                    && IsLowerSha256(item.LabelRevisionSha256)
-                    && IsLowerSha256(item.RuleCatalogSha256)
-                    && CorpusWorkerPackageManifest
-                        .IsCanonicalExecutionIdentity(
-                            new CorpusWorkerPackageIdentity(
-                                item.WorkerPackageManifestId,
-                                item.WorkerPackageManifestVersion,
-                                item.WorkerPackageSha256,
-                                item.WorkerExecutableRelativePath,
-                                item.WorkerExecutableSha256)));
+            && seen.Count == ordered.Length;
     }
 
     private void FindLedgerSemanticFailures(
         IReadOnlyList<ApprovalLedgerRow> rows,
-        ISet<string> invalid)
+        ISet<string> invalid,
+        CancellationToken cancellationToken = default,
+        Action<ApprovalPilotReadPoint>? observePilotRead = null)
     {
-        var byId = rows
-            .Where(static row =>
-                row.CanonicalValid
-                && IsSafeEntryId(row.EntryId))
-            .ToDictionary(
-                static row => row.EntryId,
-                StringComparer.Ordinal);
-        foreach (var row in rows.Where(static row =>
-                     row.Payload is not null))
+        var byId = new Dictionary<string, ApprovalLedgerRow>(
+            StringComparer.Ordinal);
+        foreach (var row in rows)
         {
+            observePilotRead?.Invoke(
+                ApprovalPilotReadPoint.DuringSemanticVerification);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (row.CanonicalValid
+                && IsSafeEntryId(row.EntryId))
+            {
+                byId.Add(row.EntryId, row);
+            }
+
+            if (row.Payload is null)
+            {
+                continue;
+            }
+
             if (!IsDecisionTimeWithinPolicy(
                     row.Payload!.ApprovedAtUtc))
             {
@@ -1573,10 +2028,17 @@ public sealed class ApprovalLedgerService
             }
         }
 
-        foreach (var batch in rows.Where(static row =>
-                     row.Payload?.Mode
-                         == ApprovalMode.BatchApproval))
+        foreach (var batch in rows)
         {
+            observePilotRead?.Invoke(
+                ApprovalPilotReadPoint.DuringSemanticVerification);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (batch.Payload?.Mode
+                != ApprovalMode.BatchApproval)
+            {
+                continue;
+            }
+
             var payload = batch.Payload!;
             if (payload.DirectReviewEntries.Length
                     != PilotCatalog.DirectReviewTargetPerMarket
@@ -1585,13 +2047,15 @@ public sealed class ApprovalLedgerService
                     ApprovalMode.DirectReview,
                     payload,
                     batch.Sequence,
-                    byId)
+                    byId,
+                    cancellationToken)
                 || !ReferencesEarlierEntries(
                     payload.DelegatedEntries,
                     ApprovalMode.DelegatedLabel,
                     payload,
                     batch.Sequence,
-                    byId))
+                    byId,
+                    cancellationToken))
             {
                 invalid.Add(batch.DiagnosticId);
             }
@@ -1603,10 +2067,12 @@ public sealed class ApprovalLedgerService
         ApprovalMode expectedMode,
         ApprovalDecisionPayload batch,
         long batchSequence,
-        IReadOnlyDictionary<string, ApprovalLedgerRow> byId)
+        IReadOnlyDictionary<string, ApprovalLedgerRow> byId,
+        CancellationToken cancellationToken = default)
     {
         foreach (var reference in references)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!byId.TryGetValue(reference.EntryId, out var row)
                 || row.Sequence >= batchSequence
                 || row.Payload?.Mode != expectedMode
@@ -2391,6 +2857,15 @@ internal enum ApprovalLedgerFaultPoint
     BeforeInsert,
     AfterInsertBeforeAnchor,
     AfterInsertBeforeCommit,
+}
+
+internal enum ApprovalPilotReadPoint
+{
+    AfterLedgerRowRead,
+    AfterLedgerBeforeStates,
+    DuringChainVerification,
+    DuringSemanticVerification,
+    DuringProjection,
 }
 
 [JsonSourceGenerationOptions(
