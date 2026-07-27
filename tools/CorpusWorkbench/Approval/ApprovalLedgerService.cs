@@ -77,6 +77,18 @@ public sealed class ApprovalLedgerService
     private readonly CorpusWorkbenchStore _store;
     private readonly Func<CancellationToken, Task> _verifyWorker;
 
+    internal PilotScope TrustedPilotScope => _context.Scope;
+
+    internal ImmutableDictionary<string, string>
+        TrustedRuleCatalogs => _context.RuleCatalogs;
+
+    internal string TrustedPilotRuleCatalogSha256 =>
+        OfficialRuleCatalog.ComputePilotCatalogSha256(
+            _context.RuleSnapshots.Values);
+
+    internal string TrustedWorkerPackageSha256 =>
+        _context.WorkerIdentity.Sha256;
+
     public ApprovalLedgerService(
         CorpusVault vault,
         PilotScope scope,
@@ -261,9 +273,20 @@ public sealed class ApprovalLedgerService
             cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<ApprovalVerificationResult> VerifyAsync(
+    public Task<ApprovalVerificationResult> VerifyAsync(
+        CancellationToken cancellationToken) =>
+        VerifyAsync(int.MaxValue, cancellationToken);
+
+    internal async Task<ApprovalVerificationResult> VerifyAsync(
+        int maximumDocumentCount,
         CancellationToken cancellationToken)
     {
+        if (maximumDocumentCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumDocumentCount));
+        }
+
         await VerifyWorkerAsync(cancellationToken)
             .ConfigureAwait(false);
         var result = await _store.ExecuteApprovalReadAsync(
@@ -282,7 +305,9 @@ public sealed class ApprovalLedgerService
                     var states =
                         await _store.ReadAllApprovalLabelStatesAsync(
                                 connection,
-                                transaction)
+                                transaction,
+                                maximumDocumentCount,
+                                cancellationToken)
                             .ConfigureAwait(false);
                     FindCurrentStateFailures(
                         rows,
@@ -322,9 +347,20 @@ public sealed class ApprovalLedgerService
         return result;
     }
 
-    public async Task<OwnerApprovalView> GetOwnerApprovalViewAsync(
+    public Task<OwnerApprovalView> GetOwnerApprovalViewAsync(
+        CancellationToken cancellationToken) =>
+        GetOwnerApprovalViewAsync(int.MaxValue, cancellationToken);
+
+    internal async Task<OwnerApprovalView> GetOwnerApprovalViewAsync(
+        int maximumDocumentCount,
         CancellationToken cancellationToken)
     {
+        if (maximumDocumentCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumDocumentCount));
+        }
+
         await VerifyWorkerAsync(cancellationToken)
             .ConfigureAwait(false);
         var result = await _store.ExecuteApprovalReadAsync(
@@ -347,7 +383,9 @@ public sealed class ApprovalLedgerService
                 var states =
                     await _store.ReadAllApprovalLabelStatesAsync(
                             connection,
-                            transaction)
+                            transaction,
+                            maximumDocumentCount,
+                            cancellationToken)
                         .ConfigureAwait(false);
                 var currentByDocument = states.ToDictionary(
                     static state => state.Document.DocumentId,

@@ -1,6 +1,8 @@
 using System.Collections.Frozen;
+using System.Buffers.Binary;
 using System.Globalization;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using LocalDocumentOrganizer.CorpusWorkbench.Contracts;
 using LocalDocumentOrganizer.CorpusWorkbench.Serialization;
@@ -9,6 +11,9 @@ namespace LocalDocumentOrganizer.CorpusWorkbench.Rules;
 
 public static class OfficialRuleCatalog
 {
+    private const string PilotIdentityDomain =
+        "corpus-workbench-official-rule-catalog-set-v1\n";
+
     public static async Task<OfficialRuleCatalogSnapshot> LoadAsync(
         string path,
         CancellationToken cancellationToken)
@@ -26,6 +31,92 @@ public static class OfficialRuleCatalog
             document.Rules.ToFrozenDictionary(
                 static rule => rule.FieldId,
                 StringComparer.Ordinal));
+    }
+
+    internal static string ComputePilotCatalogSha256(
+        IEnumerable<OfficialRuleCatalogSnapshot> snapshots)
+    {
+        ArgumentNullException.ThrowIfNull(snapshots);
+        var canonical = new List<OfficialRuleCatalogSnapshot>(
+            PilotCatalog.MarketIds.Length);
+        foreach (var snapshot in snapshots)
+        {
+            if (snapshot is null
+                || snapshot.Document is null
+                || canonical.Count >= PilotCatalog.MarketIds.Length)
+            {
+                throw new WorkbenchException(
+                    WorkbenchFailureCode.InvalidArguments);
+            }
+
+            canonical.Add(snapshot);
+        }
+
+        canonical.Sort(static (left, right) =>
+            string.CompareOrdinal(
+                left.Document.MarketId,
+                right.Document.MarketId));
+        if (canonical.Count != PilotCatalog.MarketIds.Length
+            || canonical.Select(
+                    static snapshot => snapshot.Document.MarketId)
+                .Distinct(StringComparer.Ordinal)
+                .Count() != canonical.Count
+            || !canonical.Select(
+                    static snapshot => snapshot.Document.MarketId)
+                .SequenceEqual(
+                    PilotCatalog.MarketIds.Order(
+                        StringComparer.Ordinal),
+                    StringComparer.Ordinal))
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.InvalidArguments);
+        }
+
+        using var hash = IncrementalHash.CreateHash(
+            HashAlgorithmName.SHA256);
+        hash.AppendData(Encoding.UTF8.GetBytes(PilotIdentityDomain));
+        AppendInt32(hash, canonical.Count);
+        foreach (var snapshot in canonical)
+        {
+            OfficialRuleCatalogValidator.Validate(snapshot.Document);
+            var expected = Convert.ToHexStringLower(
+                SHA256.HashData(
+                    CanonicalRuleCatalog.Serialize(
+                        snapshot.Document)));
+            if (!string.Equals(
+                    expected,
+                    snapshot.CatalogSha256,
+                    StringComparison.Ordinal))
+            {
+                throw new WorkbenchException(
+                    WorkbenchFailureCode.InvalidArguments);
+            }
+
+            AppendLengthPrefixed(
+                hash,
+                snapshot.Document.MarketId);
+            AppendLengthPrefixed(hash, snapshot.CatalogSha256);
+        }
+
+        return Convert.ToHexStringLower(hash.GetHashAndReset());
+    }
+
+    private static void AppendLengthPrefixed(
+        IncrementalHash hash,
+        string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        AppendInt32(hash, bytes.Length);
+        hash.AppendData(bytes);
+    }
+
+    private static void AppendInt32(
+        IncrementalHash hash,
+        int value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32BigEndian(bytes, value);
+        hash.AppendData(bytes);
     }
 }
 

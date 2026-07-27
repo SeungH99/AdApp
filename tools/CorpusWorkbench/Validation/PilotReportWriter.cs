@@ -13,16 +13,34 @@ public sealed class PilotReportWriter
 {
     private const string ReportHashDomain =
         "corpus-workbench-report-v1\n";
+    internal const int MaximumReportBytes = 64 * 1024;
+    private readonly PilotAuthenticationService? _authentication;
     private readonly Action<PilotReportFaultPoint>? _injectFault;
 
     public PilotReportWriter()
-        : this(injectFault: null)
     {
     }
 
+    public PilotReportWriter(CorpusWorkbench.Vault.CorpusVault vault)
+    {
+        _authentication = new PilotAuthenticationService(vault);
+    }
+
     internal PilotReportWriter(
-        Action<PilotReportFaultPoint>? injectFault) =>
+        Action<PilotReportFaultPoint>? injectFault)
+    {
         _injectFault = injectFault;
+    }
+
+    internal PilotReportWriter(
+        PilotAuthenticationService authentication,
+        Action<PilotReportFaultPoint>? injectFault = null)
+    {
+        _authentication = authentication
+            ?? throw new ArgumentNullException(
+                nameof(authentication));
+        _injectFault = injectFault;
+    }
 
     public async Task<string> SerializeAsync(
         PilotValidationResult result,
@@ -31,16 +49,21 @@ public sealed class PilotReportWriter
             await SerializeBytesAsync(result, cancellationToken)
                 .ConfigureAwait(false));
 
-    public Task<byte[]> SerializeBytesAsync(
+    public async Task<byte[]> SerializeBytesAsync(
         PilotValidationResult result,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var envelope = CreateEnvelope(result);
+        var envelope = await CreateEnvelopeAsync(
+                result,
+                cancellationToken)
+            .ConfigureAwait(false);
         var bytes = SerializeCanonical(envelope);
-        CorpusPrivacyScanner.ScanOrThrow(bytes);
+        CorpusPrivacyScanner.ScanOrThrow(
+            bytes,
+            cancellationToken: cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(bytes);
+        return bytes;
     }
 
     public async Task<PilotReportEnvelope> WriteAsync(
@@ -48,9 +71,14 @@ public sealed class PilotReportWriter
         string outputPath,
         CancellationToken cancellationToken)
     {
-        var envelope = CreateEnvelope(result);
+        var envelope = await CreateEnvelopeAsync(
+                result,
+                cancellationToken)
+            .ConfigureAwait(false);
         var bytes = SerializeCanonical(envelope);
-        CorpusPrivacyScanner.ScanOrThrow(bytes);
+        CorpusPrivacyScanner.ScanOrThrow(
+            bytes,
+            cancellationToken: cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         await PublishAtomicAsync(
                 outputPath,
@@ -60,10 +88,22 @@ public sealed class PilotReportWriter
         return envelope;
     }
 
-    private static PilotReportEnvelope CreateEnvelope(
-        PilotValidationResult result)
+    private async ValueTask<PilotReportEnvelope> CreateEnvelopeAsync(
+        PilotValidationResult result,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(result);
+        if (_authentication is null)
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.InvalidState);
+        }
+
+        await PilotResultAttestation.VerifyAsync(
+                result,
+                _authentication,
+                cancellationToken)
+            .ConfigureAwait(false);
         var scope = result.Scope
             ?? throw new WorkbenchException(
                 WorkbenchFailureCode.InvalidState);
@@ -122,6 +162,11 @@ public sealed class PilotReportWriter
                 scope.ContractId,
                 PilotCatalog.ContractId,
                 StringComparison.Ordinal)
+            || scope.CatalogEpoch is not { Length: > 0 and <= 64 }
+            || scope.HeldOutTargetPerMarket
+                != PilotCatalog.HeldOutTargetPerMarket
+            || scope.DirectReviewTargetPerMarket
+                != PilotCatalog.DirectReviewTargetPerMarket
             || !PilotValidator.IsLowerSha256(
                 result.RuleCatalogSha256)
             || !PilotValidator.IsLowerSha256(
@@ -129,6 +174,7 @@ public sealed class PilotReportWriter
             || !PilotValidator.IsLowerSha256(
                 result.LedgerHeadSha256)
             || result.BlockingReasons.IsDefault
+            || result.BlockingReasons.Length > 32
             || result.Markets.IsDefault
             || result.PilotComplete
                 != result.BlockingReasons.IsEmpty
@@ -141,6 +187,13 @@ public sealed class PilotReportWriter
                 .AsSpan()
                 .SequenceEqual(result.BlockingReasons.AsSpan())
             || scope.MarketIds.IsDefaultOrEmpty
+            || scope.MarketIds.Length != PilotCatalog.MarketIds.Length
+            || !scope.MarketIds.Order(StringComparer.Ordinal)
+                .SequenceEqual(
+                    PilotCatalog.MarketIds.Order(
+                        StringComparer.Ordinal),
+                    StringComparer.Ordinal)
+            || result.Markets.Length != PilotCatalog.MarketIds.Length
             || scope.MarketIds
                 .Order(StringComparer.Ordinal)
                 .SequenceEqual(
@@ -153,6 +206,20 @@ public sealed class PilotReportWriter
                 .Select(static market => market.MarketId)
                 .Distinct(StringComparer.Ordinal)
                 .Count() != result.Markets.Length
+            || result.PilotComplete
+                && result.Markets.Any(static market =>
+                    market.EligibleDocumentCount
+                        != PilotCatalog.HeldOutTargetPerMarket
+                    || market.DirectReviewCount
+                        != PilotCatalog
+                            .DirectReviewTargetPerMarket
+                    || market.DelegatedLabelCount
+                        != PilotCatalog.HeldOutTargetPerMarket
+                            - PilotCatalog
+                                .DirectReviewTargetPerMarket
+                    || !market.BatchApproved
+                    || market.AggregateErrorCounts is null
+                    || market.AggregateErrorCounts.Count != 0)
             || result.Markets.Any(IsInvalidMarket))
         {
             throw new WorkbenchException(
@@ -168,6 +235,8 @@ public sealed class PilotReportWriter
         || market.SourceFamilyCount < 0
         || market.DirectReviewCount < 0
         || market.DelegatedLabelCount < 0
+        || market.EligibleDocumentCount
+            > PilotCatalog.HeldOutTargetPerMarket
         || market.ImagePdfCount + market.StandaloneRasterCount
             > market.EligibleDocumentCount
         || market.SourceFamilyCount
@@ -176,6 +245,7 @@ public sealed class PilotReportWriter
             + market.DelegatedLabelCount
             > market.EligibleDocumentCount
         || market.AggregateErrorCounts is null
+        || market.AggregateErrorCounts.Count > 32
         || market.AggregateErrorCounts.Any(pair =>
             !Enum.TryParse<WorkbenchFailureCode>(
                 pair.Key,
@@ -209,69 +279,81 @@ public sealed class PilotReportWriter
         PilotReportEnvelope envelope,
         bool includeReportHash = true)
     {
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(
-                   stream,
-                   new JsonWriterOptions
-                   {
-                       Indented = false,
-                       SkipValidation = false,
-                   }))
+        try
         {
-            writer.WriteStartObject();
-            writer.WriteString(
-                "schemaVersion",
-                envelope.SchemaVersion);
-            writer.WriteString("catalogEpoch", envelope.CatalogEpoch);
-            writer.WriteString("contractId", envelope.ContractId);
-            writer.WriteString(
-                "ruleCatalogSha256",
-                envelope.RuleCatalogSha256);
-            writer.WriteString(
-                "workerPackageSha256",
-                envelope.WorkerPackageSha256);
-            writer.WriteString(
-                "ledgerHeadSha256",
-                envelope.LedgerHeadSha256);
-            writer.WriteBoolean(
-                "pilotComplete",
-                envelope.PilotComplete);
-            if (envelope.PrimaryFailureCode is { } primary)
+            using var stream =
+                new BoundedMemoryStream(MaximumReportBytes);
+            using (var writer = new Utf8JsonWriter(
+                       stream,
+                       new JsonWriterOptions
+                       {
+                           Indented = false,
+                           SkipValidation = false,
+                       }))
             {
+                writer.WriteStartObject();
                 writer.WriteString(
-                    "primaryFailureCode",
-                    primary.ToString());
-            }
-            else
-            {
-                writer.WriteNull("primaryFailureCode");
-            }
-
-            writer.WriteStartArray("blockingReasons");
-            foreach (var reason in envelope.BlockingReasons)
-            {
-                writer.WriteStringValue(reason.ToString());
-            }
-
-            writer.WriteEndArray();
-            writer.WriteStartArray("markets");
-            foreach (var market in envelope.Markets)
-            {
-                WriteMarket(writer, market);
-            }
-
-            writer.WriteEndArray();
-            if (includeReportHash)
-            {
+                    "schemaVersion",
+                    envelope.SchemaVersion);
                 writer.WriteString(
-                    "reportSha256",
-                    envelope.ReportSha256);
+                    "catalogEpoch",
+                    envelope.CatalogEpoch);
+                writer.WriteString("contractId", envelope.ContractId);
+                writer.WriteString(
+                    "ruleCatalogSha256",
+                    envelope.RuleCatalogSha256);
+                writer.WriteString(
+                    "workerPackageSha256",
+                    envelope.WorkerPackageSha256);
+                writer.WriteString(
+                    "ledgerHeadSha256",
+                    envelope.LedgerHeadSha256);
+                writer.WriteBoolean(
+                    "pilotComplete",
+                    envelope.PilotComplete);
+                if (envelope.PrimaryFailureCode is { } primary)
+                {
+                    writer.WriteString(
+                        "primaryFailureCode",
+                        primary.ToString());
+                }
+                else
+                {
+                    writer.WriteNull("primaryFailureCode");
+                }
+
+                writer.WriteStartArray("blockingReasons");
+                foreach (var reason in envelope.BlockingReasons)
+                {
+                    writer.WriteStringValue(reason.ToString());
+                }
+
+                writer.WriteEndArray();
+                writer.WriteStartArray("markets");
+                foreach (var market in envelope.Markets)
+                {
+                    WriteMarket(writer, market);
+                }
+
+                writer.WriteEndArray();
+                if (includeReportHash)
+                {
+                    writer.WriteString(
+                        "reportSha256",
+                        envelope.ReportSha256);
+                }
+
+                writer.WriteEndObject();
             }
 
-            writer.WriteEndObject();
+            return stream.ToArray();
         }
-
-        return stream.ToArray();
+        catch (BoundedBufferExceededException exception)
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.PrivacyLeakDetected,
+                exception);
+        }
     }
 
     private static void WriteMarket(
@@ -382,7 +464,9 @@ public sealed class PilotReportWriter
                     staged,
                     stagedName,
                     bytes.Length);
-                CorpusPrivacyScanner.ScanOrThrow(bytes);
+                CorpusPrivacyScanner.ScanOrThrow(
+                    bytes,
+                    cancellationToken: cancellationToken);
                 _injectFault?.Invoke(
                     PilotReportFaultPoint
                         .AfterStagingBeforePublish);

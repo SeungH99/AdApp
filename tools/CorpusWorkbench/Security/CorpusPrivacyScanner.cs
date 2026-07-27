@@ -7,6 +7,11 @@ namespace LocalDocumentOrganizer.CorpusWorkbench.Security;
 
 public static class CorpusPrivacyScanner
 {
+    internal const int MaximumReportBytes = 64 * 1024;
+    private const int MaximumJsonDepth = 12;
+    private const int MaximumDecodedStringLength = 4 * 1024;
+    private const int MaximumBlockingReasons = 32;
+    private const int MaximumAggregateEntries = 32;
     private static readonly UTF8Encoding StrictUtf8 =
         new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
     private static readonly HashSet<string> RootKeys =
@@ -42,20 +47,32 @@ public static class CorpusPrivacyScanner
 
     public static void ScanOrThrow(
         ReadOnlySpan<byte> utf8,
-        IEnumerable<string>? privateSentinels = null)
+        IEnumerable<string>? privateSentinels = null,
+        CancellationToken cancellationToken = default)
     {
         try
         {
-            var text = StrictUtf8.GetString(utf8);
-            if (text.Length == 0
-                || text.IndexOf('\0') >= 0
-                || ContainsPrivateText(text)
-                || ContainsEnvironmentValue(text)
-                || ContainsSentinel(text, privateSentinels))
+            cancellationToken.ThrowIfCancellationRequested();
+            if (utf8.Length is 0 or > MaximumReportBytes)
             {
                 throw PrivacyFailure();
             }
 
+            var text = StrictUtf8.GetString(utf8);
+            if (text.IndexOf('\0') >= 0
+                || ContainsPrivateText(text)
+                || ContainsEnvironmentValue(
+                    text,
+                    cancellationToken)
+                || ContainsSentinel(
+                    text,
+                    privateSentinels,
+                    cancellationToken))
+            {
+                throw PrivacyFailure();
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
             using var document = JsonDocument.Parse(
                 utf8.ToArray(),
                 new JsonDocumentOptions
@@ -63,9 +80,19 @@ public static class CorpusPrivacyScanner
                     AllowTrailingCommas = false,
                     CommentHandling =
                         JsonCommentHandling.Disallow,
-                    MaxDepth = 16,
+                    MaxDepth = MaximumJsonDepth,
                 });
-            ValidateRoot(document.RootElement);
+            ScanDecoded(
+                document.RootElement,
+                privateSentinels,
+                cancellationToken);
+            ValidateRoot(
+                document.RootElement,
+                cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (WorkbenchException)
         {
@@ -82,9 +109,11 @@ public static class CorpusPrivacyScanner
         }
     }
 
-    private static void ValidateRoot(JsonElement root)
+    private static void ValidateRoot(
+        JsonElement root,
+        CancellationToken cancellationToken)
     {
-        RequireObjectKeys(root, RootKeys);
+        RequireObjectKeys(root, RootKeys, cancellationToken);
         RequireString(
             root,
             "schemaVersion",
@@ -99,12 +128,18 @@ public static class CorpusPrivacyScanner
         RequireSha256(root, "ledgerHeadSha256");
         RequireBoolean(root, "pilotComplete");
         ValidateNullableFailureCode(root, "primaryFailureCode");
-        ValidateBlockingReasons(root.GetProperty("blockingReasons"));
-        ValidateMarkets(root.GetProperty("markets"));
+        ValidateBlockingReasons(
+            root.GetProperty("blockingReasons"),
+            cancellationToken);
+        ValidateMarkets(
+            root.GetProperty("markets"),
+            cancellationToken);
         RequireSha256(root, "reportSha256");
     }
 
-    private static void ValidateBlockingReasons(JsonElement reasons)
+    private static void ValidateBlockingReasons(
+        JsonElement reasons,
+        CancellationToken cancellationToken)
     {
         if (reasons.ValueKind != JsonValueKind.Array)
         {
@@ -114,6 +149,12 @@ public static class CorpusPrivacyScanner
         var seen = new HashSet<WorkbenchFailureCode>();
         foreach (var reason in reasons.EnumerateArray())
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (seen.Count >= MaximumBlockingReasons)
+            {
+                throw PrivacyFailure();
+            }
+
             if (reason.ValueKind != JsonValueKind.String
                 || !Enum.TryParse<WorkbenchFailureCode>(
                     reason.GetString(),
@@ -126,7 +167,9 @@ public static class CorpusPrivacyScanner
         }
     }
 
-    private static void ValidateMarkets(JsonElement markets)
+    private static void ValidateMarkets(
+        JsonElement markets,
+        CancellationToken cancellationToken)
     {
         if (markets.ValueKind != JsonValueKind.Array)
         {
@@ -134,9 +177,20 @@ public static class CorpusPrivacyScanner
         }
 
         var previous = string.Empty;
+        var count = 0;
         foreach (var market in markets.EnumerateArray())
         {
-            RequireObjectKeys(market, MarketKeys);
+            cancellationToken.ThrowIfCancellationRequested();
+            count = checked(count + 1);
+            if (count > PilotCatalog.MarketIds.Length)
+            {
+                throw PrivacyFailure();
+            }
+
+            RequireObjectKeys(
+                market,
+                MarketKeys,
+                cancellationToken);
             var marketId = RequireStringValue(market, "marketId");
             if (!PilotCatalog.MarketIds.Contains(
                     marketId,
@@ -165,11 +219,19 @@ public static class CorpusPrivacyScanner
                 "delegatedLabelCount");
             RequireBoolean(market, "batchApproved");
             ValidateAggregateErrors(
-                market.GetProperty("aggregateErrorCounts"));
+                market.GetProperty("aggregateErrorCounts"),
+                cancellationToken);
+        }
+
+        if (count != PilotCatalog.MarketIds.Length)
+        {
+            throw PrivacyFailure();
         }
     }
 
-    private static void ValidateAggregateErrors(JsonElement errors)
+    private static void ValidateAggregateErrors(
+        JsonElement errors,
+        CancellationToken cancellationToken)
     {
         if (errors.ValueKind != JsonValueKind.Object)
         {
@@ -177,16 +239,24 @@ public static class CorpusPrivacyScanner
         }
 
         var previous = string.Empty;
+        var entryCount = 0;
         foreach (var property in errors.EnumerateObject())
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            entryCount = checked(entryCount + 1);
+            if (entryCount > MaximumAggregateEntries)
+            {
+                throw PrivacyFailure();
+            }
+
             if (string.CompareOrdinal(previous, property.Name) >= 0
                 || !Enum.TryParse<WorkbenchFailureCode>(
                     property.Name,
                     ignoreCase: false,
                     out _)
                 || property.Value.ValueKind != JsonValueKind.Number
-                || !property.Value.TryGetInt32(out var count)
-                || count <= 0)
+                || !property.Value.TryGetInt32(out var valueCount)
+                || valueCount <= 0)
             {
                 throw PrivacyFailure();
             }
@@ -197,7 +267,8 @@ public static class CorpusPrivacyScanner
 
     private static void RequireObjectKeys(
         JsonElement value,
-        IReadOnlySet<string> allowed)
+        IReadOnlySet<string> allowed,
+        CancellationToken cancellationToken)
     {
         if (value.ValueKind != JsonValueKind.Object)
         {
@@ -207,6 +278,7 @@ public static class CorpusPrivacyScanner
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var property in value.EnumerateObject())
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!allowed.Contains(property.Name)
                 || !seen.Add(property.Name))
             {
@@ -215,6 +287,67 @@ public static class CorpusPrivacyScanner
         }
 
         if (seen.Count != allowed.Count)
+        {
+            throw PrivacyFailure();
+        }
+    }
+
+    private static void ScanDecoded(
+        JsonElement value,
+        IEnumerable<string>? privateSentinels,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                foreach (var property in value.EnumerateObject())
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    ScanDecodedText(
+                        property.Name,
+                        privateSentinels,
+                        cancellationToken);
+                    ScanDecoded(
+                        property.Value,
+                        privateSentinels,
+                        cancellationToken);
+                }
+
+                break;
+            case JsonValueKind.Array:
+                foreach (var item in value.EnumerateArray())
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    ScanDecoded(
+                        item,
+                        privateSentinels,
+                        cancellationToken);
+                }
+
+                break;
+            case JsonValueKind.String:
+                ScanDecodedText(
+                    value.GetString() ?? throw PrivacyFailure(),
+                    privateSentinels,
+                    cancellationToken);
+                break;
+        }
+    }
+
+    private static void ScanDecodedText(
+        string text,
+        IEnumerable<string>? privateSentinels,
+        CancellationToken cancellationToken)
+    {
+        if (text.Length > MaximumDecodedStringLength
+            || text.IndexOf('\0') >= 0
+            || ContainsPrivateText(text)
+            || ContainsEnvironmentValue(text, cancellationToken)
+            || ContainsSentinel(
+                text,
+                privateSentinels,
+                cancellationToken))
         {
             throw PrivacyFailure();
         }
@@ -325,20 +458,34 @@ public static class CorpusPrivacyScanner
             || lower.Contains("receipt-", StringComparison.Ordinal)
             || lower.Contains("revision-", StringComparison.Ordinal)
             || lower.Contains("bearer ", StringComparison.Ordinal)
+            || lower.Contains("authorization:", StringComparison.Ordinal)
             || lower.Contains("password=", StringComparison.Ordinal)
             || lower.Contains("password:", StringComparison.Ordinal)
             || lower.Contains("token=", StringComparison.Ordinal)
+            || lower.Contains("token:", StringComparison.Ordinal)
             || lower.Contains("secret=", StringComparison.Ordinal)
+            || lower.Contains("secret:", StringComparison.Ordinal)
+            || lower.Contains("api_key", StringComparison.Ordinal)
+            || lower.Contains("apikey", StringComparison.Ordinal)
+            || lower.Contains("client_secret", StringComparison.Ordinal)
             || lower.Contains(".pdf", StringComparison.Ordinal)
+            || lower.Contains(".doc", StringComparison.Ordinal)
+            || lower.Contains(".docx", StringComparison.Ordinal)
+            || lower.Contains(".xls", StringComparison.Ordinal)
+            || lower.Contains(".xlsx", StringComparison.Ordinal)
+            || lower.Contains(".csv", StringComparison.Ordinal)
             || lower.Contains(".png", StringComparison.Ordinal)
             || lower.Contains(".jpg", StringComparison.Ordinal)
             || lower.Contains(".jpeg", StringComparison.Ordinal)
             || lower.Contains(".tif", StringComparison.Ordinal)
             || lower.Contains(".tiff", StringComparison.Ordinal)
             || lower.Contains(@"\\", StringComparison.Ordinal)
+            || lower.Contains("approval-", StringComparison.Ordinal)
+            || lower.Contains("entry-", StringComparison.Ordinal)
             || lower.Contains("/home/", StringComparison.Ordinal)
             || lower.Contains("/users/", StringComparison.Ordinal)
-            || ContainsDrivePath(text);
+            || ContainsDrivePath(text)
+            || ContainsPosixPath(text);
     }
 
     private static bool ContainsDrivePath(string text)
@@ -356,11 +503,34 @@ public static class CorpusPrivacyScanner
         return false;
     }
 
-    private static bool ContainsEnvironmentValue(string text)
+    private static bool ContainsPosixPath(string text)
+    {
+        for (var index = 0; index < text.Length; index++)
+        {
+            if (text[index] != '/')
+            {
+                continue;
+            }
+
+            if (index + 1 < text.Length
+                && text[index + 1] is not '/' and not ' ')
+            {
+                return true;
+            }
+        }
+
+        return text.Contains("../", StringComparison.Ordinal)
+            || text.Contains("./", StringComparison.Ordinal);
+    }
+
+    private static bool ContainsEnvironmentValue(
+        string text,
+        CancellationToken cancellationToken)
     {
         foreach (DictionaryEntry entry in
                  Environment.GetEnvironmentVariables())
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (entry.Value is not string value
                 || value.Length < 8
                 || value.All(char.IsDigit))
@@ -368,7 +538,9 @@ public static class CorpusPrivacyScanner
                 continue;
             }
 
-            if (text.Contains(value, StringComparison.Ordinal))
+            if (text.Contains(
+                    value,
+                    StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
@@ -379,9 +551,12 @@ public static class CorpusPrivacyScanner
 
     private static bool ContainsSentinel(
         string text,
-        IEnumerable<string>? sentinels)
+        IEnumerable<string>? sentinels,
+        CancellationToken cancellationToken)
     {
-        if (text.Contains(PrivateSentinel, StringComparison.Ordinal))
+        if (text.Contains(
+                PrivateSentinel,
+                StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
@@ -393,13 +568,16 @@ public static class CorpusPrivacyScanner
 
         foreach (var sentinel in sentinels)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (string.IsNullOrEmpty(sentinel)
                 || sentinel.Length > 4096)
             {
                 throw PrivacyFailure();
             }
 
-            if (text.Contains(sentinel, StringComparison.Ordinal))
+            if (text.Contains(
+                    sentinel,
+                    StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }

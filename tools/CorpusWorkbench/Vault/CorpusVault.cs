@@ -49,6 +49,15 @@ public sealed class CorpusVault : IDisposable, IAsyncDisposable
         _store
         ?? throw new ObjectDisposedException(nameof(CorpusVault));
 
+    internal string ApprovedRoot
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return GetFileStore().ApprovedRoot;
+        }
+    }
+
     internal ApprovedRootPathGuard ExtractionRootGuard
     {
         get

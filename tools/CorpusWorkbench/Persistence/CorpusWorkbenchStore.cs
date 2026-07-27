@@ -732,8 +732,16 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
     internal async Task<IReadOnlyList<LabelDraftState>>
         ReadAllApprovalLabelStatesAsync(
         SqliteConnection connection,
-        SqliteTransaction? transaction)
+        SqliteTransaction? transaction,
+        int maximumCount = int.MaxValue,
+        CancellationToken cancellationToken = default)
     {
+        if (maximumCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumCount));
+        }
+
         var documentIds = new List<string>();
         await using (var command = connection.CreateCommand())
         {
@@ -749,6 +757,13 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
             while (await reader.ReadAsync(CancellationToken.None)
                        .ConfigureAwait(false))
             {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (documentIds.Count >= maximumCount)
+                {
+                    throw new WorkbenchException(
+                        WorkbenchFailureCode.InvalidArguments);
+                }
+
                 documentIds.Add(reader.GetString(0));
             }
         }
@@ -756,6 +771,7 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
         var states = new List<LabelDraftState>(documentIds.Count);
         foreach (var documentId in documentIds)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             states.Add(
                 await ReadLabelStateAsync(
                         connection,
@@ -767,6 +783,28 @@ public sealed class CorpusWorkbenchStore : IDisposable, IAsyncDisposable
 
         return states;
     }
+
+    internal Task<bool> HasPilotValidationCheckpointAsync(
+        CancellationToken cancellationToken) =>
+        ExecuteApprovalReadAsync(
+            async (connection, transaction) =>
+            {
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = """
+                    SELECT 1
+                    FROM checkpoints
+                    WHERE checkpoint_id IN (
+                      'pilot-validation-v1',
+                      'pilot-validation-v1.mac')
+                    LIMIT 1;
+                    """;
+                return await command.ExecuteScalarAsync(
+                            CancellationToken.None)
+                        .ConfigureAwait(false)
+                    is not null;
+            },
+            cancellationToken);
 
     internal async Task<T> ExecuteApprovalWriteAsync<T>(
         Func<SqliteConnection, SqliteTransaction, Task<T>> operation,

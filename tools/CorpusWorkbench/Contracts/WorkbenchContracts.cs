@@ -218,6 +218,10 @@ public sealed record PilotValidationResult(
     string LedgerHeadSha256)
 {
     internal PilotScope? Scope { get; init; }
+
+    internal string? AttestationVersion { get; init; }
+
+    internal byte[]? Attestation { get; init; }
 }
 
 public sealed record PilotValidationCheckpoint(

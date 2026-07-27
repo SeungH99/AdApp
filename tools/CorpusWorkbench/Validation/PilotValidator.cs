@@ -12,6 +12,8 @@ namespace LocalDocumentOrganizer.CorpusWorkbench.Validation;
 
 public sealed class PilotValidator
 {
+    internal const int MaximumPilotDocumentCount =
+        PilotCatalog.HeldOutTargetPerMarket * 2;
     private static readonly ImmutableArray<WorkbenchFailureCode>
         FailurePrecedence =
         [
@@ -34,6 +36,8 @@ public sealed class PilotValidator
     private readonly Func<
         CancellationToken,
         ValueTask<PilotValidationSnapshot>> _load;
+    private readonly PilotAuthenticationService _authentication;
+    private readonly PilotValidationTrustIdentity _trustedIdentity;
 
     public PilotValidator(
         CorpusVault vault,
@@ -41,6 +45,9 @@ public sealed class PilotValidator
     {
         ArgumentNullException.ThrowIfNull(vault);
         ArgumentNullException.ThrowIfNull(approvalLedger);
+        _authentication = new PilotAuthenticationService(vault);
+        _trustedIdentity =
+            PilotValidationTrustIdentity.From(approvalLedger);
         _load = cancellationToken => LoadAsync(
             vault,
             approvalLedger,
@@ -50,14 +57,24 @@ public sealed class PilotValidator
     internal PilotValidator(
         Func<
             CancellationToken,
-            ValueTask<PilotValidationSnapshot>> load) =>
+            ValueTask<PilotValidationSnapshot>> load,
+        PilotAuthenticationService authentication,
+        PilotValidationTrustIdentity trustedIdentity)
+    {
         _load = load ?? throw new ArgumentNullException(nameof(load));
+        _authentication = authentication
+            ?? throw new ArgumentNullException(
+                nameof(authentication));
+        _trustedIdentity = trustedIdentity
+            ?? throw new ArgumentNullException(
+                nameof(trustedIdentity));
+    }
 
     public async Task<PilotValidationResult> ValidateAsync(
         PilotValidationRequest request,
         CancellationToken cancellationToken)
     {
-        ValidateRequest(request);
+        ValidateRequest(request, _trustedIdentity);
         cancellationToken.ThrowIfCancellationRequested();
 
         PilotValidationSnapshot snapshot;
@@ -71,10 +88,14 @@ public sealed class PilotValidator
             throw;
         }
         catch (WorkbenchException exception)
+            when (exception.FailureCode
+                == WorkbenchFailureCode.InvalidArguments)
         {
-            return FailureResult(
-                request,
-                NormalizeBoundaryFailure(exception.FailureCode));
+            throw;
+        }
+        catch (WorkbenchException)
+        {
+            throw;
         }
         catch (Exception exception) when (
             exception is FileSystemBoundaryException
@@ -83,16 +104,33 @@ public sealed class PilotValidator
                 or System.Text.Json.JsonException
                 or CryptographicException)
         {
-            return FailureResult(
-                request,
-                WorkbenchFailureCode.VaultBoundaryViolation);
+            throw new WorkbenchException(
+                WorkbenchFailureCode.VaultBoundaryViolation,
+                exception);
         }
 
         cancellationToken.ThrowIfCancellationRequested();
         if (snapshot.Documents.IsDefault)
         {
-            return FailureResult(
-                request,
+            return await AttestAsync(
+                    FailureResult(
+                        request,
+                        WorkbenchFailureCode
+                            .VaultBoundaryViolation,
+                        snapshot.LedgerHeadSha256),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        if (snapshot.Documents.Length > MaximumPilotDocumentCount)
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.InvalidArguments);
+        }
+
+        if (!IsLowerSha256(snapshot.LedgerHeadSha256))
+        {
+            throw new WorkbenchException(
                 WorkbenchFailureCode.VaultBoundaryViolation);
         }
 
@@ -113,7 +151,9 @@ public sealed class PilotValidator
         FindDocumentWideFailures(
             snapshot.Documents,
             request,
-            reasons);
+            _trustedIdentity,
+            reasons,
+            cancellationToken);
 
         var summaries = ImmutableArray.CreateBuilder<
             PilotMarketSummary>(request.Scope.MarketIds.Length);
@@ -121,41 +161,66 @@ public sealed class PilotValidator
                      .Order(StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var documents = snapshot.Documents
-                .Where(document => string.Equals(
-                    document.MarketId,
-                    marketId,
-                    StringComparison.Ordinal))
-                .OrderBy(
-                    static document => document.DocumentId,
-                    StringComparer.Ordinal)
-                .ToArray();
+            var marketDocuments =
+                new List<PilotValidationDocument>();
+            foreach (var document in snapshot.Documents)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (string.Equals(
+                        document.MarketId,
+                        marketId,
+                        StringComparison.Ordinal))
+                {
+                    marketDocuments.Add(document);
+                }
+            }
+
+            marketDocuments.Sort(static (left, right) =>
+                string.CompareOrdinal(
+                    left.DocumentId,
+                    right.DocumentId));
             summaries.Add(
                 SummarizeMarket(
                     marketId,
-                    documents,
+                    marketDocuments,
                     request.Scope,
-                    reasons));
+                    reasons,
+                    cancellationToken));
         }
 
         var orderedReasons = OrderFailures(reasons);
-        return new PilotValidationResult(
-            orderedReasons.IsEmpty,
-            orderedReasons.IsEmpty ? null : orderedReasons[0],
-            orderedReasons,
-            summaries.MoveToImmutable(),
-            request.RuleCatalogSha256,
-            request.WorkerPackageSha256,
-            request.LedgerHeadSha256)
-        {
-            Scope = CanonicalScope(request.Scope),
-        };
+        return await AttestAsync(
+                new PilotValidationResult(
+                    orderedReasons.IsEmpty,
+                    orderedReasons.IsEmpty
+                        ? null
+                        : orderedReasons[0],
+                    orderedReasons,
+                    summaries.MoveToImmutable(),
+                    request.RuleCatalogSha256,
+                    request.WorkerPackageSha256,
+                    snapshot.LedgerHeadSha256)
+                {
+                    Scope = CanonicalScope(request.Scope),
+                },
+                cancellationToken)
+            .ConfigureAwait(false);
     }
+
+    private ValueTask<PilotValidationResult> AttestAsync(
+        PilotValidationResult result,
+        CancellationToken cancellationToken) =>
+        PilotResultAttestation.IssueAsync(
+            result,
+            _authentication,
+            cancellationToken);
 
     private static void FindDocumentWideFailures(
         ImmutableArray<PilotValidationDocument> documents,
         PilotValidationRequest request,
-        HashSet<WorkbenchFailureCode> reasons)
+        PilotValidationTrustIdentity trustedIdentity,
+        HashSet<WorkbenchFailureCode> reasons,
+        CancellationToken cancellationToken)
     {
         var contentHashes = new HashSet<string>(
             StringComparer.Ordinal);
@@ -163,6 +228,7 @@ public sealed class PilotValidator
             StringComparer.Ordinal);
         foreach (var document in documents)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!request.Scope.MarketIds.Contains(
                     document.MarketId,
                     StringComparer.Ordinal))
@@ -211,9 +277,13 @@ public sealed class PilotValidator
                     WorkbenchFailureCode.SourceFamilyLeakage);
             }
 
-            if (!FixedHashEquals(
+            if (!trustedIdentity.RuleCatalogSha256ByMarket
+                    .TryGetValue(
+                        document.MarketId,
+                        out var trustedRuleCatalog)
+                || !FixedHashEquals(
                     document.RuleCatalogSha256,
-                    request.RuleCatalogSha256))
+                    trustedRuleCatalog))
             {
                 reasons.Add(WorkbenchFailureCode.StaleRuleSet);
             }
@@ -232,16 +302,19 @@ public sealed class PilotValidator
         string marketId,
         IReadOnlyList<PilotValidationDocument> documents,
         PilotScope scope,
-        HashSet<WorkbenchFailureCode> reasons)
+        HashSet<WorkbenchFailureCode> reasons,
+        CancellationToken cancellationToken)
     {
         var missingFieldCount = 0;
         var missingEvidenceCount = 0;
         foreach (var document in documents)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             CountFieldFailures(
                 document.Fields,
                 ref missingFieldCount,
-                ref missingEvidenceCount);
+                ref missingEvidenceCount,
+                cancellationToken);
         }
 
         if (missingFieldCount != 0)
@@ -258,7 +331,7 @@ public sealed class PilotValidator
             document.ApprovalMode == ApprovalMode.DirectReview);
         var batchApprovalCount = documents.Count(document =>
             document.ApprovalMode == ApprovalMode.BatchApproval);
-        if (directReviewCount < scope.DirectReviewTargetPerMarket)
+        if (directReviewCount != scope.DirectReviewTargetPerMarket)
         {
             reasons.Add(
                 WorkbenchFailureCode.InsufficientDirectReview);
@@ -268,13 +341,15 @@ public sealed class PilotValidator
             0,
             documents.Count - directReviewCount);
         var batchApproved = requiredBatchCount != 0
+            && directReviewCount
+                == scope.DirectReviewTargetPerMarket
             && batchApprovalCount == requiredBatchCount;
         if (!batchApproved)
         {
             reasons.Add(WorkbenchFailureCode.BatchApprovalMissing);
         }
 
-        if (documents.Count < scope.HeldOutTargetPerMarket)
+        if (documents.Count != scope.HeldOutTargetPerMarket)
         {
             reasons.Add(WorkbenchFailureCode.CoverageIncomplete);
         }
@@ -319,7 +394,8 @@ public sealed class PilotValidator
     private static void CountFieldFailures(
         ImmutableArray<LabeledField> fields,
         ref int missingFieldCount,
-        ref int missingEvidenceCount)
+        ref int missingEvidenceCount,
+        CancellationToken cancellationToken)
     {
         if (fields.IsDefault)
         {
@@ -331,10 +407,12 @@ public sealed class PilotValidator
 
         foreach (var fieldId in PilotCatalog.RequiredFieldIds)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             LabeledField? candidate = null;
             var candidateCount = 0;
             foreach (var field in fields)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (field is null
                     || !string.Equals(
                         field.FieldId,
@@ -377,14 +455,18 @@ public sealed class PilotValidator
                 (connection, transaction) =>
                     vault.Store.ReadAllApprovalLabelStatesAsync(
                         connection,
-                        transaction),
+                        transaction,
+                        MaximumPilotDocumentCount,
+                        cancellationToken),
                 cancellationToken)
             .ConfigureAwait(false);
         var verification = await approvalLedger.VerifyAsync(
+                MaximumPilotDocumentCount,
                 cancellationToken)
             .ConfigureAwait(false);
         var approvals = verification.IsValid
             ? await approvalLedger.GetOwnerApprovalViewAsync(
+                    MaximumPilotDocumentCount,
                     cancellationToken)
                 .ConfigureAwait(false)
             : new OwnerApprovalView(
@@ -428,7 +510,8 @@ public sealed class PilotValidator
 
     private static PilotValidationResult FailureResult(
         PilotValidationRequest request,
-        WorkbenchFailureCode failureCode) =>
+        WorkbenchFailureCode failureCode,
+        string ledgerHeadSha256) =>
         new(
             PilotComplete: false,
             failureCode,
@@ -449,18 +532,31 @@ public sealed class PilotValidator
             ],
             request.RuleCatalogSha256,
             request.WorkerPackageSha256,
-            request.LedgerHeadSha256)
+            ledgerHeadSha256)
         {
             Scope = CanonicalScope(request.Scope),
         };
 
-    private static WorkbenchFailureCode NormalizeBoundaryFailure(
-        WorkbenchFailureCode failureCode) =>
-        FailurePrecedence.Contains(failureCode)
-            ? failureCode
-            : WorkbenchFailureCode.VaultBoundaryViolation;
+    private static void ValidateRequest(
+        PilotValidationRequest request,
+        PilotValidationTrustIdentity trustedIdentity)
+    {
+        ValidateRequestSyntax(request);
+        if (!SameScope(request.Scope, trustedIdentity.Scope)
+            || !FixedHashEquals(
+                request.RuleCatalogSha256,
+                trustedIdentity.PilotRuleCatalogSha256)
+            || !FixedHashEquals(
+                request.WorkerPackageSha256,
+                trustedIdentity.WorkerPackageSha256))
+        {
+            throw new WorkbenchException(
+                WorkbenchFailureCode.InvalidArguments);
+        }
+    }
 
-    private static void ValidateRequest(PilotValidationRequest request)
+    private static void ValidateRequestSyntax(
+        PilotValidationRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(request.Scope);
@@ -479,12 +575,20 @@ public sealed class PilotValidator
             || scope.DirectReviewTargetPerMarket
                 != PilotCatalog.DirectReviewTargetPerMarket
             || scope.MarketIds.IsDefaultOrEmpty
+            || scope.MarketIds.Length
+                != PilotCatalog.MarketIds.Length
             || scope.MarketIds.Distinct(StringComparer.Ordinal).Count()
                 != scope.MarketIds.Length
             || scope.MarketIds.Any(marketId =>
                 !PilotCatalog.MarketIds.Contains(
                     marketId,
                     StringComparer.Ordinal))
+            || !scope.MarketIds
+                .Order(StringComparer.Ordinal)
+                .SequenceEqual(
+                    PilotCatalog.MarketIds.Order(
+                        StringComparer.Ordinal),
+                    StringComparer.Ordinal)
             || !IsLowerSha256(request.RuleCatalogSha256)
             || !IsLowerSha256(request.WorkerPackageSha256)
             || !IsLowerSha256(request.LedgerHeadSha256))
@@ -526,7 +630,34 @@ public sealed class PilotValidator
 
     internal static void ValidateCheckpointRequest(
         PilotValidationRequest request) =>
-        ValidateRequest(request);
+        ValidateRequestSyntax(request);
+
+    internal static bool SameScope(PilotScope left, PilotScope right) =>
+        left is not null
+        && right is not null
+        && string.Equals(
+            left.SchemaVersion,
+            right.SchemaVersion,
+            StringComparison.Ordinal)
+        && string.Equals(
+            left.CatalogEpoch,
+            right.CatalogEpoch,
+            StringComparison.Ordinal)
+        && string.Equals(
+            left.ContractId,
+            right.ContractId,
+            StringComparison.Ordinal)
+        && left.HeldOutTargetPerMarket
+            == right.HeldOutTargetPerMarket
+        && left.DirectReviewTargetPerMarket
+            == right.DirectReviewTargetPerMarket
+        && !left.MarketIds.IsDefault
+        && !right.MarketIds.IsDefault
+        && left.MarketIds
+            .Order(StringComparer.Ordinal)
+            .SequenceEqual(
+                right.MarketIds.Order(StringComparer.Ordinal),
+                StringComparer.Ordinal);
 
     internal static ImmutableArray<WorkbenchFailureCode>
         OrderFailures(IEnumerable<WorkbenchFailureCode> reasons)
@@ -556,3 +687,22 @@ internal sealed record PilotValidationSnapshot(
     bool VaultBoundaryValid,
     bool LedgerValid,
     string LedgerHeadSha256);
+
+internal sealed record PilotValidationTrustIdentity(
+    PilotScope Scope,
+    string PilotRuleCatalogSha256,
+    ImmutableDictionary<string, string>
+        RuleCatalogSha256ByMarket,
+    string WorkerPackageSha256)
+{
+    internal static PilotValidationTrustIdentity From(
+        ApprovalLedgerService approvalLedger)
+    {
+        ArgumentNullException.ThrowIfNull(approvalLedger);
+        return new(
+            approvalLedger.TrustedPilotScope,
+            approvalLedger.TrustedPilotRuleCatalogSha256,
+            approvalLedger.TrustedRuleCatalogs,
+            approvalLedger.TrustedWorkerPackageSha256);
+    }
+}
