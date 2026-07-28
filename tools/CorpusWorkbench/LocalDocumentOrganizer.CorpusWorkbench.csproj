@@ -4,6 +4,7 @@
     <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="..\..\src\LocalDocumentOrganizer.Application\LocalDocumentOrganizer.Application.csproj" />
     <ProjectReference Include="..\..\src\LocalDocumentOrganizer.Core\LocalDocumentOrganizer.Core.csproj" />
     <ProjectReference Include="..\..\src\LocalDocumentOrganizer.Infrastructure.Windows\LocalDocumentOrganizer.Infrastructure.Windows.csproj" />
     <ProjectReference Include="..\CorpusEval\LocalDocumentOrganizer.CorpusEval.csproj" />

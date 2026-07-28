@@ -6,6 +6,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\LocalDocumentOrganizer.Application\LocalDocumentOrganizer.Application.csproj" />
     <ProjectReference Include="..\LocalDocumentOrganizer.Core\LocalDocumentOrganizer.Core.csproj" />
     <PackageReference Include="Microsoft.Data.Sqlite" />
     <PackageReference Include="Microsoft.Extensions.Logging" />

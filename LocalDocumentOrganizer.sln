@@ -4,6 +4,8 @@ VisualStudioVersion = 17.13.35931.197
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LocalDocumentOrganizer.Core", "src\LocalDocumentOrganizer.Core\LocalDocumentOrganizer.Core.csproj", "{4D2D90D8-7E37-4BE9-AB90-5A33ED05358D}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LocalDocumentOrganizer.Application", "src\LocalDocumentOrganizer.Application\LocalDocumentOrganizer.Application.csproj", "{8F7623F7-9BFC-42C6-AF96-F70C87B2C69C}"
+EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LocalDocumentOrganizer.Infrastructure.Windows", "src\LocalDocumentOrganizer.Infrastructure.Windows\LocalDocumentOrganizer.Infrastructure.Windows.csproj", "{FF63A7A5-A5BF-48B2-9227-7A8E726D79BE}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LocalDocumentOrganizer.App", "src\LocalDocumentOrganizer.App\LocalDocumentOrganizer.App.csproj", "{D55B7DA7-A7BD-41AF-9C89-97FB4BCF7A43}"
@@ -30,6 +32,10 @@ Global
 		{4D2D90D8-7E37-4BE9-AB90-5A33ED05358D}.Debug|x64.Build.0 = Debug|Any CPU
 		{4D2D90D8-7E37-4BE9-AB90-5A33ED05358D}.Release|x64.ActiveCfg = Release|Any CPU
 		{4D2D90D8-7E37-4BE9-AB90-5A33ED05358D}.Release|x64.Build.0 = Release|Any CPU
+		{8F7623F7-9BFC-42C6-AF96-F70C87B2C69C}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{8F7623F7-9BFC-42C6-AF96-F70C87B2C69C}.Debug|x64.Build.0 = Debug|Any CPU
+		{8F7623F7-9BFC-42C6-AF96-F70C87B2C69C}.Release|x64.ActiveCfg = Release|Any CPU
+		{8F7623F7-9BFC-42C6-AF96-F70C87B2C69C}.Release|x64.Build.0 = Release|Any CPU
 		{FF63A7A5-A5BF-48B2-9227-7A8E726D79BE}.Debug|x64.ActiveCfg = Debug|Any CPU
 		{FF63A7A5-A5BF-48B2-9227-7A8E726D79BE}.Debug|x64.Build.0 = Debug|Any CPU
 		{FF63A7A5-A5BF-48B2-9227-7A8E726D79BE}.Release|x64.ActiveCfg = Release|Any CPU
