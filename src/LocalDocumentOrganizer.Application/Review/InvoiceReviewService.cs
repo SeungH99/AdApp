@@ -12,6 +12,8 @@ namespace LocalDocumentOrganizer.Application.Review;
 
 public sealed class InvoiceReviewService
 {
+    private const int BusyReconciliationAttemptLimit = 5;
+
     private static readonly ImmutableHashSet<string> RequiredFields =
         PilotCatalog.RequiredFieldIds.ToImmutableHashSet(StringComparer.Ordinal);
 
@@ -59,22 +61,10 @@ public sealed class InvoiceReviewService
                 .ConfigureAwait(false);
             if (historical is not null)
             {
-                return historical.EventId == command.EventId
-                    && historical.DocumentId == command.DocumentId
-                    && string.Equals(
-                        historical.SubmissionFingerprint,
-                        submissionFingerprint,
-                        StringComparison.Ordinal)
-                    ? new InvoiceReviewResult(
-                        InvoiceReviewOutcome.AlreadyConfirmed,
-                        InvoiceReviewFailureCode.None,
-                        historical.Review,
-                        null)
-                    : new InvoiceReviewResult(
-                        InvoiceReviewOutcome.ConcurrentConflict,
-                        InvoiceReviewFailureCode.StorageConflict,
-                        null,
-                        command);
+                return MapHistoricalOperation(
+                    command,
+                    submissionFingerprint,
+                    historical);
             }
 
             snapshot = await _reviews.LoadCurrentAsync(
@@ -185,6 +175,17 @@ public sealed class InvoiceReviewService
             return await MapStreamConflictAsync(command, cancellationToken)
                 .ConfigureAwait(false);
         }
+        if (commit is ProductRecoveryRequired
+            {
+                Kind: ProductRecoveryKind.StorageBusy,
+            })
+        {
+            return await ReconcileBusyOperationAsync(
+                    command,
+                    submissionFingerprint,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
         return commit switch
         {
             ProductCommitted => new(InvoiceReviewOutcome.Confirmed, InvoiceReviewFailureCode.None, review, null),
@@ -194,6 +195,94 @@ public sealed class InvoiceReviewService
             _ => new(InvoiceReviewOutcome.RecoveryRequired, InvoiceReviewFailureCode.StorageRecoveryRequired, null, command),
         };
     }
+
+    private async Task<InvoiceReviewResult> ReconcileBusyOperationAsync(
+        ConfirmInvoiceReviewCommand command,
+        string submissionFingerprint,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0;
+             attempt < BusyReconciliationAttemptLimit;
+             attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var historical = await _reviews.LoadByOperationAsync(
+                        command.OperationId,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (historical is not null)
+                {
+                    return MapHistoricalOperation(
+                        command,
+                        submissionFingerprint,
+                        historical);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                return Recovery(command);
+            }
+
+            if (attempt + 1 < BusyReconciliationAttemptLimit)
+            {
+                await Task.Delay(
+                        TimeSpan.FromMilliseconds(
+                            checked((attempt + 1) * 10)),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        return Recovery(command);
+    }
+
+    private static InvoiceReviewResult MapHistoricalOperation(
+        ConfirmInvoiceReviewCommand command,
+        string submissionFingerprint,
+        InvoiceReviewOperationHistory historical)
+    {
+        var review = historical.Review;
+        return historical.OperationId == command.OperationId
+            && historical.EventId == command.EventId
+            && historical.DocumentId == command.DocumentId
+            && string.Equals(
+                historical.SubmissionFingerprint,
+                submissionFingerprint,
+                StringComparison.Ordinal)
+            && review is not null
+            && review.CommitOperationId == command.OperationId
+            && review.CommitEventId == command.EventId
+            && review.CommittedStreamVersion is not null
+            && review.DocumentId == command.DocumentId
+            && review.ExtractionRevision
+                == command.ExpectedExtractionRevision
+            && review.SourceIdentity is not null
+            && review.SourceIdentity.Equals(command.ExpectedSourceIdentity)
+            ? new InvoiceReviewResult(
+                InvoiceReviewOutcome.AlreadyConfirmed,
+                InvoiceReviewFailureCode.None,
+                review,
+                null)
+            : new InvoiceReviewResult(
+                InvoiceReviewOutcome.ConcurrentConflict,
+                InvoiceReviewFailureCode.StorageConflict,
+                null,
+                command);
+    }
+
+    private static InvoiceReviewResult Recovery(
+        ConfirmInvoiceReviewCommand command) =>
+        new(
+            InvoiceReviewOutcome.RecoveryRequired,
+            InvoiceReviewFailureCode.StorageRecoveryRequired,
+            null,
+            command);
 
     private async Task<InvoiceReviewResult> MapStreamConflictAsync(
         ConfirmInvoiceReviewCommand command,
