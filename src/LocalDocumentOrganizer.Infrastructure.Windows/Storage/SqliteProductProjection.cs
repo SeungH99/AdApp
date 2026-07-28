@@ -412,7 +412,7 @@ internal sealed class SqliteProductProjection(
             review.Transaction = context.Transaction;
             review.CommandText = """
                 INSERT INTO product_reviews(document_id,extraction_revision,review_revision,approved_at_utc,owner_kind,owner_id,key_id,encryption_version,payload_nonce,payload_ciphertext,payload_tag)
-                VALUES($document,$extraction,$review,$approved,$kind,$owner,$key,$version,$nonce,$cipher,$tag)
+                VALUES($document,$extraction,$review,$approved,$owner_kind,$owner_id,$key_id,$version,$nonce,$cipher,$tag)
                 ON CONFLICT(document_id) DO UPDATE SET extraction_revision=excluded.extraction_revision,review_revision=excluded.review_revision,approved_at_utc=excluded.approved_at_utc,owner_kind=excluded.owner_kind,owner_id=excluded.owner_id,key_id=excluded.key_id,encryption_version=excluded.encryption_version,payload_nonce=excluded.payload_nonce,payload_ciphertext=excluded.payload_ciphertext,payload_tag=excluded.payload_tag;
                 """;
             review.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(documentId));
