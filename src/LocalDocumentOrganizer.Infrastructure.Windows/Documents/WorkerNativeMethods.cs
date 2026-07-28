@@ -8,6 +8,7 @@ internal static class WorkerNativeMethods
 {
     internal const int ErrorAlreadyExists = unchecked((int)0x800700B7);
     internal const int ErrorInsufficientBuffer = 122;
+    internal const int FileIdInfo = 18;
 
     internal const uint CreateSuspended = 0x00000004;
     internal const uint CreateUnicodeEnvironment = 0x00000400;
@@ -228,6 +229,22 @@ internal static class WorkerNativeMethods
         SafeKernelHandle process,
         out uint exitCode);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool QueryFullProcessImageNameW(
+        SafeKernelHandle process,
+        uint flags,
+        StringBuilder executablePath,
+        ref uint size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool GetFileInformationByHandleEx(
+        SafeFileHandle file,
+        int fileInformationClass,
+        out FileIdInformation fileInformation,
+        uint bufferSize);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool CloseHandle(IntPtr handle);
@@ -288,6 +305,15 @@ internal static class WorkerNativeMethods
         internal IntPtr Thread;
         internal uint ProcessId;
         internal uint ThreadId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct FileIdInformation
+    {
+        internal ulong VolumeSerialNumber;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        internal byte[] FileId;
     }
 
     [StructLayout(LayoutKind.Sequential)]

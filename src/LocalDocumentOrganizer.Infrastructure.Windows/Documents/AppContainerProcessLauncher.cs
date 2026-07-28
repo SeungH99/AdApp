@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
@@ -58,6 +59,146 @@ public sealed class AppContainerLaunchException : Exception
         new(
             $"{operation} failed.",
             Marshal.GetExceptionForHR(result));
+}
+
+internal sealed class PinnedWorkerExecutable
+{
+    private PinnedWorkerExecutable(
+        WorkerFileIdentity fileIdentity,
+        byte[] sha256)
+    {
+        FileIdentity = fileIdentity;
+        Sha256 = sha256;
+    }
+
+    internal WorkerFileIdentity FileIdentity { get; }
+
+    internal byte[] Sha256 { get; }
+
+    internal static PinnedWorkerExecutable FromOpenFile(
+        FileStream executable)
+    {
+        ArgumentNullException.ThrowIfNull(executable);
+        var identity = WorkerFileIdentity.FromHandle(executable.SafeFileHandle);
+        executable.Position = 0;
+        return new PinnedWorkerExecutable(
+            identity,
+            SHA256.HashData(executable));
+    }
+}
+
+internal readonly record struct WorkerFileIdentity(
+    ulong VolumeSerialNumber,
+    byte[] FileId)
+{
+    internal static WorkerFileIdentity FromHandle(SafeFileHandle handle)
+    {
+        if (!WorkerNativeMethods.GetFileInformationByHandleEx(
+                handle,
+                WorkerNativeMethods.FileIdInfo,
+                out var information,
+                checked((uint)Marshal.SizeOf<WorkerNativeMethods.FileIdInformation>())))
+        {
+            throw new AppContainerLaunchException(
+                "The worker executable file identity could not be read.");
+        }
+
+        return new WorkerFileIdentity(
+            information.VolumeSerialNumber,
+            information.FileId);
+    }
+
+    internal bool Matches(WorkerFileIdentity other) =>
+        VolumeSerialNumber == other.VolumeSerialNumber
+        && FileId.AsSpan().SequenceEqual(other.FileId);
+}
+
+internal interface IWorkerProcessImageAttestor
+{
+    string Attest(
+        SafeKernelHandle suspendedProcess,
+        PinnedWorkerExecutable configured);
+}
+
+internal sealed class NativeWorkerProcessImageAttestor
+    : IWorkerProcessImageAttestor
+{
+    internal static NativeWorkerProcessImageAttestor Instance { get; } = new();
+
+    private NativeWorkerProcessImageAttestor()
+    {
+    }
+
+    public string Attest(
+        SafeKernelHandle suspendedProcess,
+        PinnedWorkerExecutable configured)
+    {
+        ArgumentNullException.ThrowIfNull(suspendedProcess);
+        ArgumentNullException.ThrowIfNull(configured);
+        try
+        {
+            var imagePath = QueryProcessImagePath(suspendedProcess);
+            using var image = new FileStream(
+                imagePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read);
+            var actualIdentity = WorkerFileIdentity.FromHandle(image.SafeFileHandle);
+            if (!configured.FileIdentity.Matches(actualIdentity))
+            {
+                throw FailClosed();
+            }
+
+            image.Position = 0;
+            var actualHash = SHA256.HashData(image);
+            if (!CryptographicOperations.FixedTimeEquals(
+                    configured.Sha256,
+                    actualHash))
+            {
+                throw FailClosed();
+            }
+
+            return Convert.ToHexStringLower(actualHash);
+        }
+        catch
+        {
+            throw FailClosed();
+        }
+    }
+
+    private static string QueryProcessImagePath(SafeKernelHandle process)
+    {
+        for (uint capacity = 260; capacity <= 32_768; capacity *= 2)
+        {
+            var buffer = new StringBuilder(checked((int)capacity));
+            var length = capacity;
+            if (WorkerNativeMethods.QueryFullProcessImageNameW(
+                    process,
+                    0,
+                    buffer,
+                    ref length))
+            {
+                var path = buffer.ToString();
+                if (!string.IsNullOrWhiteSpace(path))
+                {
+                    return path;
+                }
+
+                break;
+            }
+
+            if (Marshal.GetLastPInvokeError()
+                != WorkerNativeMethods.ErrorInsufficientBuffer)
+            {
+                break;
+            }
+        }
+
+        throw FailClosed();
+    }
+
+    private static AppContainerLaunchException FailClosed() =>
+        new("The suspended worker image could not be attested.");
 }
 
 internal sealed class DocumentWorkerResumeGate : IDisposable
@@ -147,19 +288,36 @@ public sealed class AppContainerProcessLauncher
 {
     private readonly AppContainerProfile _profile;
     private readonly IWorkerLaunchFaultInjector _faultInjector;
+    private readonly IWorkerProcessImageAttestor _processImageAttestor;
 
     public AppContainerProcessLauncher(AppContainerProfile profile)
-        : this(profile, NoOpWorkerLaunchFaultInjector.Instance)
+        : this(
+            profile,
+            NoOpWorkerLaunchFaultInjector.Instance,
+            NativeWorkerProcessImageAttestor.Instance)
     {
     }
 
     internal AppContainerProcessLauncher(
         AppContainerProfile profile,
         IWorkerLaunchFaultInjector faultInjector)
+        : this(
+            profile,
+            faultInjector,
+            NativeWorkerProcessImageAttestor.Instance)
+    {
+    }
+
+    internal AppContainerProcessLauncher(
+        AppContainerProfile profile,
+        IWorkerLaunchFaultInjector faultInjector,
+        IWorkerProcessImageAttestor processImageAttestor)
     {
         _profile = profile ?? throw new ArgumentNullException(nameof(profile));
         _faultInjector = faultInjector
             ?? throw new ArgumentNullException(nameof(faultInjector));
+        _processImageAttestor = processImageAttestor
+            ?? throw new ArgumentNullException(nameof(processImageAttestor));
     }
 
     public LaunchedAppContainerProcess Start(
@@ -209,8 +367,8 @@ public sealed class AppContainerProcessLauncher
 
         using var executableLease = new FileStream(
             executablePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-        var workerPackageIdentity = Convert.ToHexString(
-            System.Security.Cryptography.SHA256.HashData(executableLease)).ToLowerInvariant();
+        var pinnedExecutable = PinnedWorkerExecutable.FromOpenFile(
+            executableLease);
 
         deadline?.ThrowIfExpired();
         SafeFileHandle? childInput = null;
@@ -231,6 +389,7 @@ public sealed class AppContainerProcessLauncher
         IntPtr handlesPointer = IntPtr.Zero;
         IntPtr environmentPointer = IntPtr.Zero;
         uint processId = 0;
+        string? workerPackageIdentity = null;
         try
         {
             CreateProtocolPipes(
@@ -345,6 +504,9 @@ public sealed class AppContainerProcessLauncher
             process = new SafeKernelHandle(processInformation.Process);
             thread = new SafeKernelHandle(processInformation.Thread);
             processId = processInformation.ProcessId;
+            workerPackageIdentity = _processImageAttestor.Attest(
+                process,
+                pinnedExecutable);
             deadline?.ThrowIfExpired();
             _faultInjector.ThrowIfRequested(
                 WorkerLaunchFaultPoint.BeforeJobAssignment,
@@ -404,7 +566,7 @@ public sealed class AppContainerProcessLauncher
                 outputStream,
                 processInformation.ProcessId,
                 unchecked((ulong)handles[2].ToInt64()),
-                workerPackageIdentity,
+                workerPackageIdentity!,
                 _profile,
                 _faultInjector);
             inputStream = null;
