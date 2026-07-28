@@ -554,6 +554,24 @@ internal sealed class SqliteProductProjection(
                 ProductEventPayloads.Canonical(documentId));
             RequireSingle(await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false));
         }
+        if (kind == "review-committed")
+        {
+            await using var draftHead = context.Connection.CreateCommand();
+            draftHead.Transaction = context.Transaction;
+            draftHead.CommandText = """
+                UPDATE product_review_drafts
+                SET current_stream_version=$version
+                WHERE document_id=$document;
+                """;
+            draftHead.Parameters.AddWithValue(
+                "$version",
+                replayEvent.Metadata.StreamVersion.Value);
+            draftHead.Parameters.AddWithValue(
+                "$document",
+                ProductEventPayloads.Canonical(documentId));
+            await draftHead.ExecuteNonQueryAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         var inboxId = await ReadInboxIdAsync(
             context.Connection,
@@ -807,6 +825,7 @@ internal sealed class SqliteProductProjection(
             || currentExtractionRevision != extractionRevision
             || rawStatus is not ((int)ProductInboxStatus.ReadyForReview)
                 and not ((int)ProductInboxStatus.NeedsReview)
+                and not ((int)ProductInboxStatus.Reviewed)
             || reviewRevision != checked(currentReviewRevision + 1))
         {
             throw new ProductProjectionConflictException(

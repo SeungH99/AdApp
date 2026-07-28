@@ -93,7 +93,10 @@ public sealed record ConfirmedInvoiceReview(
     string ConfirmedMarket,
     bool IsOutboundInvoice,
     DateTimeOffset ApprovedAtUtc,
-    ImmutableArray<ConfirmedInvoiceReviewField> Fields);
+    ImmutableArray<ConfirmedInvoiceReviewField> Fields,
+    OperationId? CommitOperationId = null,
+    EventId? CommitEventId = null,
+    StreamVersion? CommittedStreamVersion = null);
 
 public sealed record ConfirmedInvoiceReviewField(
     string FieldId,
@@ -112,7 +115,10 @@ public sealed record PersistedConfirmedInvoiceReview(
     string ConfirmedMarket,
     bool IsOutboundInvoice,
     DateTimeOffset ApprovedAtUtc,
-    ImmutableArray<ConfirmedInvoiceReviewField> Fields);
+    ImmutableArray<ConfirmedInvoiceReviewField> Fields,
+    string? CommitOperationId = null,
+    string? CommitEventId = null,
+    long? CommittedStreamVersion = null);
 
 public sealed record InvoiceReviewResult(
     InvoiceReviewOutcome Outcome,

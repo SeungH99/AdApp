@@ -5,6 +5,7 @@ using System.Text.Json;
 using LocalDocumentOrganizer.Application.Contracts;
 using LocalDocumentOrganizer.Application.Products;
 using LocalDocumentOrganizer.Core.Cases.Receivable;
+using LocalDocumentOrganizer.Core.Events;
 
 namespace LocalDocumentOrganizer.Application.Review;
 
@@ -76,12 +77,39 @@ public sealed class InvoiceReviewService
         if (!TryValidateFields(command, snapshot, out var fields, out var failure))
             return Failed(failure, command);
 
+        if (snapshot.InboxStatus == ProductInboxStatus.Reviewed)
+        {
+            var existing = await _reviews.LoadConfirmedAsync(
+                    command.DocumentId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (existing is not null
+                && existing.CommitOperationId == command.OperationId)
+            {
+                return existing.CommitEventId == command.EventId
+                    && MatchesSubmission(existing, command, fields)
+                    ? new InvoiceReviewResult(
+                        InvoiceReviewOutcome.AlreadyConfirmed,
+                        InvoiceReviewFailureCode.None,
+                        existing,
+                        null)
+                    : Failed(
+                        InvoiceReviewFailureCode.StorageConflict,
+                        command);
+            }
+        }
+
         if (snapshot.ConfirmedReviewRevision == int.MaxValue)
+            return Failed(InvoiceReviewFailureCode.StorageConflict, command);
+        if (snapshot.CurrentStreamVersion.Value == long.MaxValue)
             return Failed(InvoiceReviewFailureCode.StorageConflict, command);
         var review = new ConfirmedInvoiceReview(
             command.DocumentId, command.ExpectedSourceIdentity,
             command.ExpectedExtractionRevision, snapshot.ConfirmedReviewRevision + 1,
-            command.ConfirmedMarket, true, command.ApprovedAtUtc, fields);
+            command.ConfirmedMarket, true, command.ApprovedAtUtc, fields,
+            command.OperationId,
+            command.EventId,
+            new StreamVersion(snapshot.CurrentStreamVersion.Value + 1));
         if (!TrySerializeBounded(review, out var payload))
             return Failed(InvoiceReviewFailureCode.InputTooLarge, command);
         var commit = await _commits.CommitReviewAsync(
@@ -89,16 +117,62 @@ public sealed class InvoiceReviewService
                 snapshot.CurrentStreamVersion, command.ApprovedAtUtc, payload,
                 command.ExpectedExtractionRevision, review.ReviewRevision),
             cancellationToken).ConfigureAwait(false);
+        if (commit is ProductConflict
+            {
+                Kind: ProductConflictKind.StreamVersionMismatch,
+            })
+        {
+            return await MapStreamConflictAsync(command, cancellationToken)
+                .ConfigureAwait(false);
+        }
         return commit switch
         {
             ProductCommitted => new(InvoiceReviewOutcome.Confirmed, InvoiceReviewFailureCode.None, review, null),
             ProductAlreadyCommitted => new(InvoiceReviewOutcome.AlreadyConfirmed, InvoiceReviewFailureCode.None, review, null),
-            ProductConflict { Kind: ProductConflictKind.StreamVersionMismatch } =>
-                new(InvoiceReviewOutcome.StaleRevision, InvoiceReviewFailureCode.StaleExtractionRevision, null, command),
             ProductConflict => Failed(InvoiceReviewFailureCode.StorageConflict, command),
             ProductRecoveryRequired => new(InvoiceReviewOutcome.RecoveryRequired, InvoiceReviewFailureCode.StorageRecoveryRequired, null, command),
             _ => new(InvoiceReviewOutcome.RecoveryRequired, InvoiceReviewFailureCode.StorageRecoveryRequired, null, command),
         };
+    }
+
+    private async Task<InvoiceReviewResult> MapStreamConflictAsync(
+        ConfirmInvoiceReviewCommand command,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var current = await _reviews.LoadCurrentAsync(
+                    command.DocumentId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return current is null
+                || current.CurrentExtractionRevision
+                    != command.ExpectedExtractionRevision
+                || !current.SourceIdentity.Equals(
+                    command.ExpectedSourceIdentity)
+                ? new InvoiceReviewResult(
+                    InvoiceReviewOutcome.StaleRevision,
+                    InvoiceReviewFailureCode.StaleExtractionRevision,
+                    null,
+                    command)
+                : new InvoiceReviewResult(
+                    InvoiceReviewOutcome.ConcurrentConflict,
+                    InvoiceReviewFailureCode.StorageConflict,
+                    null,
+                    command);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return new(
+                InvoiceReviewOutcome.RecoveryRequired,
+                InvoiceReviewFailureCode.StorageRecoveryRequired,
+                null,
+                command);
+        }
     }
 
     private static bool TryValidateFields(
@@ -245,7 +319,10 @@ public sealed class InvoiceReviewService
         payload = JsonSerializer.Serialize(new PersistedConfirmedInvoiceReview(
             review.DocumentId.Value.ToString("D"), review.SourceIdentity.Hex,
             review.ExtractionRevision, review.ReviewRevision, review.ConfirmedMarket,
-            review.IsOutboundInvoice, review.ApprovedAtUtc, review.Fields));
+            review.IsOutboundInvoice, review.ApprovedAtUtc, review.Fields,
+            review.CommitOperationId?.Value.ToString("D"),
+            review.CommitEventId?.Value.ToString("D"),
+            review.CommittedStreamVersion?.Value));
         return payload.Length > 0
             && Encoding.UTF8.GetByteCount(payload)
                 <= InvoiceReviewLimits.MaxProtectedPayloadUtf8Bytes;
@@ -254,4 +331,59 @@ public sealed class InvoiceReviewService
     private static InvoiceReviewResult Failed(InvoiceReviewFailureCode failure, ConfirmInvoiceReviewCommand command) =>
         new(InvoiceReviewOutcome.InvalidReview, failure, null, command);
 
+    private static bool MatchesSubmission(
+        ConfirmedInvoiceReview existing,
+        ConfirmInvoiceReviewCommand command,
+        ImmutableArray<ConfirmedInvoiceReviewField> fields)
+    {
+        if (!existing.SourceIdentity.Equals(command.ExpectedSourceIdentity)
+            || existing.ExtractionRevision
+                != command.ExpectedExtractionRevision
+            || !string.Equals(
+                existing.ConfirmedMarket,
+                command.ConfirmedMarket,
+                StringComparison.Ordinal)
+            || existing.IsOutboundInvoice != command.IsOutboundInvoice
+            || existing.ApprovedAtUtc != command.ApprovedAtUtc
+            || existing.Fields.Length != fields.Length)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < fields.Length; index++)
+        {
+            var left = existing.Fields[index];
+            var right = fields[index];
+            if (!string.Equals(left.FieldId, right.FieldId, StringComparison.Ordinal)
+                || !string.Equals(
+                    left.OriginalNormalizedValue,
+                    right.OriginalNormalizedValue,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    left.ConfirmedDisplayValue,
+                    right.ConfirmedDisplayValue,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    left.ConfirmedNormalizedValue,
+                    right.ConfirmedNormalizedValue,
+                    StringComparison.Ordinal)
+                || left.IsCorrected != right.IsCorrected
+                || left.Evidence.Length != right.Evidence.Length)
+            {
+                return false;
+            }
+            for (var evidenceIndex = 0;
+                 evidenceIndex < left.Evidence.Length;
+                 evidenceIndex++)
+            {
+                if (left.Evidence[evidenceIndex]
+                    != right.Evidence[evidenceIndex])
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
 }

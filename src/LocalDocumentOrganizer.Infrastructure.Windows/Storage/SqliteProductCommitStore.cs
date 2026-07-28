@@ -1129,7 +1129,45 @@ public sealed class SqliteProductCommitStore :
         var stored = JsonSerializer.Deserialize<PersistedConfirmedInvoiceReview>(payload) ?? throw new VaultRecoveryRequiredException();
         if (!Guid.TryParseExact(stored.DocumentId, "D", out var document) || stored.ExtractionRevision <= 0 || stored.ReviewRevision <= 0 || stored.ApprovedAtUtc.Offset != TimeSpan.Zero)
             throw new VaultRecoveryRequiredException();
-        return new ConfirmedInvoiceReview(new DocumentId(document), new ContentSha256(Convert.FromHexString(stored.SourceIdentitySha256)), stored.ExtractionRevision, stored.ReviewRevision, stored.ConfirmedMarket, stored.IsOutboundInvoice, stored.ApprovedAtUtc, stored.Fields);
+        OperationId? operationId = null;
+        EventId? eventId = null;
+        StreamVersion? committedVersion = null;
+        var hasAnyCommitIdentity = stored.CommitOperationId is not null
+            || stored.CommitEventId is not null
+            || stored.CommittedStreamVersion is not null;
+        if (hasAnyCommitIdentity)
+        {
+            if (!Guid.TryParseExact(
+                    stored.CommitOperationId,
+                    "D",
+                    out var operation)
+                || operation == Guid.Empty
+                || !Guid.TryParseExact(
+                    stored.CommitEventId,
+                    "D",
+                    out var eventValue)
+                || eventValue == Guid.Empty
+                || stored.CommittedStreamVersion is not >= 0)
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+            operationId = new OperationId(operation);
+            eventId = new EventId(eventValue);
+            committedVersion = new StreamVersion(
+                stored.CommittedStreamVersion.Value);
+        }
+        return new ConfirmedInvoiceReview(
+            new DocumentId(document),
+            new ContentSha256(Convert.FromHexString(stored.SourceIdentitySha256)),
+            stored.ExtractionRevision,
+            stored.ReviewRevision,
+            stored.ConfirmedMarket,
+            stored.IsOutboundInvoice,
+            stored.ApprovedAtUtc,
+            stored.Fields,
+            operationId,
+            eventId,
+            committedVersion);
     }
 
     private async Task<ProductCommitResult> CommitDocumentProgressAsync(
