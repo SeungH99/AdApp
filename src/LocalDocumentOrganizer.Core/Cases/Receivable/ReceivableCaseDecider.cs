@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Globalization;
+using LocalDocumentOrganizer.Core.Documents;
 
 namespace LocalDocumentOrganizer.Core.Cases.Receivable;
 
@@ -32,17 +33,26 @@ public sealed record ReceivableEvidence(
     double X,
     double Y,
     double Width,
-    double Height)
+    double Height,
+    EvidenceCoordinateSystem CoordinateSystem =
+        EvidenceCoordinateSystem.PdfPagePoints)
 {
     public bool IsValid => SourceIndex >= 0
         && double.IsFinite(X) && double.IsFinite(Y)
         && double.IsFinite(Width) && double.IsFinite(Height)
+        && X >= 0 && Y >= 0
         && Width > 0 && Height > 0;
 }
 
+public sealed record ReceivableSourcePage(
+    int SourceIndex,
+    double Width,
+    double Height,
+    EvidenceCoordinateSystem CoordinateSystem);
+
 public sealed record ConfirmedReceivableField(
     string FieldId,
-    string OriginalNormalizedValue,
+    string? OriginalNormalizedValue,
     string ConfirmedNormalizedValue,
     bool IsCorrected,
     ImmutableArray<ReceivableEvidence> Evidence);
@@ -61,7 +71,11 @@ public sealed record CreateReceivableCaseCommand(
     DateOnly DueDate,
     decimal TotalAmount,
     string Currency,
-    ImmutableDictionary<string, ConfirmedReceivableField> Fields);
+    ImmutableDictionary<string, ConfirmedReceivableField> Fields,
+    int? CurrentExtractionRevision = null,
+    string? ReviewedSourceIdentity = null,
+    string? CurrentSourceIdentity = null,
+    ImmutableDictionary<int, ReceivableSourcePage>? SourcePages = null);
 
 public sealed record ReceivableCaseCreated(
     CaseId CaseId,
@@ -106,8 +120,12 @@ public static class ReceivableCaseDecider
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.IdentityMismatch);
         if (existingCase is not null)
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.CaseAlreadyExists);
+        var currentExtractionRevision =
+            command.CurrentExtractionRevision ?? command.ExtractionRevision;
         if (command.ExtractionRevision <= 0 || command.ReviewRevision <= 0
-            || command.ExtractionRevision != command.ReviewRevision)
+            || currentExtractionRevision <= 0
+            || command.ExtractionRevision != currentExtractionRevision
+            || !SourceBindingMatches(command))
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.StaleReviewRevision);
         if (command.ConfirmedMarket is not ("ko-KR" or "en-US"))
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.MarketNotConfirmed);
@@ -116,7 +134,7 @@ public static class ReceivableCaseDecider
         if (!command.IsExplicitlyApproved || command.ApprovedAtUtc.Offset != TimeSpan.Zero
             || command.ApprovedAtUtc == default)
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.ApprovalRequired);
-        if (!HasValidFields(command.Fields))
+        if (!HasValidFields(command.Fields, command.SourcePages))
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.InvalidReview);
         if (command.DueDate < command.IssueDate
             || !MatchesDate(command.Fields["issue_date"].ConfirmedNormalizedValue, command.IssueDate)
@@ -140,15 +158,67 @@ public static class ReceivableCaseDecider
     }
 
     private static bool HasValidFields(
-        ImmutableDictionary<string, ConfirmedReceivableField>? fields) =>
+        ImmutableDictionary<string, ConfirmedReceivableField>? fields,
+        ImmutableDictionary<int, ReceivableSourcePage>? sourcePages) =>
         fields is not null
         && fields.Count == RequiredFields.Count
         && fields.Keys.ToImmutableHashSet(StringComparer.Ordinal).SetEquals(RequiredFields)
         && fields.All(pair => pair.Key == pair.Value.FieldId
-            && !string.IsNullOrWhiteSpace(pair.Value.OriginalNormalizedValue)
             && !string.IsNullOrWhiteSpace(pair.Value.ConfirmedNormalizedValue)
             && !pair.Value.Evidence.IsDefaultOrEmpty
-            && pair.Value.Evidence.All(static evidence => evidence.IsValid));
+            && pair.Value.Evidence.All(evidence =>
+                IsValidEvidence(evidence, sourcePages)));
+
+    private static bool SourceBindingMatches(
+        CreateReceivableCaseCommand command)
+    {
+        if (command.ReviewedSourceIdentity is null
+            && command.CurrentSourceIdentity is null)
+        {
+            return true;
+        }
+
+        return IsSha256(command.ReviewedSourceIdentity)
+            && IsSha256(command.CurrentSourceIdentity)
+            && string.Equals(
+                command.ReviewedSourceIdentity,
+                command.CurrentSourceIdentity,
+                StringComparison.Ordinal);
+    }
+
+    private static bool IsSha256(string? value) =>
+        value is { Length: 64 }
+        && value.All(static character =>
+            character is >= '0' and <= '9'
+                or >= 'a' and <= 'f');
+
+    private static bool IsValidEvidence(
+        ReceivableEvidence evidence,
+        ImmutableDictionary<int, ReceivableSourcePage>? sourcePages)
+    {
+        if (!evidence.IsValid)
+        {
+            return false;
+        }
+        if (sourcePages is null)
+        {
+            return true;
+        }
+        if (!sourcePages.TryGetValue(evidence.SourceIndex, out var page)
+            || page.SourceIndex != evidence.SourceIndex
+            || !Enum.IsDefined(page.CoordinateSystem)
+            || evidence.CoordinateSystem != page.CoordinateSystem
+            || !double.IsFinite(page.Width)
+            || !double.IsFinite(page.Height)
+            || page.Width <= 0
+            || page.Height <= 0)
+        {
+            return false;
+        }
+
+        return evidence.X <= page.Width - evidence.Width
+            && evidence.Y <= page.Height - evidence.Height;
+    }
 
     private static bool MatchesDate(string value, DateOnly expected) =>
         DateOnly.TryParseExact(value, "yyyy-MM-dd", CultureInfo.InvariantCulture,

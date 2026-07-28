@@ -45,17 +45,30 @@ public sealed class ReceivableCaseService
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
+        var current = await _reviews.LoadCurrentAsync(
+                request.DocumentId,
+                cancellationToken)
+            .ConfigureAwait(false);
         var review = await _reviews.LoadConfirmedAsync(request.DocumentId, cancellationToken)
             .ConfigureAwait(false);
-        if (review is null)
+        if (review is null || current is null)
             return new(ReceivableCaseOutcome.ReviewUnavailable, null, null);
+        if (review.ExtractionRevision != current.CurrentExtractionRevision
+            || !review.SourceIdentity.Equals(current.SourceIdentity))
+        {
+            return new(
+                ReceivableCaseOutcome.ReviewInvalid,
+                ReceivableCaseFailureCode.StaleReviewRevision,
+                null);
+        }
         var fields = review.Fields.ToImmutableDictionary(
             static field => field.FieldId,
             static field => new ConfirmedReceivableField(field.FieldId,
                 field.OriginalNormalizedValue, field.ConfirmedNormalizedValue,
                 field.IsCorrected, field.Evidence.Select(static evidence =>
                     new ReceivableEvidence(evidence.Box.SourceIndex, evidence.Box.X,
-                        evidence.Box.Y, evidence.Box.Width, evidence.Box.Height)).ToImmutableArray()),
+                        evidence.Box.Y, evidence.Box.Width, evidence.Box.Height,
+                        evidence.CoordinateSystem)).ToImmutableArray()),
             StringComparer.Ordinal);
         if (!DateOnly.TryParseExact(fields["issue_date"].ConfirmedNormalizedValue, "yyyy-MM-dd",
                 System.Globalization.CultureInfo.InvariantCulture,
@@ -72,7 +85,20 @@ public sealed class ReceivableCaseService
             request.CaseId, request.ActionId, request.DocumentId, review.ExtractionRevision,
             review.ReviewRevision, review.ConfirmedMarket, review.IsOutboundInvoice, true,
             review.ApprovedAtUtc, issue, due, amount,
-            fields["currency"].ConfirmedNormalizedValue, fields), null);
+            fields["currency"].ConfirmedNormalizedValue,
+            fields,
+            current.CurrentExtractionRevision,
+            review.SourceIdentity.Hex,
+            current.SourceIdentity.Hex,
+            current.SourcePages.IsDefault
+                ? null
+                : current.SourcePages.ToImmutableDictionary(
+                    static page => page.SourceIndex,
+                    static page => new ReceivableSourcePage(
+                        page.SourceIndex,
+                        page.Width,
+                        page.Height,
+                        page.CoordinateSystem))), null);
         if (decision.Failure is { } failure)
             return new(failure == ReceivableCaseFailureCode.IncomingInvoiceNotSupported
                 ? ReceivableCaseOutcome.NotSupportedInThisVersion : ReceivableCaseOutcome.ReviewInvalid,

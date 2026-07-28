@@ -15,13 +15,16 @@ public sealed class InvoiceReviewService
 
     private readonly IInvoiceReviewQueryStore _reviews;
     private readonly IProductCommitStore _commits;
+    private readonly IInvoiceReviewDraftLabeler? _draftLabeler;
 
     public InvoiceReviewService(
         IInvoiceReviewQueryStore reviews,
-        IProductCommitStore commits)
+        IProductCommitStore commits,
+        IInvoiceReviewDraftLabeler? draftLabeler = null)
     {
         _reviews = reviews ?? throw new ArgumentNullException(nameof(reviews));
         _commits = commits ?? throw new ArgumentNullException(nameof(commits));
+        _draftLabeler = draftLabeler;
     }
 
     public async Task<InvoiceReviewResult> ConfirmAsync(
@@ -37,7 +40,10 @@ public sealed class InvoiceReviewService
             return Failed(InvoiceReviewFailureCode.SourceIdentityMismatch, command);
         if (snapshot.CurrentExtractionRevision != command.ExpectedExtractionRevision)
             return new(InvoiceReviewOutcome.StaleRevision, InvoiceReviewFailureCode.StaleExtractionRevision, null, command);
-        if (snapshot.InboxStatus is not (ProductInboxStatus.ReadyForReview or ProductInboxStatus.NeedsReview))
+        if (snapshot.InboxStatus is not (
+                ProductInboxStatus.ReadyForReview
+                or ProductInboxStatus.NeedsReview
+                or ProductInboxStatus.Reviewed))
             return Failed(InvoiceReviewFailureCode.DocumentUnavailable, command);
         if (command.ConfirmedMarket is not ("ko-KR" or "en-US"))
             return Failed(InvoiceReviewFailureCode.MarketConfirmationRequired, command);
@@ -45,14 +51,39 @@ public sealed class InvoiceReviewService
             return new(InvoiceReviewOutcome.NotSupportedInThisVersion, InvoiceReviewFailureCode.OutboundConfirmationRequired, null, command);
         if (!command.IsExplicitlyApproved || command.ApprovedAtUtc.Offset != TimeSpan.Zero || command.ApprovedAtUtc == default)
             return Failed(InvoiceReviewFailureCode.ApprovalRequired, command);
+        if (snapshot.CurrentDraft is not null)
+        {
+            if (_draftLabeler is null)
+                return Failed(
+                    InvoiceReviewFailureCode.ExactFieldSetRequired,
+                    command);
+            try
+            {
+                snapshot = snapshot with
+                {
+                    Fields = _draftLabeler.Label(
+                        command.ConfirmedMarket,
+                        snapshot.CurrentDraft),
+                };
+            }
+            catch (InvoiceRuleException)
+            {
+                return Failed(
+                    InvoiceReviewFailureCode.ExactFieldSetRequired,
+                    command);
+            }
+        }
         if (!TryValidateFields(command, snapshot, out var fields, out var failure))
             return Failed(failure, command);
 
+        if (snapshot.ConfirmedReviewRevision == int.MaxValue)
+            return Failed(InvoiceReviewFailureCode.StorageConflict, command);
         var review = new ConfirmedInvoiceReview(
             command.DocumentId, command.ExpectedSourceIdentity,
-            command.ExpectedExtractionRevision, checked(snapshot.ConfirmedReviewRevision + 1),
+            command.ExpectedExtractionRevision, snapshot.ConfirmedReviewRevision + 1,
             command.ConfirmedMarket, true, command.ApprovedAtUtc, fields);
-        var payload = SerializeBounded(review);
+        if (!TrySerializeBounded(review, out var payload))
+            return Failed(InvoiceReviewFailureCode.InputTooLarge, command);
         var commit = await _commits.CommitReviewAsync(
             new CommitReviewCommand(command.OperationId, command.EventId, command.DocumentId,
                 snapshot.CurrentStreamVersion, command.ApprovedAtUtc, payload,
@@ -78,8 +109,30 @@ public sealed class InvoiceReviewService
     {
         fields = ImmutableArray<ConfirmedInvoiceReviewField>.Empty;
         failure = InvoiceReviewFailureCode.ExactFieldSetRequired;
-        if (command.Fields.IsDefault || command.Fields.Length != RequiredFields.Count
-            || command.Fields.Select(static field => field.FieldId).Distinct(StringComparer.Ordinal).Count() != RequiredFields.Count
+        if (command.Fields.IsDefault || command.Fields.Length != RequiredFields.Count)
+            return false;
+
+        var totalEvidence = 0;
+        foreach (var submission in command.Fields)
+        {
+            if (submission is null
+                || submission.ConfirmedValue is null
+                || Encoding.UTF8.GetByteCount(submission.ConfirmedValue)
+                    > InvoiceReviewLimits.MaxConfirmedValueUtf8Bytes
+                || submission.Evidence.IsDefault
+                || submission.Evidence.Length
+                    > InvoiceReviewLimits.MaxEvidencePerField
+                || totalEvidence
+                    > InvoiceReviewLimits.MaxTotalEvidence
+                        - submission.Evidence.Length)
+            {
+                failure = InvoiceReviewFailureCode.InputTooLarge;
+                return false;
+            }
+            totalEvidence += submission.Evidence.Length;
+        }
+
+        if (command.Fields.Select(static field => field.FieldId).Distinct(StringComparer.Ordinal).Count() != RequiredFields.Count
             || !command.Fields.Select(static field => field.FieldId).ToImmutableHashSet(StringComparer.Ordinal).SetEquals(RequiredFields)
             || snapshot.Fields.Keys.ToImmutableHashSet(StringComparer.Ordinal).SetEquals(RequiredFields) is false)
             return false;
@@ -95,7 +148,7 @@ public sealed class InvoiceReviewService
                 return false;
             }
             if (submission.Evidence.Any(evidence => evidence.ExtractionRevision != command.ExpectedExtractionRevision
-                    || !IsValidEvidence(evidence.Box, snapshot.SourcePageCount)))
+                    || !IsValidEvidence(evidence, snapshot)))
             {
                 failure = InvoiceReviewFailureCode.EvidenceInvalid;
                 return false;
@@ -120,11 +173,36 @@ public sealed class InvoiceReviewService
         return true;
     }
 
-    private static bool IsValidEvidence(EvidenceBox box, int pages) =>
-        box.SourceIndex >= 0 && box.SourceIndex < pages
-        && double.IsFinite(box.X) && double.IsFinite(box.Y)
-        && double.IsFinite(box.Width) && double.IsFinite(box.Height)
-        && box.Width > 0 && box.Height > 0;
+    private static bool IsValidEvidence(
+        ReviewEvidence evidence,
+        InvoiceReviewSnapshot snapshot)
+    {
+        var box = evidence.Box;
+        if (box.SourceIndex < 0
+            || !double.IsFinite(box.X)
+            || !double.IsFinite(box.Y)
+            || !double.IsFinite(box.Width)
+            || !double.IsFinite(box.Height)
+            || box.X < 0
+            || box.Y < 0
+            || box.Width <= 0
+            || box.Height <= 0)
+        {
+            return false;
+        }
+
+        if (snapshot.SourcePages.IsDefault)
+        {
+            return box.SourceIndex < snapshot.SourcePageCount;
+        }
+
+        var page = snapshot.SourcePages.SingleOrDefault(
+            candidate => candidate.SourceIndex == box.SourceIndex);
+        return page is not null
+            && page.CoordinateSystem == evidence.CoordinateSystem
+            && box.X <= page.Width - box.Width
+            && box.Y <= page.Height - box.Height;
+    }
 
     private static bool TryNormalize(string fieldId, string supplied, out string display, out string normalized)
     {
@@ -160,15 +238,17 @@ public sealed class InvoiceReviewService
     private static bool SetAmount(decimal value, out string display, out string normalized) =>
         (display = normalized = value.ToString("0.#############################", CultureInfo.InvariantCulture)).Length > 0;
 
-    private static string SerializeBounded(ConfirmedInvoiceReview review)
+    private static bool TrySerializeBounded(
+        ConfirmedInvoiceReview review,
+        out string payload)
     {
-        var json = JsonSerializer.Serialize(new PersistedConfirmedInvoiceReview(
+        payload = JsonSerializer.Serialize(new PersistedConfirmedInvoiceReview(
             review.DocumentId.Value.ToString("D"), review.SourceIdentity.Hex,
             review.ExtractionRevision, review.ReviewRevision, review.ConfirmedMarket,
             review.IsOutboundInvoice, review.ApprovedAtUtc, review.Fields));
-        if (json.Length is 0 or > 1_048_576)
-            throw new InvalidOperationException("Validated review serialization was out of bounds.");
-        return json;
+        return payload.Length > 0
+            && Encoding.UTF8.GetByteCount(payload)
+                <= InvoiceReviewLimits.MaxProtectedPayloadUtf8Bytes;
     }
 
     private static InvoiceReviewResult Failed(InvoiceReviewFailureCode failure, ConfirmInvoiceReviewCommand command) =>

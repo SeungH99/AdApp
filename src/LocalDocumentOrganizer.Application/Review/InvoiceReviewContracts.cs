@@ -9,9 +9,17 @@ using LocalDocumentOrganizer.Core.Security;
 
 namespace LocalDocumentOrganizer.Application.Review;
 
+public static class InvoiceReviewLimits
+{
+    public const int MaxConfirmedValueUtf8Bytes = 4 * 1024;
+    public const int MaxEvidencePerField = 32;
+    public const int MaxTotalEvidence = 128;
+    public const int MaxProtectedPayloadUtf8Bytes = 1024 * 1024;
+}
+
 public sealed record ReviewExtractionField(
     string FieldId,
-    string OriginalNormalizedValue);
+    string? OriginalNormalizedValue);
 
 public sealed record InvoiceReviewSnapshot(
     DocumentId DocumentId,
@@ -27,7 +35,9 @@ public sealed record InvoiceReviewSnapshot(
 
 public sealed record ReviewEvidence(
     int ExtractionRevision,
-    EvidenceBox Box);
+    EvidenceBox Box,
+    EvidenceCoordinateSystem CoordinateSystem =
+        EvidenceCoordinateSystem.PdfPagePoints);
 
 public sealed record InvoiceReviewFieldSubmission(
     string FieldId,
@@ -54,6 +64,7 @@ public enum InvoiceReviewOutcome
     InvalidReview = 4,
     NotSupportedInThisVersion = 5,
     RecoveryRequired = 6,
+    ConcurrentConflict = 7,
 }
 
 public enum InvoiceReviewFailureCode
@@ -71,6 +82,7 @@ public enum InvoiceReviewFailureCode
     InvalidValue = 10,
     StorageConflict = 11,
     StorageRecoveryRequired = 12,
+    InputTooLarge = 13,
 }
 
 public sealed record ConfirmedInvoiceReview(
@@ -85,7 +97,7 @@ public sealed record ConfirmedInvoiceReview(
 
 public sealed record ConfirmedInvoiceReviewField(
     string FieldId,
-    string OriginalNormalizedValue,
+    string? OriginalNormalizedValue,
     string ConfirmedDisplayValue,
     string ConfirmedNormalizedValue,
     bool IsCorrected,
