@@ -52,17 +52,9 @@ public sealed record LabeledField(
     ImmutableArray<EvidenceBox> Evidence,
     string RuleId);
 
-public sealed record WorkbenchDocument(
-    string DocumentId,
-    string ContentSha256,
-    string SourceFamilyId,
+public sealed record InvoiceLabelingContext(
     string MarketId,
-    string ContractId,
-    string InputKind,
-    string? CodecId,
-    string ReceiptId,
-    string LifecycleState,
-    DateTimeOffset CreatedAtUtc);
+    string ContractId);
 
 public sealed record OfficialRuleSource(
     string Id,

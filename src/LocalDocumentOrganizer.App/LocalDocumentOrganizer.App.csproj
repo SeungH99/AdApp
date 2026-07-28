@@ -13,7 +13,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\LocalDocumentOrganizer.Application\LocalDocumentOrganizer.Application.csproj" />
-    <ProjectReference Include="..\LocalDocumentOrganizer.Core\LocalDocumentOrganizer.Core.csproj" />
     <ProjectReference Include="..\LocalDocumentOrganizer.Infrastructure.Windows\LocalDocumentOrganizer.Infrastructure.Windows.csproj" />
     <PackageReference Include="CommunityToolkit.Mvvm" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" />

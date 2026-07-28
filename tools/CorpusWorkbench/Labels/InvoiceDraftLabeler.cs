@@ -26,17 +26,9 @@ public sealed class InvoiceDraftLabeler
         try
         {
             var draft = _labeler.CreateDraft(
-                new ApplicationContracts.WorkbenchDocument(
-                    document.DocumentId,
-                    document.ContentSha256,
-                    document.SourceFamilyId,
+                new ApplicationContracts.InvoiceLabelingContext(
                     document.MarketId,
-                    document.ContractId,
-                    document.InputKind,
-                    document.CodecId,
-                    document.ReceiptId,
-                    document.LifecycleState,
-                    document.CreatedAtUtc),
+                    document.ContractId),
                 extraction,
                 ToApplication(rules));
             return new LabelDraft(

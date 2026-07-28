@@ -44,14 +44,14 @@ public sealed class InvoiceDraftLabeler
         }.ToFrozenSet(StringComparer.Ordinal);
 
     public LabelDraft CreateDraft(
-        WorkbenchDocument document,
+        InvoiceLabelingContext context,
         DocumentExtractionResponse extraction,
         OfficialRuleCatalogSnapshot rules)
     {
-        ArgumentNullException.ThrowIfNull(document);
+        ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(extraction);
         ArgumentNullException.ThrowIfNull(rules);
-        RequireCompatible(document, extraction, rules);
+        RequireCompatible(context, extraction, rules);
         var fragments = ValidateAndOrderFragments(extraction);
         var fields = ImmutableArray.CreateBuilder<LabeledField>(
             PilotCatalog.RequiredFieldIds.Length);
@@ -65,7 +65,7 @@ public sealed class InvoiceDraftLabeler
                 resolution = ResolveCurrency(
                     fragments,
                     rule,
-                    document.MarketId,
+                    context.MarketId,
                     totalAmount);
             }
             else
@@ -73,7 +73,7 @@ public sealed class InvoiceDraftLabeler
                 resolution = ResolveField(
                     fragments,
                     rule,
-                    document.MarketId);
+                    context.MarketId);
                 if (fieldId == "total_amount")
                 {
                     totalAmount = resolution;
@@ -92,19 +92,19 @@ public sealed class InvoiceDraftLabeler
     }
 
     private static void RequireCompatible(
-        WorkbenchDocument document,
+        InvoiceLabelingContext context,
         DocumentExtractionResponse extraction,
         OfficialRuleCatalogSnapshot rules)
     {
         if (!string.Equals(
-                document.MarketId,
+                context.MarketId,
                 rules.Document.MarketId,
                 StringComparison.Ordinal)
             || !string.Equals(
-                document.ContractId,
+                context.ContractId,
                 rules.Document.ContractId,
                 StringComparison.Ordinal)
-            || document.ContractId != PilotCatalog.ContractId
+            || context.ContractId != PilotCatalog.ContractId
             || extraction.ProtocolVersion
                 != DocumentExtractionProtocol.CurrentVersion
             || extraction.JobId == Guid.Empty
