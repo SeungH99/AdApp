@@ -63,7 +63,7 @@ internal sealed class SqliteProductProjection(
     IProductCommitFaultInjector? faultInjector = null) : ISqliteProjection
 {
     internal const string ProjectionName = "product";
-    internal const int ProjectionSchemaVersion = 4;
+    internal const int ProjectionSchemaVersion = 5;
 
     private const string SchemaSql = """
         CREATE TABLE IF NOT EXISTS product_documents(
@@ -92,6 +92,17 @@ internal sealed class SqliteProductProjection(
         ) STRICT;
         CREATE INDEX IF NOT EXISTS product_inbox_status_received_document
             ON product_inbox(status,received_at_utc COLLATE BINARY,document_id COLLATE BINARY);
+        CREATE TABLE IF NOT EXISTS product_reviews(
+            document_id TEXT PRIMARY KEY CHECK(length(document_id)=36)
+                REFERENCES product_documents(document_id) ON DELETE CASCADE,
+            extraction_revision INTEGER NOT NULL CHECK(extraction_revision>0),
+            review_revision INTEGER NOT NULL CHECK(review_revision>0),
+            approved_at_utc TEXT NOT NULL,
+            owner_kind INTEGER NOT NULL, owner_id TEXT NOT NULL CHECK(length(owner_id)=36),
+            key_id TEXT NOT NULL CHECK(length(key_id)=36), encryption_version INTEGER NOT NULL CHECK(encryption_version=1),
+            payload_nonce BLOB NOT NULL CHECK(length(payload_nonce)=12), payload_ciphertext BLOB NOT NULL,
+            payload_tag BLOB NOT NULL CHECK(length(payload_tag)=16)
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS product_cases(
             case_id TEXT PRIMARY KEY CHECK(length(case_id)=36),
             source_document_id TEXT NOT NULL CHECK(length(source_document_id)=36)
@@ -146,6 +157,7 @@ internal sealed class SqliteProductProjection(
     [
         new("product_documents"),
         new("product_inbox"),
+        new("product_reviews"),
         new("product_cases"),
         new("product_today"),
         new("product_outbox"),
@@ -155,6 +167,7 @@ internal sealed class SqliteProductProjection(
     [
         new("product_inbox", "file_name"),
         new("product_inbox", "metadata"),
+        new("product_reviews", "payload"),
         new("product_cases", "metadata"),
     ];
 
@@ -386,6 +399,28 @@ internal sealed class SqliteProductProjection(
         _ = ProductEventPayloads.UtcValue(payload.OccurredAtUtc);
         _ = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
         RequireOwner(context, SensitiveObjectKind.DocumentEvidence, documentId);
+        if (kind == "review-committed" && payload.ExpectedExtractionRevision is { } extractionRevision
+            && payload.ReviewRevision is { } reviewRevision)
+        {
+            if (extractionRevision <= 0 || reviewRevision <= 0)
+                throw new VaultRecoveryRequiredException();
+            var encrypted = await context.Values.ProtectAsync("product_reviews", "payload",
+                ProductEventPayloads.Canonical(documentId), context.Values.BoundOwner,
+                context.Values.BoundDataKeyId, Encoding.UTF8.GetBytes(payload.AuthenticatedPayload), cancellationToken).ConfigureAwait(false);
+            await using var review = context.Connection.CreateCommand();
+            review.Transaction = context.Transaction;
+            review.CommandText = """
+                INSERT INTO product_reviews(document_id,extraction_revision,review_revision,approved_at_utc,owner_kind,owner_id,key_id,encryption_version,payload_nonce,payload_ciphertext,payload_tag)
+                VALUES($document,$extraction,$review,$approved,$kind,$owner,$key,$version,$nonce,$cipher,$tag)
+                ON CONFLICT(document_id) DO UPDATE SET extraction_revision=excluded.extraction_revision,review_revision=excluded.review_revision,approved_at_utc=excluded.approved_at_utc,owner_kind=excluded.owner_kind,owner_id=excluded.owner_id,key_id=excluded.key_id,encryption_version=excluded.encryption_version,payload_nonce=excluded.payload_nonce,payload_ciphertext=excluded.payload_ciphertext,payload_tag=excluded.payload_tag;
+                """;
+            review.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(documentId));
+            review.Parameters.AddWithValue("$extraction", extractionRevision); review.Parameters.AddWithValue("$review", reviewRevision);
+            review.Parameters.AddWithValue("$approved", ProductEventPayloads.Utc(replayEvent.Metadata.RecordedAtUtc));
+            AddOwnerAndKey(review, context.Values.BoundOwner, encrypted);
+            review.Parameters.Add("$nonce", SqliteType.Blob).Value=encrypted.Nonce.ToArray(); review.Parameters.Add("$cipher", SqliteType.Blob).Value=encrypted.Ciphertext.ToArray(); review.Parameters.Add("$tag", SqliteType.Blob).Value=encrypted.Tag.ToArray();
+            RequireSingle(await review.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false));
+        }
         if (kind == "extraction-committed"
             && context.Mode == ProjectionApplyMode.LiveAppend
             && payload.ClaimOwnerId is not null)

@@ -60,6 +60,8 @@ internal sealed record ProductDocumentProgressPayload(
     Guid? ClaimAttemptId,
     int? ClaimTargetRevision,
     string? ClaimLeaseExpiresAtUtc,
+    int? ExpectedExtractionRevision,
+    int? ReviewRevision,
     string CommitFingerprint);
 
 internal sealed record ProductReceivableCasePayload(
@@ -68,6 +70,7 @@ internal sealed record ProductReceivableCasePayload(
     string DueDate,
     string CreatedAtUtc,
     string AuthenticatedMetadata,
+    int? ConfirmedReviewRevision,
     string CommitFingerprint);
 
 internal static class ProductEventPayloads
@@ -114,6 +117,8 @@ internal static class ProductEventPayloads
                 command.ClaimBinding?.AttemptId,
                 command.ClaimBinding?.TargetRevision,
                 command.ClaimBinding is { } claim ? Utc(claim.LeaseExpiresAtUtc) : null,
+                null,
+                null,
                 Convert.ToHexString(fingerprint).ToLowerInvariant()));
 
     internal static byte[] SerializeReview(
@@ -129,6 +134,8 @@ internal static class ProductEventPayloads
                 null,
                 null,
                 null,
+                command.ExpectedExtractionRevision,
+                command.ReviewRevision,
                 Convert.ToHexString(fingerprint).ToLowerInvariant()));
 
     internal static byte[] SerializeReceivableCase(
@@ -141,6 +148,7 @@ internal static class ProductEventPayloads
                 command.DueDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
                 Utc(command.CreatedAtUtc),
                 command.AuthenticatedMetadata,
+                command.ConfirmedReviewRevision,
                 Convert.ToHexString(fingerprint).ToLowerInvariant()));
 
     internal static T Read<T>(ReadOnlyMemory<byte> payload)
@@ -203,6 +211,8 @@ internal static class ProductEventPayloads
         Add(hash, command.ExpectedVersion.Value);
         Add(hash, Utc(command.ReviewedAtUtc));
         Add(hash, command.AuthenticatedReview);
+        Add(hash, command.ExpectedExtractionRevision ?? 0);
+        Add(hash, command.ReviewRevision ?? 0);
         return hash.GetHashAndReset();
     }
 
@@ -217,6 +227,7 @@ internal static class ProductEventPayloads
         Add(hash, command.DueDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
         Add(hash, Utc(command.CreatedAtUtc));
         Add(hash, command.AuthenticatedMetadata);
+        Add(hash, command.ConfirmedReviewRevision ?? 0);
         return hash.GetHashAndReset();
     }
 
