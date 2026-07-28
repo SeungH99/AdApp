@@ -413,6 +413,24 @@ internal sealed class SqliteProductProjection(
             complete.Parameters.AddWithValue("$occurred", ProductEventPayloads.Utc(replayEvent.Metadata.RecordedAtUtc));
             RequireSingle(await complete.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false));
         }
+        else if (kind == "extraction-committed"
+            && context.Mode == ProjectionApplyMode.RebuildReplay
+            && payload.ClaimAttemptId is { } replayAttempt
+            && payload.ClaimTargetRevision is { } replayRevision)
+        {
+            await using var complete = context.Connection.CreateCommand();
+            complete.Transaction = context.Transaction;
+            complete.CommandText = """
+                UPDATE product_outbox
+                SET dispatch_status=3,lease_owner_id=NULL,lease_expires_at_utc=NULL
+                WHERE aggregate_id=$document AND extraction_attempt_id=$attempt
+                  AND target_extraction_revision=$revision;
+                """;
+            complete.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(documentId));
+            complete.Parameters.AddWithValue("$attempt", ProductEventPayloads.Canonical(replayAttempt));
+            complete.Parameters.AddWithValue("$revision", replayRevision);
+            RequireSingle(await complete.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false));
+        }
         _faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeInbox);
         await using (var update = context.Connection.CreateCommand())
         {
