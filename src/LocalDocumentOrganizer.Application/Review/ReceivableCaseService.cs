@@ -24,6 +24,9 @@ public enum ReceivableCaseOutcome
     ReviewInvalid = 4,
     NotSupportedInThisVersion = 5,
     RecoveryRequired = 6,
+    OperationConflict = 7,
+    StorageConflict = 8,
+    ConcurrentConflict = 9,
 }
 
 public sealed record ReceivableCaseResult(
@@ -50,12 +53,27 @@ public sealed class ReceivableCaseService
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
-        var current = await _reviews.LoadCurrentAsync(
-                request.DocumentId,
-                cancellationToken)
-            .ConfigureAwait(false);
-        var review = await _reviews.LoadConfirmedAsync(request.DocumentId, cancellationToken)
-            .ConfigureAwait(false);
+        InvoiceReviewSnapshot? current;
+        ConfirmedInvoiceReview? review;
+        try
+        {
+            current = await _reviews.LoadCurrentAsync(
+                    request.DocumentId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            review = await _reviews.LoadConfirmedAsync(
+                    request.DocumentId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return new(ReceivableCaseOutcome.RecoveryRequired, null, null);
+        }
         if (review is null || current is null)
             return new(ReceivableCaseOutcome.ReviewUnavailable, null, null);
         if (review.ExtractionRevision != current.CurrentExtractionRevision
@@ -125,15 +143,80 @@ public sealed class ReceivableCaseService
                 fields["currency"].ConfirmedNormalizedValue,
                 SafePaymentReason), cancellationToken)
             .ConfigureAwait(false);
+        if (commit is ProductConflict
+            {
+                Kind: ProductConflictKind.StreamVersionMismatch,
+            })
+        {
+            return await MapConcurrentConflictAsync(
+                    request,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
         return commit switch
         {
             ProductCommitted => new(ReceivableCaseOutcome.Created, null, caseId),
             ProductAlreadyCommitted => new(ReceivableCaseOutcome.AlreadyCreated, null, caseId),
             ProductConflict { Kind: ProductConflictKind.SourceDocumentAlreadyHasCase, ExistingIdentity: { } id } =>
                 new(ReceivableCaseOutcome.AlreadyCreated, ReceivableCaseFailureCode.CaseAlreadyExists, new CaseId(id)),
-            ProductConflict => new(ReceivableCaseOutcome.ReviewInvalid, ReceivableCaseFailureCode.StaleReviewRevision, null),
+            ProductConflict { Kind: ProductConflictKind.SourceDocumentAlreadyHasCase } =>
+                new(ReceivableCaseOutcome.AlreadyCreated, ReceivableCaseFailureCode.CaseAlreadyExists, caseId),
+            ProductConflict { Kind: ProductConflictKind.OperationIdentityMismatch } =>
+                new(ReceivableCaseOutcome.OperationConflict, null, null),
+            ProductConflict { Kind: ProductConflictKind.StorageConstraint } =>
+                new(ReceivableCaseOutcome.StorageConflict, null, null),
+            ProductConflict =>
+                new(ReceivableCaseOutcome.ConcurrentConflict, null, null),
             _ => new(ReceivableCaseOutcome.RecoveryRequired, null, null),
         };
+    }
+
+    private async Task<ReceivableCaseResult> MapConcurrentConflictAsync(
+        CreateReceivableCaseRequest request,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var current = await _reviews.LoadCurrentAsync(
+                    request.DocumentId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var review = await _reviews.LoadConfirmedAsync(
+                    request.DocumentId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (current is null || review is null)
+            {
+                return new(
+                    ReceivableCaseOutcome.RecoveryRequired,
+                    null,
+                    null);
+            }
+            if (review.ExtractionRevision
+                    != current.CurrentExtractionRevision
+                || !review.SourceIdentity.Equals(current.SourceIdentity))
+            {
+                return new(
+                    ReceivableCaseOutcome.ReviewInvalid,
+                    ReceivableCaseFailureCode.StaleReviewRevision,
+                    null);
+            }
+            return new(
+                ReceivableCaseOutcome.ConcurrentConflict,
+                null,
+                null);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return new(
+                ReceivableCaseOutcome.RecoveryRequired,
+                null,
+                null);
+        }
     }
 
     private static string SerializeMetadata(
