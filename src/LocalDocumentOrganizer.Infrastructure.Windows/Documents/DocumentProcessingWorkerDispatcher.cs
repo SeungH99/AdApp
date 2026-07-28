@@ -1,6 +1,5 @@
 using System.Collections.Immutable;
 using System.Security.Cryptography;
-using System.Text.Json;
 using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Application.Products;
 using LocalDocumentOrganizer.Core.Documents;
@@ -36,17 +35,26 @@ public sealed class ContentAddressedVaultExtractionSourceResolver(
             throw new DocumentExtractionException(DocumentExtractionFailureCode.InvalidSourceHandle);
         var path = Path.Combine(vaultRoot.ApprovedRoot, "objects",
             request.ContentSha256.Hex[..2], request.ContentSha256.Hex + binding.CanonicalExtension);
-        await using var source = vaultRoot.OpenVerifiedSourceFromApprovedRoot(path);
-        if (source.Length != binding.DeclaredLength
-            || !await HasExpectedMagicAsync(source, binding.Format, cancellationToken).ConfigureAwait(false)
-            || !CryptographicOperations.FixedTimeEquals(
-                await ComputeSha256Async(source, cancellationToken).ConfigureAwait(false),
-                request.ContentSha256.Bytes.Span))
-            throw new DocumentExtractionException(DocumentExtractionFailureCode.InvalidSourceFingerprint);
-        return new ImmutableVaultExtractionSource(path,
-            new DocumentSourceDescriptor(0, ToContainer(binding.Format), binding.CanonicalMimeType,
-                binding.DeclaredLength, ImmutableArray.CreateRange(request.ContentSha256.Bytes.ToArray())),
-            expectedWorkerPackageIdentity);
+        try
+        {
+            await using var source = vaultRoot.OpenVerifiedSourceFromApprovedRoot(path);
+            if (source.Length != binding.DeclaredLength
+                || !await HasExpectedMagicAsync(source, binding.Format, cancellationToken).ConfigureAwait(false)
+                || !CryptographicOperations.FixedTimeEquals(
+                    await ComputeSha256Async(source, cancellationToken).ConfigureAwait(false),
+                    request.ContentSha256.Bytes.Span))
+                throw new DocumentExtractionException(DocumentExtractionFailureCode.InvalidSourceFingerprint);
+            return new ImmutableVaultExtractionSource(path,
+                new DocumentSourceDescriptor(0, ToContainer(binding.Format), binding.CanonicalMimeType,
+                    binding.DeclaredLength, ImmutableArray.CreateRange(request.ContentSha256.Bytes.ToArray())),
+                expectedWorkerPackageIdentity);
+        }
+        catch (FileSystemBoundaryException exception)
+        {
+            throw new DocumentExtractionException(
+                DocumentExtractionFailureCode.InvalidSourceHandle,
+                exception);
+        }
     }
 
     private static async Task<byte[]> ComputeSha256Async(
@@ -102,18 +110,22 @@ public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDisp
     private readonly IImmutableVaultExtractionSourceResolver _sources;
     private readonly DocumentExtractionClient _client;
     private readonly string _expectedWorkerPackageIdentity;
+    private readonly IExtractionMarketSuggester _marketSuggester;
 
     public DocumentProcessingWorkerDispatcher(
         IImmutableVaultExtractionSourceResolver sources,
         DocumentExtractionClient client,
-        string expectedWorkerPackageIdentity)
+        string expectedWorkerPackageIdentity,
+        IExtractionMarketSuggester marketSuggester)
     {
         ArgumentNullException.ThrowIfNull(sources);
         ArgumentNullException.ThrowIfNull(client);
         ArgumentException.ThrowIfNullOrWhiteSpace(expectedWorkerPackageIdentity);
+        ArgumentNullException.ThrowIfNull(marketSuggester);
         _sources = sources;
         _client = client;
         _expectedWorkerPackageIdentity = expectedWorkerPackageIdentity;
+        _marketSuggester = marketSuggester;
     }
 
     public async Task<DocumentProcessingDispatchResult> DispatchAsync(
@@ -159,9 +171,11 @@ public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDisp
                     MapWorkerFailure(evaluation.Response.FailureCode));
             }
 
-            var protectedDraft = JsonSerializer.Serialize(
+            var marketSuggestion = _marketSuggester.Suggest(evaluation.Response);
+            var protectedDraft = AuthenticatedExtractionDraftSerializer.Serialize(
                 evaluation.Response,
-                DocumentExtractionJsonContext.Default.DocumentExtractionResponse);
+                marketSuggestion,
+                IsComplete(evaluation.Response));
             return new DocumentProcessingDispatchResult.Successful(
                 evaluation.Response,
                 new DocumentProcessingResponseBinding(
@@ -172,7 +186,7 @@ public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDisp
                     _expectedWorkerPackageIdentity),
                 protectedDraft,
                 IsComplete(evaluation.Response),
-                SuggestMarket(request.RequestedLanguages));
+                marketSuggestion.MarketId);
         }
         catch (OperationCanceledException)
         {
@@ -181,6 +195,11 @@ public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDisp
         catch (DocumentExtractionException exception)
         {
             return DocumentProcessingDispatchResult.TransientFailure(MapWorkerFailure(exception.FailureCode));
+        }
+        catch (ExtractionDraftSerializationException)
+        {
+            return DocumentProcessingDispatchResult.TransientFailure(
+                DocumentProcessingFailureCode.ResponseInvalid);
         }
         catch (Exception)
         {
@@ -192,11 +211,6 @@ public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDisp
     private static bool IsComplete(DocumentExtractionResponse response) =>
         // Extraction never invents required invoice fields; Task 5 performs user confirmation.
         response.Fragments.Length >= 6;
-
-    private static string SuggestMarket(ImmutableArray<string> languages) =>
-        languages.Any(language => language.StartsWith("ko", StringComparison.OrdinalIgnoreCase))
-            ? "ko-KR"
-            : "en-US";
 
     public static DocumentProcessingFailureCode MapWorkerFailure(
         DocumentExtractionFailureCode failureCode) => failureCode switch

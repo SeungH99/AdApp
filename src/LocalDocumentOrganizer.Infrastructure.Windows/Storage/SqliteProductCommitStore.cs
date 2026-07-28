@@ -183,10 +183,17 @@ public sealed class SqliteProductCommitStore :
         {
             var committed = await CommitExtractionAsync(command.ExtractionCommit, cancellationToken)
                 .ConfigureAwait(false);
-            if (committed is not (ProductCommitted or ProductAlreadyCommitted))
+            if (committed is ProductCommitted)
             {
-                throw new InvalidOperationException("Extraction commit requires recovery.");
+                // The extraction projection accepted the event and completed the
+                // live outbox claim in its own event-store transaction.
+                return new ExtractionOutboxCompletion(command.Claim.Work.TargetRevision, false);
             }
+            if (committed is ProductAlreadyCommitted)
+            {
+                return new ExtractionOutboxCompletion(command.Claim.Work.TargetRevision, true);
+            }
+            throw new InvalidOperationException("Extraction commit requires recovery.");
         }
 
         SqliteEventStoreSchema.ValidateVaultPath(_connectionString, _keyRing.MaintenanceGate);
