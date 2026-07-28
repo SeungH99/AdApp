@@ -55,7 +55,8 @@ public sealed class InvoiceReviewService
         var payload = SerializeBounded(review);
         var commit = await _commits.CommitReviewAsync(
             new CommitReviewCommand(command.OperationId, command.EventId, command.DocumentId,
-                snapshot.CurrentStreamVersion, command.ApprovedAtUtc, payload),
+                snapshot.CurrentStreamVersion, command.ApprovedAtUtc, payload,
+                command.ExpectedExtractionRevision, review.ReviewRevision),
             cancellationToken).ConfigureAwait(false);
         return commit switch
         {
