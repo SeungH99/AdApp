@@ -258,9 +258,9 @@ public sealed class SqliteProductCommitStore :
             throw new ArgumentOutOfRangeException(nameof(command));
         }
 
-        var events = await _events.ReadStreamAsync(
-            new StreamId(command.DocumentId.Value), cancellationToken).ConfigureAwait(false);
-        var currentRevision = events.Count == 0 ? -1 : events[^1].Metadata.StreamVersion.Value;
+        var currentRevision = await ReadCurrentExtractionRevisionAsync(
+            command.DocumentId,
+            cancellationToken).ConfigureAwait(false);
         if (currentRevision != command.ExpectedCurrentRevision)
         {
             return new ExplicitReprocessResult(
@@ -610,6 +610,10 @@ public sealed class SqliteProductCommitStore :
                     : new ProductConflict(ProductConflictKind.StorageConstraint);
             }
         }
+        catch (ProductProjectionConflictException conflict)
+        {
+            return new ProductConflict(conflict.Kind);
+        }
         catch (OperationCanceledException)
         {
             throw;
@@ -827,31 +831,114 @@ public sealed class SqliteProductCommitStore :
 
     public async Task<ConfirmedInvoiceReview?> LoadConfirmedAsync(DocumentId documentId, CancellationToken cancellationToken)
     {
-        var row = await LoadReviewPayloadAsync(documentId, cancellationToken).ConfigureAwait(false);
-        return row is null ? null : ParseReview(row);
+        try
+        {
+            var row = await LoadReviewPayloadAsync(documentId, cancellationToken)
+                .ConfigureAwait(false);
+            return row is null ? null : ParseReview(row);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (VaultRecoveryRequiredException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (
+            exception is ProjectionValueRecoveryRequiredException
+                or JsonException
+                or DecoderFallbackException
+                or FormatException
+                or InvalidCastException
+                or OverflowException)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
     }
 
     public async Task<InvoiceReviewSnapshot?> LoadCurrentAsync(DocumentId documentId, CancellationToken cancellationToken)
     {
         var review = await LoadConfirmedAsync(documentId, cancellationToken).ConfigureAwait(false);
         if (review is null) return null;
-        var version = await ReadProjectedStreamVersionAsync(documentId, cancellationToken).ConfigureAwait(false);
-        return new InvoiceReviewSnapshot(documentId, review.SourceIdentity, review.ExtractionRevision,
-            review.ReviewRevision, version, ProductInboxStatus.Reviewed,
+        var state = await ReadProjectedReviewStateAsync(documentId, cancellationToken)
+            .ConfigureAwait(false);
+        if (!state.SourceIdentity.Equals(review.SourceIdentity))
+            throw new VaultRecoveryRequiredException();
+        return new InvoiceReviewSnapshot(documentId, state.SourceIdentity, state.ExtractionRevision,
+            review.ReviewRevision, state.StreamVersion, state.Status,
             review.Fields.ToImmutableDictionary(field => field.FieldId,
                 field => new ReviewExtractionField(field.FieldId, field.OriginalNormalizedValue), StringComparer.Ordinal),
             review.Fields.SelectMany(field => field.Evidence).Select(e => e.Box.SourceIndex).DefaultIfEmpty(-1).Max() + 1);
     }
 
-    private async Task<StreamVersion> ReadProjectedStreamVersionAsync(DocumentId documentId, CancellationToken cancellationToken)
+    private Task<int> ReadCurrentExtractionRevisionAsync(
+        DocumentId documentId,
+        CancellationToken cancellationToken) =>
+        ReadStructuralAsync(
+            async (connection, transaction, token) =>
+            {
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = """
+                    SELECT current_extraction_revision
+                    FROM product_inbox
+                    WHERE document_id=$document;
+                    """;
+                command.Parameters.AddWithValue(
+                    "$document",
+                    ProductEventPayloads.Canonical(documentId.Value));
+                var value = await command.ExecuteScalarAsync(token)
+                    .ConfigureAwait(false);
+                return value is long revision
+                    && revision >= 0
+                    && revision <= int.MaxValue
+                    ? checked((int)revision)
+                    : -1;
+            },
+            cancellationToken);
+
+    private async Task<ProjectedReviewState> ReadProjectedReviewStateAsync(
+        DocumentId documentId,
+        CancellationToken cancellationToken)
     {
         await using var lease = await _keyRing.MaintenanceGate.AcquireReadAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await SqliteEventStoreSchema.OpenConnectionAsync(_connectionString, _keyRing.MaintenanceGate, cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        await ValidateReadBoundaryAsync(connection, transaction, cancellationToken)
+            .ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT current_stream_version FROM product_inbox WHERE document_id=$document;";
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT d.content_sha256,i.current_extraction_revision,
+                   i.current_stream_version,i.status
+            FROM product_documents d
+            JOIN product_inbox i ON i.document_id=d.document_id
+            WHERE d.document_id=$document;
+            """;
         command.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(documentId.Value));
-        var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        return value is long raw && raw >= 0 ? new StreamVersion(raw) : throw new VaultRecoveryRequiredException();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            throw new VaultRecoveryRequiredException();
+        var sourceIdentity = new ContentSha256((byte[])reader.GetValue(0));
+        var extractionRevision = reader.GetInt32(1);
+        var streamVersion = reader.GetInt64(2);
+        var rawStatus = reader.GetInt32(3);
+        if (extractionRevision <= 0
+            || streamVersion < 0
+            || !Enum.IsDefined(typeof(ProductInboxStatus), rawStatus)
+            || await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            throw new VaultRecoveryRequiredException();
+        }
+        await reader.DisposeAsync().ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new ProjectedReviewState(
+            sourceIdentity,
+            extractionRevision,
+            new StreamVersion(streamVersion),
+            (ProductInboxStatus)rawStatus);
     }
 
     private async Task<string?> LoadReviewPayloadAsync(DocumentId documentId, CancellationToken cancellationToken)
@@ -912,6 +999,10 @@ public sealed class SqliteProductCommitStore :
         catch (OperationCanceledException)
         {
             throw;
+        }
+        catch (ProductProjectionConflictException conflict)
+        {
+            return new ProductConflict(conflict.Kind);
         }
         catch (Exception exception)
         {
@@ -1279,4 +1370,10 @@ public sealed class SqliteProductCommitStore :
     private sealed record ExistingDocument(
         DocumentId DocumentId,
         InboxId InboxId);
+
+    private sealed record ProjectedReviewState(
+        ContentSha256 SourceIdentity,
+        int ExtractionRevision,
+        StreamVersion StreamVersion,
+        ProductInboxStatus Status);
 }
