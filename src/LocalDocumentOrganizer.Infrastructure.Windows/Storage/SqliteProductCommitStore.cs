@@ -1,8 +1,11 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Collections.Immutable;
+using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Application.Products;
 using LocalDocumentOrganizer.Core.Cases;
+using LocalDocumentOrganizer.Core.Documents;
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
 using LocalDocumentOrganizer.Infrastructure.Windows.Crypto;
@@ -12,7 +15,8 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
 public sealed class SqliteProductCommitStore :
     IProductCommitStore,
-    IProductQueryStore
+    IProductQueryStore,
+    IExtractionOutboxStore
 {
     private const int DuplicateAppendRetryLimit = 16;
     private const int ImportBusyRetryLimit = 8;
@@ -72,6 +76,254 @@ public sealed class SqliteProductCommitStore :
     public Task<ProjectionRebuildResult> RebuildProjectionsAsync(
         CancellationToken cancellationToken = default) =>
         _events.RebuildProjectionsAsync(cancellationToken);
+
+    public async Task<ExtractionOutboxClaim?> ClaimNextAsync(
+        Guid ownerId,
+        DateTimeOffset nowUtc,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken)
+    {
+        if (ownerId == Guid.Empty || nowUtc.Offset != TimeSpan.Zero || leaseDuration <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(ownerId));
+        }
+
+        SqliteEventStoreSchema.ValidateVaultPath(_connectionString, _keyRing.MaintenanceGate);
+        await using var lease = await _keyRing.MaintenanceGate
+            .AcquireMutationAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await SqliteEventStoreSchema.OpenConnectionAsync(
+            _connectionString, _keyRing.MaintenanceGate, cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        await ValidateReadBoundaryAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+        var now = ProductEventPayloads.Utc(nowUtc);
+        await using (var recover = connection.CreateCommand())
+        {
+            recover.Transaction = transaction;
+            recover.CommandText = """
+                UPDATE product_outbox
+                SET dispatch_status=2,lease_owner_id=NULL,lease_expires_at_utc=NULL
+                WHERE commit_kind IN ('import-committed','explicit-reprocess') AND dispatch_status=1
+                  AND lease_expires_at_utc IS NOT NULL AND lease_expires_at_utc<=$now;
+                """;
+            recover.Parameters.AddWithValue("$now", now);
+            await recover.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        await using var select = connection.CreateCommand();
+        select.Transaction = transaction;
+        select.CommandText = """
+            SELECT o.operation_id,o.aggregate_id,o.inbox_id,d.content_sha256,
+                   o.extraction_attempt_id,o.target_extraction_revision,
+                   o.extraction_commit_operation_id,o.automatic_failure_count
+            FROM product_outbox o
+            JOIN product_documents d ON d.document_id=o.aggregate_id
+            WHERE o.commit_kind IN ('import-committed','explicit-reprocess')
+              AND o.extraction_attempt_id IS NOT NULL
+              AND o.dispatch_status IN (0,2)
+            ORDER BY o.occurred_at_utc COLLATE BINARY,o.operation_id COLLATE BINARY
+            LIMIT 1;
+            """;
+        await using var reader = await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return null;
+        }
+
+        var work = new ExtractionOutboxWorkItem(
+            ProductEventPayloads.GuidValue(reader.GetString(0)),
+            new DocumentId(ProductEventPayloads.GuidValue(reader.GetString(1))),
+            new InboxId(ProductEventPayloads.GuidValue(reader.GetString(2))),
+            new ContentSha256((byte[])reader.GetValue(3)),
+            new ExtractionAttemptId(ProductEventPayloads.GuidValue(reader.GetString(4))),
+            reader.GetInt32(5),
+            new OperationId(ProductEventPayloads.GuidValue(reader.GetString(6))),
+            ImmutableArray.Create("en-US", "ko-KR"),
+            ExtractionCapability.EmbeddedText | ExtractionCapability.Ocr,
+            reader.GetInt32(7),
+            ExtractionOutboxState.Running,
+            nowUtc.Add(leaseDuration));
+        await reader.DisposeAsync().ConfigureAwait(false);
+        await using (var claim = connection.CreateCommand())
+        {
+            claim.Transaction = transaction;
+            claim.CommandText = """
+                UPDATE product_outbox
+                SET dispatch_status=1,lease_owner_id=$owner,lease_expires_at_utc=$expires
+                WHERE operation_id=$operation AND dispatch_status IN (0,2);
+                """;
+            claim.Parameters.AddWithValue("$owner", ProductEventPayloads.Canonical(ownerId));
+            claim.Parameters.AddWithValue("$expires", ProductEventPayloads.Utc(work.LeaseExpiresAtUtc!.Value));
+            claim.Parameters.AddWithValue("$operation", ProductEventPayloads.Canonical(work.OutboxId));
+            if (await claim.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+        }
+        await using (var inbox = connection.CreateCommand())
+        {
+            inbox.Transaction = transaction;
+            inbox.CommandText = "UPDATE product_inbox SET status=$status WHERE document_id=$document AND status=0;";
+            inbox.Parameters.AddWithValue("$status", (int)ProductInboxStatus.Processing);
+            inbox.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(work.DocumentId.Value));
+            await inbox.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new ExtractionOutboxClaim(work, ownerId);
+    }
+
+    public async Task<ExtractionOutboxCompletion> CompleteAsync(
+        ExtractionOutboxCompletionCommand command,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        if (command.ExtractionCommit is not null)
+        {
+            var committed = await CommitExtractionAsync(command.ExtractionCommit, cancellationToken)
+                .ConfigureAwait(false);
+            if (committed is not (ProductCommitted or ProductAlreadyCommitted))
+            {
+                throw new InvalidOperationException("Extraction commit requires recovery.");
+            }
+        }
+
+        SqliteEventStoreSchema.ValidateVaultPath(_connectionString, _keyRing.MaintenanceGate);
+        await using var lease = await _keyRing.MaintenanceGate
+            .AcquireMutationAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await SqliteEventStoreSchema.OpenConnectionAsync(
+            _connectionString, _keyRing.MaintenanceGate, cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        await ValidateReadBoundaryAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+        await using var update = connection.CreateCommand();
+        update.Transaction = transaction;
+        update.CommandText = """
+            UPDATE product_outbox
+            SET dispatch_status=$status,automatic_failure_count=$failures,
+                lease_owner_id=NULL,lease_expires_at_utc=NULL
+            WHERE operation_id=$operation AND dispatch_status=1 AND lease_owner_id=$owner;
+            """;
+        update.Parameters.AddWithValue("$status", ToStorageStatus(command.NextState));
+        update.Parameters.AddWithValue("$failures", command.AutomaticFailureCount);
+        update.Parameters.AddWithValue("$operation", ProductEventPayloads.Canonical(command.Claim.Work.OutboxId));
+        update.Parameters.AddWithValue("$owner", ProductEventPayloads.Canonical(command.Claim.OwnerId));
+        var affected = await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        if (affected == 0)
+        {
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new ExtractionOutboxCompletion(command.Claim.Work.TargetRevision, true);
+        }
+        if (command.NextState == ExtractionOutboxState.TerminalFailure)
+        {
+            await using var inbox = connection.CreateCommand();
+            inbox.Transaction = transaction;
+            inbox.CommandText = """
+                UPDATE product_inbox SET status=$status
+                WHERE document_id=$document;
+                """;
+            inbox.Parameters.AddWithValue(
+                "$status",
+                command.FailureCode == DocumentProcessingFailureCode.UnsupportedDocument
+                    ? (int)ProductInboxStatus.Unsupported
+                    : (int)ProductInboxStatus.Failed);
+            inbox.Parameters.AddWithValue(
+                "$document",
+                ProductEventPayloads.Canonical(command.Claim.Work.DocumentId.Value));
+            if (await inbox.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+        }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new ExtractionOutboxCompletion(command.Claim.Work.TargetRevision, false);
+    }
+
+    public async Task<ExplicitReprocessResult> ScheduleReprocessAsync(
+        ExplicitReprocessCommand command,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        if (command.ExpectedCurrentRevision < 0 || command.CommandOperationId.Value == Guid.Empty)
+        {
+            throw new ArgumentOutOfRangeException(nameof(command));
+        }
+
+        var events = await _events.ReadStreamAsync(
+            new StreamId(command.DocumentId.Value), cancellationToken).ConfigureAwait(false);
+        var currentRevision = events.Count == 0 ? -1 : events[^1].Metadata.StreamVersion.Value;
+        if (currentRevision != command.ExpectedCurrentRevision)
+        {
+            return new ExplicitReprocessResult(
+                ExplicitReprocessOutcome.RevisionConflict,
+                checked(command.ExpectedCurrentRevision + 1));
+        }
+
+        SqliteEventStoreSchema.ValidateVaultPath(_connectionString, _keyRing.MaintenanceGate);
+        await using var lease = await _keyRing.MaintenanceGate
+            .AcquireMutationAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await SqliteEventStoreSchema.OpenConnectionAsync(
+            _connectionString, _keyRing.MaintenanceGate, cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        await ValidateReadBoundaryAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+        await using (var existing = connection.CreateCommand())
+        {
+            existing.Transaction = transaction;
+            existing.CommandText = """
+                SELECT target_extraction_revision FROM product_outbox
+                WHERE operation_id=$operation AND commit_kind='explicit-reprocess';
+                """;
+            existing.Parameters.AddWithValue("$operation", ProductEventPayloads.Canonical(command.CommandOperationId.Value));
+            var value = await existing.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            if (value is long revision)
+            {
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return new ExplicitReprocessResult(
+                    ExplicitReprocessOutcome.AlreadyScheduled,
+                    checked((int)revision));
+            }
+            if (value is not null)
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+        }
+
+        string inboxId;
+        await using (var inbox = connection.CreateCommand())
+        {
+            inbox.Transaction = transaction;
+            inbox.CommandText = "SELECT inbox_id FROM product_inbox WHERE document_id=$document;";
+            inbox.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(command.DocumentId.Value));
+            inboxId = await inbox.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string
+                ?? throw new VaultRecoveryRequiredException();
+        }
+        var targetRevision = checked((int)(currentRevision + 1));
+        var occurred = ProductEventPayloads.Utc(DateTimeOffset.UtcNow);
+        await using (var insert = connection.CreateCommand())
+        {
+            insert.Transaction = transaction;
+            insert.CommandText = """
+                INSERT INTO product_outbox(
+                    operation_id,event_id,commit_kind,aggregate_id,inbox_id,occurred_at_utc,
+                    dispatch_status,extraction_attempt_id,target_extraction_revision,
+                    extraction_commit_operation_id)
+                VALUES($operation,$event,'explicit-reprocess',$document,$inbox,$occurred,
+                    0,$attempt,$revision,$commit_operation);
+                """;
+            insert.Parameters.AddWithValue("$operation", ProductEventPayloads.Canonical(command.CommandOperationId.Value));
+            insert.Parameters.AddWithValue("$event", ProductEventPayloads.Canonical(command.CommandOperationId.Value));
+            insert.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(command.DocumentId.Value));
+            insert.Parameters.AddWithValue("$inbox", inboxId);
+            insert.Parameters.AddWithValue("$occurred", occurred);
+            insert.Parameters.AddWithValue("$attempt", ProductEventPayloads.Canonical(Guid.NewGuid()));
+            insert.Parameters.AddWithValue("$revision", targetRevision);
+            insert.Parameters.AddWithValue("$commit_operation", ProductEventPayloads.Canonical(Guid.NewGuid()));
+            if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+        }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new ExplicitReprocessResult(ExplicitReprocessOutcome.Scheduled, targetRevision);
+    }
 
     public async Task<ImportCommitResult> CommitImportAsync(
         CommitImportCommand command,
@@ -810,6 +1062,16 @@ public sealed class SqliteProductCommitStore :
             LIMIT $limit;
             """;
     }
+
+    private static int ToStorageStatus(ExtractionOutboxState state) => state switch
+    {
+        ExtractionOutboxState.Pending => 0,
+        ExtractionOutboxState.Running => 1,
+        ExtractionOutboxState.RetryPending => 2,
+        ExtractionOutboxState.Succeeded => 3,
+        ExtractionOutboxState.TerminalFailure => 4,
+        _ => throw new ArgumentOutOfRangeException(nameof(state)),
+    };
 
     private static string BuildTodayQuery(TodayPageRequest request)
     {

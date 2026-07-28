@@ -39,6 +39,9 @@ internal sealed record ProductImportPayload(
     string ReceivedAtUtc,
     string FileName,
     string AuthenticatedMetadata,
+    string ExtractionAttemptId,
+    int TargetExtractionRevision,
+    string ExtractionCommitOperationId,
     string CommitFingerprint);
 
 internal sealed record ProductDuplicateImportPayload(
@@ -51,6 +54,7 @@ internal sealed record ProductDocumentProgressPayload(
     string DocumentId,
     string OccurredAtUtc,
     string AuthenticatedPayload,
+    int? InboxStatus,
     string CommitFingerprint);
 
 internal sealed record ProductReceivableCasePayload(
@@ -74,6 +78,9 @@ internal static class ProductEventPayloads
                 Utc(command.ReceivedAtUtc),
                 command.FileName,
                 command.AuthenticatedMetadata,
+                Canonical(command.ExtractionAttemptId.Value),
+                command.TargetExtractionRevision,
+                Canonical(command.ExtractionCommitOperationId.Value),
                 Convert.ToHexString(fingerprint).ToLowerInvariant()));
 
     internal static byte[] SerializeDuplicate(
@@ -96,6 +103,7 @@ internal static class ProductEventPayloads
                 Canonical(command.DocumentId.Value),
                 Utc(command.ExtractedAtUtc),
                 command.AuthenticatedExtraction,
+                (int)command.InboxStatus,
                 Convert.ToHexString(fingerprint).ToLowerInvariant()));
 
     internal static byte[] SerializeReview(
@@ -106,6 +114,7 @@ internal static class ProductEventPayloads
                 Canonical(command.DocumentId.Value),
                 Utc(command.ReviewedAtUtc),
                 command.AuthenticatedReview,
+                null,
                 Convert.ToHexString(fingerprint).ToLowerInvariant()));
 
     internal static byte[] SerializeReceivableCase(
@@ -149,6 +158,9 @@ internal static class ProductEventPayloads
         Add(hash, Utc(command.ReceivedAtUtc));
         Add(hash, command.FileName);
         Add(hash, command.AuthenticatedMetadata);
+        Add(hash, command.ExtractionAttemptId.Value);
+        Add(hash, command.TargetExtractionRevision);
+        Add(hash, command.ExtractionCommitOperationId.Value);
         return hash.GetHashAndReset();
     }
 
@@ -162,6 +174,7 @@ internal static class ProductEventPayloads
         Add(hash, command.ExpectedVersion.Value);
         Add(hash, Utc(command.ExtractedAtUtc));
         Add(hash, command.AuthenticatedExtraction);
+        Add(hash, (int)command.InboxStatus);
         return hash.GetHashAndReset();
     }
 

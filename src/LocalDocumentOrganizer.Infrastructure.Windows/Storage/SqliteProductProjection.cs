@@ -63,7 +63,7 @@ internal sealed class SqliteProductProjection(
     IProductCommitFaultInjector? faultInjector = null) : ISqliteProjection
 {
     internal const string ProjectionName = "product";
-    internal const int ProjectionSchemaVersion = 2;
+    internal const int ProjectionSchemaVersion = 3;
 
     private const string SchemaSql = """
         CREATE TABLE IF NOT EXISTS product_documents(
@@ -78,7 +78,7 @@ internal sealed class SqliteProductProjection(
             document_id TEXT NOT NULL UNIQUE CHECK(length(document_id)=36)
                 REFERENCES product_documents(document_id) ON DELETE CASCADE,
             received_at_utc TEXT NOT NULL,
-            status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 3),
+            status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 7),
             owner_kind INTEGER NOT NULL,
             owner_id TEXT NOT NULL CHECK(length(owner_id)=36),
             key_id TEXT NOT NULL CHECK(length(key_id)=36),
@@ -125,8 +125,16 @@ internal sealed class SqliteProductProjection(
             aggregate_id TEXT NOT NULL CHECK(length(aggregate_id)=36),
             inbox_id TEXT NULL CHECK(inbox_id IS NULL OR length(inbox_id)=36),
             occurred_at_utc TEXT NOT NULL,
-            dispatch_status INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_status BETWEEN 0 AND 1)
+            dispatch_status INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_status BETWEEN 0 AND 4),
+            extraction_attempt_id TEXT NULL CHECK(extraction_attempt_id IS NULL OR length(extraction_attempt_id)=36),
+            target_extraction_revision INTEGER NULL CHECK(target_extraction_revision IS NULL OR target_extraction_revision > 0),
+            extraction_commit_operation_id TEXT NULL CHECK(extraction_commit_operation_id IS NULL OR length(extraction_commit_operation_id)=36),
+            automatic_failure_count INTEGER NOT NULL DEFAULT 0 CHECK(automatic_failure_count BETWEEN 0 AND 1),
+            lease_owner_id TEXT NULL CHECK(lease_owner_id IS NULL OR length(lease_owner_id)=36),
+            lease_expires_at_utc TEXT NULL
         ) STRICT;
+        CREATE INDEX IF NOT EXISTS product_outbox_dispatch_order
+            ON product_outbox(dispatch_status,occurred_at_utc COLLATE BINARY,operation_id COLLATE BINARY);
         """;
 
     private static readonly ProjectionOwnedTable[] Tables =
@@ -164,10 +172,10 @@ internal sealed class SqliteProductProjection(
     {
         var existing = await ExistingTableCountAsync(context, cancellationToken)
             .ConfigureAwait(false);
-        var removedOperationJournalFields =
-            await OutboxHasOperationJournalFieldsAsync(context, cancellationToken)
-                .ConfigureAwait(false);
-        if (removedOperationJournalFields)
+        var legacyOutbox =
+            !await OutboxHasExtractionFieldsAsync(context, cancellationToken)
+            .ConfigureAwait(false);
+        if (legacyOutbox)
         {
             await ExecuteAsync(
                 context.Connection,
@@ -178,7 +186,7 @@ internal sealed class SqliteProductProjection(
         await ExecuteAsync(context.Connection, context.Transaction, SchemaSql, cancellationToken)
             .ConfigureAwait(false);
         return new ProjectionCompatibilityResult(
-            existing == Tables.Length && !removedOperationJournalFields
+            existing == Tables.Length && !legacyOutbox
                 ? ProjectionCompatibility.Compatible
                 : ProjectionCompatibility.CreatedEmpty);
     }
@@ -205,10 +213,16 @@ internal sealed class SqliteProductProjection(
                     .ConfigureAwait(false);
                 break;
             case ProductEventContracts.ExtractionCommitted:
+                var extractionPayload = ProductEventPayloads.Read<ProductDocumentProgressPayload>(
+                    decrypted.Payload);
+                var extractionStatus = extractionPayload.InboxStatus is { } rawStatus
+                    && Enum.IsDefined(typeof(ProductInboxStatus), rawStatus)
+                    ? (ProductInboxStatus)rawStatus
+                    : throw new VaultRecoveryRequiredException();
                 await ApplyProgressAsync(
                     decrypted,
                     context,
-                    ProductInboxStatus.Extracted,
+                    extractionStatus,
                     "extraction-committed",
                     cancellationToken).ConfigureAwait(false);
                 break;
@@ -237,6 +251,12 @@ internal sealed class SqliteProductProjection(
         var inboxId = ProductEventPayloads.GuidValue(payload.InboxId);
         var receivedAt = ProductEventPayloads.UtcValue(payload.ReceivedAtUtc);
         var sha = ParseSha(payload.ContentSha256);
+        var attemptId = ProductEventPayloads.GuidValue(payload.ExtractionAttemptId);
+        var commitOperationId = ProductEventPayloads.GuidValue(payload.ExtractionCommitOperationId);
+        if (payload.TargetExtractionRevision != 1)
+        {
+            throw new VaultRecoveryRequiredException();
+        }
         _ = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
         RequireOwner(
             context,
@@ -312,6 +332,9 @@ internal sealed class SqliteProductProjection(
             "import-committed",
             documentId,
             new InboxId(inboxId),
+            attemptId,
+            payload.TargetExtractionRevision,
+            commitOperationId,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -333,6 +356,9 @@ internal sealed class SqliteProductProjection(
             "already-imported",
             documentId,
             new InboxId(inboxId),
+            null,
+            null,
+            null,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -375,6 +401,9 @@ internal sealed class SqliteProductProjection(
             kind,
             documentId,
             inboxId,
+            null,
+            null,
+            null,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -485,6 +514,9 @@ internal sealed class SqliteProductProjection(
             "receivable-case-committed",
             caseId,
             inboxId,
+            null,
+            null,
+            null,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -558,7 +590,10 @@ internal sealed class SqliteProductProjection(
             context.Transaction,
             """
             SELECT operation_id,event_id,commit_kind,aggregate_id,COALESCE(inbox_id,''),
-                   occurred_at_utc,dispatch_status
+                   occurred_at_utc,dispatch_status,COALESCE(extraction_attempt_id,''),
+                   COALESCE(target_extraction_revision,0),
+                   COALESCE(extraction_commit_operation_id,''),automatic_failure_count,
+                   COALESCE(lease_owner_id,''),COALESCE(lease_expires_at_utc,'')
             FROM product_outbox ORDER BY operation_id COLLATE BINARY;
             """,
             hash,
@@ -770,7 +805,7 @@ internal sealed class SqliteProductProjection(
             CultureInfo.InvariantCulture);
     }
 
-    private static async Task<bool> OutboxHasOperationJournalFieldsAsync(
+    private static async Task<bool> OutboxHasExtractionFieldsAsync(
         SqliteProjectionAdministrativeContext context,
         CancellationToken cancellationToken)
     {
@@ -783,9 +818,9 @@ internal sealed class SqliteProductProjection(
             """;
         var schema = await command.ExecuteScalarAsync(cancellationToken)
             .ConfigureAwait(false);
-        return schema is string sql
-            && (sql.Contains("commit_fingerprint", StringComparison.OrdinalIgnoreCase)
-                || sql.Contains("stream_version", StringComparison.OrdinalIgnoreCase));
+        return schema is not string sql
+            || (sql.Contains("extraction_attempt_id", StringComparison.OrdinalIgnoreCase)
+                && sql.Contains("extraction_commit_operation_id", StringComparison.OrdinalIgnoreCase));
     }
 
     private static async Task InsertOutboxAsync(
@@ -794,6 +829,9 @@ internal sealed class SqliteProductProjection(
         string kind,
         Guid aggregateId,
         InboxId? inboxId,
+        Guid? extractionAttemptId,
+        int? targetExtractionRevision,
+        Guid? extractionCommitOperationId,
         CancellationToken cancellationToken)
     {
         await using var outbox = context.Connection.CreateCommand();
@@ -801,10 +839,11 @@ internal sealed class SqliteProductProjection(
         outbox.CommandText = """
             INSERT INTO product_outbox(
                 operation_id,event_id,commit_kind,aggregate_id,inbox_id,
-                occurred_at_utc,dispatch_status)
+                occurred_at_utc,dispatch_status,extraction_attempt_id,
+                target_extraction_revision,extraction_commit_operation_id)
             VALUES(
                 $operation,$event,$kind,$aggregate,$inbox,
-                $occurred,0);
+                $occurred,0,$attempt,$revision,$commit_operation);
             """;
         outbox.Parameters.AddWithValue(
             "$operation",
@@ -823,6 +862,12 @@ internal sealed class SqliteProductProjection(
         outbox.Parameters.AddWithValue(
             "$occurred",
             ProductEventPayloads.Utc(replayEvent.Metadata.RecordedAtUtc));
+        outbox.Parameters.Add("$attempt", SqliteType.Text).Value =
+            extractionAttemptId is { } attempt ? ProductEventPayloads.Canonical(attempt) : DBNull.Value;
+        outbox.Parameters.Add("$revision", SqliteType.Integer).Value =
+            targetExtractionRevision is { } revision ? revision : DBNull.Value;
+        outbox.Parameters.Add("$commit_operation", SqliteType.Text).Value =
+            extractionCommitOperationId is { } commit ? ProductEventPayloads.Canonical(commit) : DBNull.Value;
         RequireSingle(await outbox.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false));
     }
 
