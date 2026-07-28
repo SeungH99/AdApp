@@ -1108,7 +1108,7 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore,
                 transaction,
                 keySession,
                 command,
-                operationCommitFaults: null,
+                _operationCommitFaults,
                 cancellationToken).ConfigureAwait(false);
             if (result is not Appended)
             {
