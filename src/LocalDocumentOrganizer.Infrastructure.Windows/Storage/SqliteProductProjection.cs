@@ -512,6 +512,16 @@ internal sealed class SqliteProductProjection(
         var createdAt = ProductEventPayloads.UtcValue(payload.CreatedAtUtc);
         _ = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
         RequireOwner(context, SensitiveObjectKind.Case, caseId);
+        if (payload.ConfirmedReviewRevision is { } confirmedReviewRevision)
+        {
+            await using var confirmed = context.Connection.CreateCommand();
+            confirmed.Transaction = context.Transaction;
+            confirmed.CommandText = "SELECT 1 FROM product_reviews WHERE document_id=$document AND review_revision=$review;";
+            confirmed.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(documentId));
+            confirmed.Parameters.AddWithValue("$review", confirmedReviewRevision);
+            if (await confirmed.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is null)
+                throw new VaultRecoveryRequiredException();
+        }
         var logicalKey = ProductEventPayloads.Canonical(caseId);
         var metadata = await context.Values.ProtectAsync(
             "product_cases",
