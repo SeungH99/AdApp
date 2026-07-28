@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Collections.Immutable;
+using LocalDocumentOrganizer.Application.Contracts;
 using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Application.Products;
 using LocalDocumentOrganizer.Application.Review;
@@ -1186,7 +1187,17 @@ public sealed class SqliteProductCommitStore :
     private static ConfirmedInvoiceReview ParseReview(string payload)
     {
         var stored = JsonSerializer.Deserialize<PersistedConfirmedInvoiceReview>(payload) ?? throw new VaultRecoveryRequiredException();
-        if (!Guid.TryParseExact(stored.DocumentId, "D", out var document) || stored.ExtractionRevision <= 0 || stored.ReviewRevision <= 0 || stored.ApprovedAtUtc.Offset != TimeSpan.Zero)
+        if (!Guid.TryParseExact(stored.DocumentId, "D", out var document)
+            || document == Guid.Empty
+            || stored.ExtractionRevision <= 0
+            || stored.ReviewRevision <= 0
+            || stored.ApprovedAtUtc.Offset != TimeSpan.Zero
+            || stored.ApprovedAtUtc == default
+            || stored.ConfirmedMarket is not ("ko-KR" or "en-US")
+            || !IsCanonicalSha256(stored.SourceIdentitySha256)
+            || !IsValidPersistedReviewFields(
+                stored.Fields,
+                stored.ExtractionRevision))
             throw new VaultRecoveryRequiredException();
         OperationId? operationId = null;
         EventId? eventId = null;
@@ -1227,6 +1238,75 @@ public sealed class SqliteProductCommitStore :
             operationId,
             eventId,
             committedVersion);
+    }
+
+    private static bool IsCanonicalSha256(string? value) =>
+        value is { Length: 64 }
+        && value.All(static character =>
+            character is >= '0' and <= '9'
+                or >= 'a' and <= 'f');
+
+    private static bool IsValidPersistedReviewFields(
+        ImmutableArray<ConfirmedInvoiceReviewField> fields,
+        int extractionRevision)
+    {
+        if (fields.IsDefaultOrEmpty
+            || fields.Length != PilotCatalog.RequiredFieldIds.Length
+            || fields.Any(static field => field is null)
+            || fields.Select(static field => field.FieldId)
+                    .Distinct(StringComparer.Ordinal)
+                    .Count()
+                != fields.Length
+            || !fields.Select(static field => field.FieldId)
+                .ToImmutableHashSet(StringComparer.Ordinal)
+                .SetEquals(PilotCatalog.RequiredFieldIds))
+        {
+            return false;
+        }
+
+        var totalEvidence = 0;
+        foreach (var field in fields)
+        {
+            if (string.IsNullOrWhiteSpace(field.FieldId)
+                || field.ConfirmedDisplayValue is null
+                || field.ConfirmedNormalizedValue is null
+                || Encoding.UTF8.GetByteCount(field.ConfirmedDisplayValue)
+                    > InvoiceReviewLimits.MaxConfirmedValueUtf8Bytes
+                || Encoding.UTF8.GetByteCount(field.ConfirmedNormalizedValue)
+                    > InvoiceReviewLimits.MaxConfirmedValueUtf8Bytes
+                || field.Evidence.IsDefaultOrEmpty
+                || field.Evidence.Length
+                    > InvoiceReviewLimits.MaxEvidencePerField
+                || field.Evidence.Any(static evidence => evidence is null)
+                || totalEvidence
+                    > InvoiceReviewLimits.MaxTotalEvidence
+                        - field.Evidence.Length)
+            {
+                return false;
+            }
+            totalEvidence += field.Evidence.Length;
+            foreach (var evidence in field.Evidence)
+            {
+                var box = evidence.Box;
+                if (evidence.ExtractionRevision != extractionRevision
+                    || box is null
+                    || box.SourceIndex < 0
+                    || !double.IsFinite(box.X)
+                    || !double.IsFinite(box.Y)
+                    || !double.IsFinite(box.Width)
+                    || !double.IsFinite(box.Height)
+                    || box.X < 0
+                    || box.Y < 0
+                    || box.Width <= 0
+                    || box.Height <= 0
+                    || !Enum.IsDefined(evidence.CoordinateSystem))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 
     private async Task<ProductCommitResult> CommitDocumentProgressAsync(

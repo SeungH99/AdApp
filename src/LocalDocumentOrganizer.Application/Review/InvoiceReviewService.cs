@@ -5,6 +5,7 @@ using System.Text.Json;
 using LocalDocumentOrganizer.Application.Contracts;
 using LocalDocumentOrganizer.Application.Products;
 using LocalDocumentOrganizer.Core.Cases.Receivable;
+using LocalDocumentOrganizer.Core.Documents;
 using LocalDocumentOrganizer.Core.Events;
 
 namespace LocalDocumentOrganizer.Application.Review;
@@ -203,12 +204,19 @@ public sealed class InvoiceReviewService
                 failure = InvoiceReviewFailureCode.InputTooLarge;
                 return false;
             }
+            if (submission.Evidence.Any(static evidence => evidence is null))
+            {
+                failure = InvoiceReviewFailureCode.EvidenceInvalid;
+                return false;
+            }
             totalEvidence += submission.Evidence.Length;
         }
 
         if (command.Fields.Select(static field => field.FieldId).Distinct(StringComparer.Ordinal).Count() != RequiredFields.Count
             || !command.Fields.Select(static field => field.FieldId).ToImmutableHashSet(StringComparer.Ordinal).SetEquals(RequiredFields)
-            || snapshot.Fields.Keys.ToImmutableHashSet(StringComparer.Ordinal).SetEquals(RequiredFields) is false)
+            || snapshot.Fields.Keys.ToImmutableHashSet(StringComparer.Ordinal).SetEquals(RequiredFields) is false
+            || snapshot.Fields.Values.Any(static field => field is null)
+            || !HasValidSourcePages(snapshot.SourcePages))
             return false;
 
         var result = ImmutableArray.CreateBuilder<ConfirmedInvoiceReviewField>(RequiredFields.Count);
@@ -276,6 +284,31 @@ public sealed class InvoiceReviewService
             && page.CoordinateSystem == evidence.CoordinateSystem
             && box.X <= page.Width - box.Width
             && box.Y <= page.Height - box.Height;
+    }
+
+    private static bool HasValidSourcePages(
+        ImmutableArray<DocumentSourcePage> sourcePages)
+    {
+        if (sourcePages.IsDefault)
+        {
+            return true;
+        }
+        if (sourcePages.Any(static page => page is null
+                || page.SourceIndex < 0
+                || !double.IsFinite(page.Width)
+                || !double.IsFinite(page.Height)
+                || page.Width <= 0
+                || page.Height <= 0
+                || !Enum.IsDefined(page.CoordinateSystem)))
+        {
+            return false;
+        }
+
+        return sourcePages
+                .Select(static page => page.SourceIndex)
+                .Distinct()
+                .Count()
+            == sourcePages.Length;
     }
 
     private static bool TryNormalize(string fieldId, string supplied, out string display, out string normalized)
