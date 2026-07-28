@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Collections.Immutable;
 using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Application.Products;
+using LocalDocumentOrganizer.Application.Review;
 using LocalDocumentOrganizer.Core.Cases;
 using LocalDocumentOrganizer.Core.Documents;
 using LocalDocumentOrganizer.Core.Events;
@@ -17,6 +18,7 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 public sealed class SqliteProductCommitStore :
     IProductCommitStore,
     IProductQueryStore,
+    IInvoiceReviewQueryStore,
     IExtractionOutboxStore
 {
     private const int DuplicateAppendRetryLimit = 16;
@@ -821,6 +823,51 @@ public sealed class SqliteProductCommitStore :
         {
             throw new VaultRecoveryRequiredException(exception);
         }
+    }
+
+    public async Task<ConfirmedInvoiceReview?> LoadConfirmedAsync(DocumentId documentId, CancellationToken cancellationToken)
+    {
+        var row = await LoadReviewPayloadAsync(documentId, cancellationToken).ConfigureAwait(false);
+        return row is null ? null : ParseReview(row);
+    }
+
+    public async Task<InvoiceReviewSnapshot?> LoadCurrentAsync(DocumentId documentId, CancellationToken cancellationToken)
+    {
+        var review = await LoadConfirmedAsync(documentId, cancellationToken).ConfigureAwait(false);
+        if (review is null) return null;
+        return new InvoiceReviewSnapshot(documentId, review.SourceIdentity, review.ExtractionRevision,
+            review.ReviewRevision, new StreamVersion(review.ExtractionRevision), ProductInboxStatus.Reviewed,
+            review.Fields.ToImmutableDictionary(field => field.FieldId,
+                field => new ReviewExtractionField(field.FieldId, field.OriginalNormalizedValue), StringComparer.Ordinal),
+            review.Fields.SelectMany(field => field.Evidence).Select(e => e.Box.SourceIndex).DefaultIfEmpty(-1).Max() + 1);
+    }
+
+    private async Task<string?> LoadReviewPayloadAsync(DocumentId documentId, CancellationToken cancellationToken)
+    {
+        await using var lease = await _keyRing.MaintenanceGate.AcquireReadAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await SqliteEventStoreSchema.OpenConnectionAsync(_connectionString, _keyRing.MaintenanceGate, cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        await ValidateReadBoundaryAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+        var administrative = SqliteProjectionContexts.CreateAdministrative(connection, transaction, _keyRing, lease, _registration);
+        await using var command = connection.CreateCommand(); command.Transaction = transaction;
+        command.CommandText = "SELECT owner_kind,owner_id,key_id,encryption_version,payload_nonce,payload_ciphertext,payload_tag FROM product_reviews WHERE document_id=$document;";
+        command.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(documentId.Value));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
+        var owner = ReadOwner(reader, 0, 1); var key = new DataKeyId(ProductEventPayloads.GuidValue(reader.GetString(2)));
+        var encrypted = new EncryptedProjectionValue(reader.GetInt32(3), key, (byte[])reader.GetValue(4), (byte[])reader.GetValue(5), (byte[])reader.GetValue(6));
+        var payload = await administrative.Values.UnprotectAsync("product_reviews", "payload", ProductEventPayloads.Canonical(documentId.Value), owner, key, encrypted,
+            (plain, _) => ValueTask.FromResult(new UTF8Encoding(false, true).GetString(plain.Span)), cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return payload;
+    }
+
+    private static ConfirmedInvoiceReview ParseReview(string payload)
+    {
+        var stored = JsonSerializer.Deserialize<PersistedConfirmedInvoiceReview>(payload) ?? throw new VaultRecoveryRequiredException();
+        if (!Guid.TryParseExact(stored.DocumentId, "D", out var document) || stored.ExtractionRevision <= 0 || stored.ReviewRevision <= 0 || stored.ApprovedAtUtc.Offset != TimeSpan.Zero)
+            throw new VaultRecoveryRequiredException();
+        return new ConfirmedInvoiceReview(new DocumentId(document), new ContentSha256(Convert.FromHexString(stored.SourceIdentitySha256)), stored.ExtractionRevision, stored.ReviewRevision, stored.ConfirmedMarket, stored.IsOutboundInvoice, stored.ApprovedAtUtc, stored.Fields);
     }
 
     private async Task<ProductCommitResult> CommitDocumentProgressAsync(
