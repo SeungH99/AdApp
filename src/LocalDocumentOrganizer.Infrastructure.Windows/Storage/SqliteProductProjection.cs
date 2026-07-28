@@ -63,7 +63,7 @@ internal sealed class SqliteProductProjection(
     IProductCommitFaultInjector? faultInjector = null) : ISqliteProjection
 {
     internal const string ProjectionName = "product";
-    internal const int ProjectionSchemaVersion = 5;
+    internal const int ProjectionSchemaVersion = 6;
 
     private const string SchemaSql = """
         CREATE TABLE IF NOT EXISTS product_documents(
@@ -79,6 +79,7 @@ internal sealed class SqliteProductProjection(
                 REFERENCES product_documents(document_id) ON DELETE CASCADE,
             received_at_utc TEXT NOT NULL,
             status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 8),
+            current_stream_version INTEGER NOT NULL DEFAULT 0 CHECK(current_stream_version>=0),
             owner_kind INTEGER NOT NULL,
             owner_id TEXT NOT NULL CHECK(length(owner_id)=36),
             key_id TEXT NOT NULL CHECK(length(key_id)=36),
@@ -471,9 +472,10 @@ internal sealed class SqliteProductProjection(
         {
             update.Transaction = context.Transaction;
             update.CommandText = """
-                UPDATE product_inbox SET status=$status WHERE document_id=$document;
+                UPDATE product_inbox SET status=$status,current_stream_version=$version WHERE document_id=$document;
                 """;
             update.Parameters.AddWithValue("$status", (int)status);
+            update.Parameters.AddWithValue("$version", replayEvent.Metadata.StreamVersion.Value);
             update.Parameters.AddWithValue(
                 "$document",
                 ProductEventPayloads.Canonical(documentId));

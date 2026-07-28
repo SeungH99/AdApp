@@ -835,8 +835,10 @@ public sealed class SqliteProductCommitStore :
     {
         var review = await LoadConfirmedAsync(documentId, cancellationToken).ConfigureAwait(false);
         if (review is null) return null;
+        var stream = await _events.ReadStreamAsync(new StreamId(documentId.Value), cancellationToken).ConfigureAwait(false);
+        if (stream.Count == 0) throw new VaultRecoveryRequiredException();
         return new InvoiceReviewSnapshot(documentId, review.SourceIdentity, review.ExtractionRevision,
-            review.ReviewRevision, new StreamVersion(review.ExtractionRevision), ProductInboxStatus.Reviewed,
+            review.ReviewRevision, stream[^1].Metadata.StreamVersion, ProductInboxStatus.Reviewed,
             review.Fields.ToImmutableDictionary(field => field.FieldId,
                 field => new ReviewExtractionField(field.FieldId, field.OriginalNormalizedValue), StringComparer.Ordinal),
             review.Fields.SelectMany(field => field.Evidence).Select(e => e.Box.SourceIndex).DefaultIfEmpty(-1).Max() + 1);
