@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Core.Cases;
+using LocalDocumentOrganizer.Core.Cases.Receivable;
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
 
@@ -364,7 +365,9 @@ public sealed record CommitReceivableCaseCommand
         DateTimeOffset createdAtUtc,
         string authenticatedMetadata)
         : this(operationId, eventId, caseId, sourceDocumentId, dueDate, createdAtUtc,
-            authenticatedMetadata, confirmedReviewRevision: null)
+            authenticatedMetadata, confirmedReviewRevision: null,
+            actionId: null, actionType: null, totalAmount: null,
+            currency: null, safeReason: null)
     {
     }
 
@@ -377,6 +380,37 @@ public sealed record CommitReceivableCaseCommand
         DateTimeOffset createdAtUtc,
         string authenticatedMetadata,
         int? confirmedReviewRevision)
+        : this(
+            operationId,
+            eventId,
+            caseId,
+            sourceDocumentId,
+            dueDate,
+            createdAtUtc,
+            authenticatedMetadata,
+            confirmedReviewRevision,
+            actionId: null,
+            actionType: null,
+            totalAmount: null,
+            currency: null,
+            safeReason: null)
+    {
+    }
+
+    public CommitReceivableCaseCommand(
+        OperationId operationId,
+        EventId eventId,
+        CaseId caseId,
+        DocumentId sourceDocumentId,
+        DateOnly dueDate,
+        DateTimeOffset createdAtUtc,
+        string authenticatedMetadata,
+        int? confirmedReviewRevision,
+        ReceivableActionId? actionId,
+        ReceivableActionType? actionType,
+        decimal? totalAmount,
+        string? currency,
+        string? safeReason)
     {
         CommitImportCommand.ValidateOperation(operationId, eventId);
         if (caseId.Value == Guid.Empty)
@@ -399,6 +433,29 @@ public sealed record CommitReceivableCaseCommand
         if (confirmedReviewRevision is <= 0)
             throw new ArgumentOutOfRangeException(nameof(confirmedReviewRevision));
         ConfirmedReviewRevision = confirmedReviewRevision;
+        var hasAnyAction = actionId is not null
+            || actionType is not null
+            || totalAmount is not null
+            || currency is not null
+            || safeReason is not null;
+        if (hasAnyAction
+            && (actionId is not { IsEmpty: false }
+                || actionType is null
+                || !Enum.IsDefined(actionType.Value)
+                || totalAmount is not > 0
+                || currency is null
+                || !Iso4217CurrencyCatalog.IsValid(currency)
+                || string.IsNullOrWhiteSpace(safeReason)))
+        {
+            throw new ArgumentException(
+                "Receivable action facts must be complete.",
+                nameof(actionId));
+        }
+        ActionId = actionId;
+        ActionType = actionType;
+        TotalAmount = totalAmount;
+        Currency = currency;
+        SafeReason = safeReason;
     }
 
     public OperationId OperationId { get; }
@@ -416,6 +473,16 @@ public sealed record CommitReceivableCaseCommand
     public string AuthenticatedMetadata { get; }
 
     public int? ConfirmedReviewRevision { get; }
+
+    public ReceivableActionId? ActionId { get; }
+
+    public ReceivableActionType? ActionType { get; }
+
+    public decimal? TotalAmount { get; }
+
+    public string? Currency { get; }
+
+    public string? SafeReason { get; }
 }
 
 public enum ProductConflictKind
@@ -583,7 +650,12 @@ public sealed record TodayListItem(
     CaseId CaseId,
     DocumentId SourceDocumentId,
     DateOnly DueDate,
-    ProductTodayStatus Status);
+    ProductTodayStatus Status,
+    ReceivableActionId? ActionId = null,
+    ReceivableActionType? ActionType = null,
+    decimal? TotalAmount = null,
+    string? Currency = null,
+    string? SafeReason = null);
 
 public sealed record TodayPage(
     IReadOnlyList<TodayListItem> Items,

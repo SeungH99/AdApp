@@ -20,11 +20,14 @@ public enum TodayDueState { Upcoming = 1, DueToday = 2, Overdue = 3 }
 public sealed record TodayActionItem(
     CaseId CaseId,
     DocumentId SourceDocumentId,
-    ReceivableActionType ActionType,
+    ReceivableActionId? ActionId,
+    ReceivableActionType? ActionType,
+    decimal? TotalAmount,
+    string? Currency,
     DateOnly DueDate,
     ProductTodayStatus Status,
     TodayDueState DueState,
-    string SafeReason);
+    string? SafeReason);
 
 public sealed record TodayActionPage(IReadOnlyList<TodayActionItem> Items, TodayCursor? NextCursor);
 
@@ -46,8 +49,9 @@ public sealed class TodayService
         var page = await _store.QueryTodayAsync(request, cancellationToken).ConfigureAwait(false);
         var localDate = DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(_clock.GetUtcNow(), _timeZone.GetLocalTimeZone()).DateTime);
         return new TodayActionPage(page.Items.Select(item => new TodayActionItem(item.CaseId,
-            item.SourceDocumentId, ReceivableActionType.ConfirmPaymentReceived, item.DueDate,
+            item.SourceDocumentId, item.ActionId, item.ActionType,
+            item.TotalAmount, item.Currency, item.DueDate,
             item.Status, item.DueDate < localDate ? TodayDueState.Overdue : item.DueDate == localDate ? TodayDueState.DueToday : TodayDueState.Upcoming,
-            "Payment confirmation is required.")).ToArray(), page.NextCursor);
+            item.SafeReason)).ToArray(), page.NextCursor);
     }
 }

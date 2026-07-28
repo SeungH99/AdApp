@@ -2,8 +2,10 @@ using System.Buffers.Binary;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Application.Products;
+using LocalDocumentOrganizer.Core.Cases.Receivable;
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
 using LocalDocumentOrganizer.Infrastructure.Windows.Crypto;
@@ -70,7 +72,7 @@ internal sealed class SqliteProductProjection(
     IProductCommitFaultInjector? faultInjector = null) : ISqliteProjection
 {
     internal const string ProjectionName = "product";
-    internal const int ProjectionSchemaVersion = 8;
+    internal const int ProjectionSchemaVersion = 9;
 
     private const string SchemaSql = """
         CREATE TABLE IF NOT EXISTS product_documents(
@@ -145,10 +147,36 @@ internal sealed class SqliteProductProjection(
         CREATE TABLE IF NOT EXISTS product_today(
             case_id TEXT PRIMARY KEY CHECK(length(case_id)=36)
                 REFERENCES product_cases(case_id) ON DELETE CASCADE,
+            action_id TEXT NULL CHECK(action_id IS NULL OR length(action_id)=36),
+            action_type INTEGER NULL CHECK(action_type IS NULL OR action_type=1),
             source_document_id TEXT NOT NULL CHECK(length(source_document_id)=36),
             due_date TEXT NOT NULL CHECK(length(due_date)=10),
-            status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 1)
+            status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 1),
+            owner_kind INTEGER NULL,
+            owner_id TEXT NULL CHECK(owner_id IS NULL OR length(owner_id)=36),
+            key_id TEXT NULL CHECK(key_id IS NULL OR length(key_id)=36),
+            encryption_version INTEGER NULL
+                CHECK(encryption_version IS NULL OR encryption_version=1),
+            display_nonce BLOB NULL
+                CHECK(display_nonce IS NULL OR length(display_nonce)=12),
+            display_ciphertext BLOB NULL,
+            display_tag BLOB NULL
+                CHECK(display_tag IS NULL OR length(display_tag)=16),
+            CHECK(
+                (action_id IS NULL AND action_type IS NULL
+                 AND owner_kind IS NULL AND owner_id IS NULL AND key_id IS NULL
+                 AND encryption_version IS NULL AND display_nonce IS NULL
+                 AND display_ciphertext IS NULL AND display_tag IS NULL)
+                OR
+                (action_id IS NOT NULL AND action_type IS NOT NULL
+                 AND owner_kind IS NOT NULL AND owner_id IS NOT NULL
+                 AND key_id IS NOT NULL AND encryption_version IS NOT NULL
+                 AND display_nonce IS NOT NULL
+                 AND display_ciphertext IS NOT NULL
+                 AND display_tag IS NOT NULL))
         ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS product_today_action
+            ON product_today(action_id) WHERE action_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS product_today_status_due_case
             ON product_today(status,due_date COLLATE BINARY,case_id COLLATE BINARY);
         CREATE TABLE IF NOT EXISTS product_outbox(
@@ -193,6 +221,7 @@ internal sealed class SqliteProductProjection(
         new("product_reviews", "payload"),
         new("product_review_drafts", "payload"),
         new("product_cases", "metadata"),
+        new("product_today", "display"),
     ];
 
     private readonly IProductCommitFaultInjector _faults =
@@ -220,6 +249,9 @@ internal sealed class SqliteProductProjection(
         var legacyInbox =
             !await InboxHasExtractionRevisionAsync(context, cancellationToken)
                 .ConfigureAwait(false);
+        var legacyToday =
+            !await TodayHasActionFieldsAsync(context, cancellationToken)
+                .ConfigureAwait(false);
         if (legacyInbox)
         {
             await ExecuteAsync(
@@ -240,10 +272,21 @@ internal sealed class SqliteProductProjection(
                 "DROP TABLE product_outbox;",
                 cancellationToken).ConfigureAwait(false);
         }
+        if (legacyToday)
+        {
+            await ExecuteAsync(
+                context.Connection,
+                context.Transaction,
+                "DROP TABLE product_today;",
+                cancellationToken).ConfigureAwait(false);
+        }
         await ExecuteAsync(context.Connection, context.Transaction, SchemaSql, cancellationToken)
             .ConfigureAwait(false);
         return new ProjectionCompatibilityResult(
-            existing == Tables.Length && !legacyOutbox && !legacyInbox
+            existing == Tables.Length
+                && !legacyOutbox
+                && !legacyInbox
+                && !legacyToday
                 ? ProjectionCompatibility.Compatible
                 : ProjectionCompatibility.CreatedEmpty);
     }
@@ -673,6 +716,51 @@ internal sealed class SqliteProductProjection(
         var createdAt = ProductEventPayloads.UtcValue(payload.CreatedAtUtc);
         _ = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
         RequireOwner(context, SensitiveObjectKind.Case, caseId);
+        var hasAnyAction = payload.ActionId is not null
+            || payload.ActionType is not null
+            || payload.TotalAmount is not null
+            || payload.Currency is not null
+            || payload.SafeReason is not null;
+        Guid? actionId = null;
+        ReceivableActionType? actionType = null;
+        TodayProtectedPayload? todayDisplay = null;
+        if (hasAnyAction)
+        {
+            if (payload.ActionId is null
+                || payload.ActionType is null
+                || payload.TotalAmount is null
+                || payload.Currency is null
+                || string.IsNullOrWhiteSpace(payload.SafeReason))
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+            actionId = ProductEventPayloads.GuidValue(payload.ActionId);
+            if (!Enum.IsDefined(
+                    typeof(ReceivableActionType),
+                    payload.ActionType.Value)
+                || !decimal.TryParse(
+                    payload.TotalAmount,
+                    NumberStyles.Number,
+                    CultureInfo.InvariantCulture,
+                    out var amount)
+                || amount <= 0
+                || !string.Equals(
+                    amount.ToString(
+                        "0.#############################",
+                        CultureInfo.InvariantCulture),
+                    payload.TotalAmount,
+                    StringComparison.Ordinal)
+                || !Iso4217CurrencyCatalog.IsValid(payload.Currency))
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+            actionType = (ReceivableActionType)payload.ActionType.Value;
+            todayDisplay = new TodayProtectedPayload(
+                1,
+                payload.TotalAmount,
+                payload.Currency,
+                payload.SafeReason);
+        }
         if (payload.ConfirmedReviewRevision is { } confirmedReviewRevision)
         {
             await using var confirmed = context.Connection.CreateCommand();
@@ -743,22 +831,83 @@ internal sealed class SqliteProductProjection(
         }
 
         _faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeToday);
-        await using (var today = context.Connection.CreateCommand())
+        if (todayDisplay is null)
         {
-            today.Transaction = context.Transaction;
-            today.CommandText = """
-                INSERT INTO product_today(case_id,source_document_id,due_date,status)
+            await using var legacyToday = context.Connection.CreateCommand();
+            legacyToday.Transaction = context.Transaction;
+            legacyToday.CommandText = """
+                INSERT INTO product_today(
+                    case_id,source_document_id,due_date,status)
                 VALUES($case,$document,$due,$status);
                 """;
-            today.Parameters.AddWithValue("$case", ProductEventPayloads.Canonical(caseId));
+            legacyToday.Parameters.AddWithValue(
+                "$case",
+                ProductEventPayloads.Canonical(caseId));
+            legacyToday.Parameters.AddWithValue(
+                "$document",
+                ProductEventPayloads.Canonical(documentId));
+            legacyToday.Parameters.AddWithValue(
+                "$due",
+                dueDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+            legacyToday.Parameters.AddWithValue(
+                "$status",
+                (int)ProductTodayStatus.Pending);
+            RequireSingle(
+                await legacyToday.ExecuteNonQueryAsync(cancellationToken)
+                    .ConfigureAwait(false));
+        }
+        else
+        {
+            var protectedDisplay = await context.Values.ProtectAsync(
+                "product_today",
+                "display",
+                logicalKey,
+                context.Values.BoundOwner,
+                context.Values.BoundDataKeyId,
+                JsonSerializer.SerializeToUtf8Bytes(todayDisplay),
+                cancellationToken).ConfigureAwait(false);
+            await using var today = context.Connection.CreateCommand();
+            today.Transaction = context.Transaction;
+            today.CommandText = """
+                INSERT INTO product_today(
+                    case_id,action_id,action_type,source_document_id,
+                    due_date,status,owner_kind,owner_id,key_id,
+                    encryption_version,display_nonce,display_ciphertext,
+                    display_tag)
+                VALUES(
+                    $case,$action,$action_type,$document,
+                    $due,$status,$owner_kind,$owner_id,$key_id,
+                    $version,$nonce,$ciphertext,$tag);
+                """;
+            today.Parameters.AddWithValue("$case", logicalKey);
+            today.Parameters.AddWithValue(
+                "$action",
+                ProductEventPayloads.Canonical(actionId!.Value));
+            today.Parameters.AddWithValue(
+                "$action_type",
+                (int)actionType!.Value);
             today.Parameters.AddWithValue(
                 "$document",
                 ProductEventPayloads.Canonical(documentId));
             today.Parameters.AddWithValue(
                 "$due",
                 dueDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
-            today.Parameters.AddWithValue("$status", (int)ProductTodayStatus.Pending);
-            RequireSingle(await today.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false));
+            today.Parameters.AddWithValue(
+                "$status",
+                (int)ProductTodayStatus.Pending);
+            AddOwnerAndKey(
+                today,
+                context.Values.BoundOwner,
+                protectedDisplay);
+            today.Parameters.Add("$nonce", SqliteType.Blob).Value =
+                protectedDisplay.Nonce.ToArray();
+            today.Parameters.Add("$ciphertext", SqliteType.Blob).Value =
+                protectedDisplay.Ciphertext.ToArray();
+            today.Parameters.Add("$tag", SqliteType.Blob).Value =
+                protectedDisplay.Tag.ToArray();
+            RequireSingle(
+                await today.ExecuteNonQueryAsync(cancellationToken)
+                    .ConfigureAwait(false));
         }
 
         _faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeCaseInbox);
@@ -1182,6 +1331,32 @@ internal sealed class SqliteProductProjection(
                 "current_extraction_revision",
                 StringComparison.OrdinalIgnoreCase);
     }
+
+    private static async Task<bool> TodayHasActionFieldsAsync(
+        SqliteProjectionAdministrativeContext context,
+        CancellationToken cancellationToken)
+    {
+        await using var command = context.Connection.CreateCommand();
+        command.Transaction = context.Transaction;
+        command.CommandText = """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type='table' AND name='product_today';
+            """;
+        var schema = await command.ExecuteScalarAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return schema is not string sql
+            || sql.Contains("action_id", StringComparison.OrdinalIgnoreCase)
+            && sql.Contains(
+                "display_ciphertext",
+                StringComparison.OrdinalIgnoreCase);
+    }
+
+    private sealed record TodayProtectedPayload(
+        int Version,
+        string TotalAmount,
+        string Currency,
+        string SafeReason);
 
     private static async Task InsertOutboxAsync(
         DecryptedEvent replayEvent,

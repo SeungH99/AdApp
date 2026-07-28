@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using LocalDocumentOrganizer.Application.Products;
 using LocalDocumentOrganizer.Core.Cases;
+using LocalDocumentOrganizer.Core.Cases.Receivable;
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
 using LocalDocumentOrganizer.Infrastructure.Windows.Crypto;
@@ -71,7 +72,12 @@ internal sealed record ProductReceivableCasePayload(
     string CreatedAtUtc,
     string AuthenticatedMetadata,
     int? ConfirmedReviewRevision,
-    string CommitFingerprint);
+    string CommitFingerprint,
+    string? ActionId = null,
+    int? ActionType = null,
+    string? TotalAmount = null,
+    string? Currency = null,
+    string? SafeReason = null);
 
 internal static class ProductEventPayloads
 {
@@ -149,7 +155,18 @@ internal static class ProductEventPayloads
                 Utc(command.CreatedAtUtc),
                 command.AuthenticatedMetadata,
                 command.ConfirmedReviewRevision,
-                Convert.ToHexString(fingerprint).ToLowerInvariant()));
+                Convert.ToHexString(fingerprint).ToLowerInvariant(),
+                command.ActionId is { } actionId
+                    ? Canonical(actionId.Value)
+                    : null,
+                command.ActionType is { } actionType
+                    ? (int)actionType
+                    : null,
+                command.TotalAmount?.ToString(
+                    "0.#############################",
+                    CultureInfo.InvariantCulture),
+                command.Currency,
+                command.SafeReason));
 
     internal static T Read<T>(ReadOnlyMemory<byte> payload)
     {
@@ -228,6 +245,16 @@ internal static class ProductEventPayloads
         Add(hash, Utc(command.CreatedAtUtc));
         Add(hash, command.AuthenticatedMetadata);
         Add(hash, command.ConfirmedReviewRevision ?? 0);
+        Add(hash, command.ActionId?.Value ?? Guid.Empty);
+        Add(hash, (int?)command.ActionType ?? 0);
+        Add(
+            hash,
+            command.TotalAmount?.ToString(
+                "0.#############################",
+                CultureInfo.InvariantCulture)
+                ?? string.Empty);
+        Add(hash, command.Currency ?? string.Empty);
+        Add(hash, command.SafeReason ?? string.Empty);
         return hash.GetHashAndReset();
     }
 

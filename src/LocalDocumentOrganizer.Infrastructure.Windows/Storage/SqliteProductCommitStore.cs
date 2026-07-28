@@ -7,6 +7,7 @@ using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Application.Products;
 using LocalDocumentOrganizer.Application.Review;
 using LocalDocumentOrganizer.Core.Cases;
+using LocalDocumentOrganizer.Core.Cases.Receivable;
 using LocalDocumentOrganizer.Core.Documents;
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
@@ -763,6 +764,12 @@ public sealed class SqliteProductCommitStore :
                 connection,
                 transaction,
                 cancellationToken).ConfigureAwait(false);
+            var administrative = SqliteProjectionContexts.CreateAdministrative(
+                connection,
+                transaction,
+                _keyRing,
+                lease,
+                _registration);
             await using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = BuildTodayQuery(request);
@@ -795,14 +802,91 @@ public sealed class SqliteProductCommitStore :
                     throw new VaultRecoveryRequiredException();
                 }
 
-                items.Add(
-                    new TodayListItem(
-                        new CaseId(
-                            ProductEventPayloads.GuidValue(reader.GetString(0))),
-                        new DocumentId(
-                            ProductEventPayloads.GuidValue(reader.GetString(1))),
-                        ProductEventPayloads.DateValue(reader.GetString(2)),
-                        (ProductTodayStatus)rawStatus));
+                var caseId = new CaseId(
+                    ProductEventPayloads.GuidValue(reader.GetString(0)));
+                ReceivableActionId? actionId = null;
+                ReceivableActionType? actionType = null;
+                decimal? amount = null;
+                string? currency = null;
+                string? safeReason = null;
+                if (!reader.IsDBNull(4))
+                {
+                    var actionGuid =
+                        ProductEventPayloads.GuidValue(reader.GetString(4));
+                    var rawActionType = reader.GetInt32(5);
+                    if (!Enum.IsDefined(
+                            typeof(ReceivableActionType),
+                            rawActionType))
+                    {
+                        throw new VaultRecoveryRequiredException();
+                    }
+                    var owner = ReadOwner(reader, 6, 7);
+                    if (owner.Kind != SensitiveObjectKind.Case
+                        || owner.Id.Value != caseId.Value)
+                    {
+                        throw new VaultRecoveryRequiredException();
+                    }
+                    var keyId = new DataKeyId(
+                        ProductEventPayloads.GuidValue(reader.GetString(8)));
+                    var encrypted = new EncryptedProjectionValue(
+                        reader.GetInt32(9),
+                        keyId,
+                        (byte[])reader.GetValue(10),
+                        (byte[])reader.GetValue(11),
+                        (byte[])reader.GetValue(12));
+                    var display = await administrative.Values.UnprotectAsync(
+                        "product_today",
+                        "display",
+                        ProductEventPayloads.Canonical(caseId.Value),
+                        owner,
+                        keyId,
+                        encrypted,
+                        (plaintext, _) => ValueTask.FromResult(
+                            JsonSerializer.Deserialize<TodayProtectedPayload>(
+                                plaintext.Span)
+                            ?? throw new VaultRecoveryRequiredException()),
+                        cancellationToken).ConfigureAwait(false);
+                    if (display.Version != 1
+                        || !decimal.TryParse(
+                            display.TotalAmount,
+                            NumberStyles.Number,
+                            CultureInfo.InvariantCulture,
+                            out var parsedAmount)
+                        || parsedAmount <= 0
+                        || !string.Equals(
+                            parsedAmount.ToString(
+                                "0.#############################",
+                                CultureInfo.InvariantCulture),
+                            display.TotalAmount,
+                            StringComparison.Ordinal)
+                        || !Iso4217CurrencyCatalog.IsValid(display.Currency)
+                        || string.IsNullOrWhiteSpace(display.SafeReason))
+                    {
+                        throw new VaultRecoveryRequiredException();
+                    }
+                    actionId = new ReceivableActionId(actionGuid);
+                    actionType = (ReceivableActionType)rawActionType;
+                    amount = parsedAmount;
+                    currency = display.Currency;
+                    safeReason = display.SafeReason;
+                }
+                else if (Enumerable.Range(5, 8)
+                    .Any(ordinal => !reader.IsDBNull(ordinal)))
+                {
+                    throw new VaultRecoveryRequiredException();
+                }
+
+                items.Add(new TodayListItem(
+                    caseId,
+                    new DocumentId(
+                        ProductEventPayloads.GuidValue(reader.GetString(1))),
+                    ProductEventPayloads.DateValue(reader.GetString(2)),
+                    (ProductTodayStatus)rawStatus,
+                    actionId,
+                    actionType,
+                    amount,
+                    currency,
+                    safeReason));
             }
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -821,6 +905,8 @@ public sealed class SqliteProductCommitStore :
         }
         catch (Exception exception) when (
             exception is SqliteException
+                or ProjectionValueRecoveryRequiredException
+                or JsonException
                 or InvalidCastException
                 or FormatException
                 or OverflowException)
@@ -1472,7 +1558,10 @@ public sealed class SqliteProductCommitStore :
                (due_date=$after_due AND case_id>$after_case)) AND
               """;
         return $"""
-            SELECT case_id,source_document_id,due_date,status
+            SELECT case_id,source_document_id,due_date,status,
+                   action_id,action_type,owner_kind,owner_id,key_id,
+                   encryption_version,display_nonce,display_ciphertext,
+                   display_tag
             FROM product_today
             WHERE {status}{cursor} 1=1
             ORDER BY due_date COLLATE BINARY,case_id COLLATE BINARY
@@ -1576,6 +1665,12 @@ public sealed class SqliteProductCommitStore :
         int ExtractionRevision,
         StreamVersion StreamVersion,
         AuthenticatedExtractionDraft Draft);
+
+    private sealed record TodayProtectedPayload(
+        int Version,
+        string TotalAmount,
+        string Currency,
+        string SafeReason);
 
     private sealed record ProjectedReviewState(
         ContentSha256 SourceIdentity,
