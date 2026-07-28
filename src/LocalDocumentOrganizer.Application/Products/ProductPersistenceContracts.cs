@@ -54,13 +54,14 @@ public sealed class ContentSha256 : IEquatable<ContentSha256>
 public enum ProductInboxStatus
 {
     Imported = 0,
-    Processing = 1,
-    ReadyForReview = 2,
-    NeedsReview = 3,
-    Unsupported = 4,
-    Failed = 5,
-    Reviewed = 6,
-    CaseCreated = 7,
+    Extracted = 1,
+    Reviewed = 2,
+    CaseCreated = 3,
+    Processing = 4,
+    ReadyForReview = 5,
+    NeedsReview = 6,
+    Unsupported = 7,
+    Failed = 8,
 }
 
 public enum ProductCaseStatus

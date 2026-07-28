@@ -316,9 +316,19 @@ public sealed class SqliteProductCommitStore :
             insert.Parameters.AddWithValue("$attempt", ProductEventPayloads.Canonical(Guid.NewGuid()));
             insert.Parameters.AddWithValue("$revision", targetRevision);
             insert.Parameters.AddWithValue("$commit_operation", ProductEventPayloads.Canonical(Guid.NewGuid()));
-            if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            try
             {
-                throw new VaultRecoveryRequiredException();
+                if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+                {
+                    throw new VaultRecoveryRequiredException();
+                }
+            }
+            catch (SqliteException exception) when (exception.SqliteErrorCode == 19)
+            {
+                await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+                return new ExplicitReprocessResult(
+                    ExplicitReprocessOutcome.RevisionConflict,
+                    targetRevision);
             }
         }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);

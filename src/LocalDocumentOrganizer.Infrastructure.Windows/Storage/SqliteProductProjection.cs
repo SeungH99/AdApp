@@ -78,7 +78,7 @@ internal sealed class SqliteProductProjection(
             document_id TEXT NOT NULL UNIQUE CHECK(length(document_id)=36)
                 REFERENCES product_documents(document_id) ON DELETE CASCADE,
             received_at_utc TEXT NOT NULL,
-            status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 7),
+            status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 8),
             owner_kind INTEGER NOT NULL,
             owner_id TEXT NOT NULL CHECK(length(owner_id)=36),
             key_id TEXT NOT NULL CHECK(length(key_id)=36),
@@ -135,6 +135,9 @@ internal sealed class SqliteProductProjection(
         ) STRICT;
         CREATE INDEX IF NOT EXISTS product_outbox_dispatch_order
             ON product_outbox(dispatch_status,occurred_at_utc COLLATE BINARY,operation_id COLLATE BINARY);
+        CREATE UNIQUE INDEX IF NOT EXISTS product_outbox_explicit_reprocess_revision
+            ON product_outbox(aggregate_id,target_extraction_revision)
+            WHERE commit_kind='explicit-reprocess';
         """;
 
     private static readonly ProjectionOwnedTable[] Tables =
@@ -218,7 +221,7 @@ internal sealed class SqliteProductProjection(
                 var extractionStatus = extractionPayload.InboxStatus is { } rawStatus
                     && Enum.IsDefined(typeof(ProductInboxStatus), rawStatus)
                     ? (ProductInboxStatus)rawStatus
-                    : throw new VaultRecoveryRequiredException();
+                    : ProductInboxStatus.Extracted;
                 await ApplyProgressAsync(
                     decrypted,
                     context,
