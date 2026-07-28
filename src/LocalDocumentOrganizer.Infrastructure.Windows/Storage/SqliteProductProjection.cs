@@ -1062,11 +1062,17 @@ internal sealed class SqliteProductProjection(
             hash,
             cancellationToken).ConfigureAwait(false);
         await AppendInboxRowsAsync(context, hash, cancellationToken).ConfigureAwait(false);
+        await AppendReviewDraftRowsAsync(
+            context,
+            hash,
+            cancellationToken).ConfigureAwait(false);
+        await AppendReviewRowsAsync(
+            context,
+            hash,
+            cancellationToken).ConfigureAwait(false);
         await AppendCaseRowsAsync(context, hash, cancellationToken).ConfigureAwait(false);
-        await AppendRowsAsync(
-            context.Connection,
-            context.Transaction,
-            "SELECT case_id,source_document_id,due_date,status FROM product_today ORDER BY case_id COLLATE BINARY;",
+        await AppendTodayRowsAsync(
+            context,
             hash,
             cancellationToken).ConfigureAwait(false);
         await AppendRowsAsync(
@@ -1076,7 +1082,8 @@ internal sealed class SqliteProductProjection(
             SELECT operation_id,event_id,commit_kind,aggregate_id,COALESCE(inbox_id,''),
                    occurred_at_utc,dispatch_status,COALESCE(extraction_attempt_id,''),
                    COALESCE(target_extraction_revision,0),
-                   COALESCE(extraction_commit_operation_id,''),automatic_failure_count,
+                   COALESCE(extraction_commit_operation_id,''),
+                   COALESCE(source_binding_json,''),automatic_failure_count,
                    COALESCE(lease_owner_id,''),COALESCE(lease_expires_at_utc,'')
             FROM product_outbox ORDER BY operation_id COLLATE BINARY;
             """,
@@ -1093,7 +1100,9 @@ internal sealed class SqliteProductProjection(
         await using var command = context.Connection.CreateCommand();
         command.Transaction = context.Transaction;
         command.CommandText = """
-            SELECT inbox_id,document_id,received_at_utc,status,owner_kind,owner_id,key_id,
+            SELECT inbox_id,document_id,received_at_utc,status,
+                   current_stream_version,current_extraction_revision,
+                   owner_kind,owner_id,key_id,
                    encryption_version,file_name_nonce,file_name_ciphertext,file_name_tag,
                    metadata_nonce,metadata_ciphertext,metadata_tag
             FROM product_inbox ORDER BY inbox_id COLLATE BINARY;
@@ -1102,14 +1111,14 @@ internal sealed class SqliteProductProjection(
             .ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            for (var ordinal = 0; ordinal < 4; ordinal++)
+            for (var ordinal = 0; ordinal < 6; ordinal++)
             {
                 AppendValue(hash, reader.GetValue(ordinal));
             }
 
-            var owner = Owner(reader, 4, 5);
-            var keyId = new DataKeyId(ProductEventPayloads.GuidValue(reader.GetString(6)));
-            var version = reader.GetInt32(7);
+            var owner = Owner(reader, 6, 7);
+            var keyId = new DataKeyId(ProductEventPayloads.GuidValue(reader.GetString(8)));
+            var version = reader.GetInt32(9);
             await AppendProtectedAsync(
                 context,
                 hash,
@@ -1120,7 +1129,7 @@ internal sealed class SqliteProductProjection(
                 keyId,
                 version,
                 reader,
-                8,
+                10,
                 cancellationToken).ConfigureAwait(false);
             await AppendProtectedAsync(
                 context,
@@ -1132,7 +1141,132 @@ internal sealed class SqliteProductProjection(
                 keyId,
                 version,
                 reader,
-                11,
+                13,
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task AppendReviewDraftRowsAsync(
+        SqliteProjectionAdministrativeContext context,
+        IncrementalHash hash,
+        CancellationToken cancellationToken)
+    {
+        await using var command = context.Connection.CreateCommand();
+        command.Transaction = context.Transaction;
+        command.CommandText = """
+            SELECT document_id,extraction_revision,current_stream_version,
+                   owner_kind,owner_id,key_id,encryption_version,
+                   payload_nonce,payload_ciphertext,payload_tag
+            FROM product_review_drafts
+            ORDER BY document_id COLLATE BINARY;
+            """;
+        await using var reader = await command.ExecuteReaderAsync(
+            cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            for (var ordinal = 0; ordinal < 3; ordinal++)
+                AppendValue(hash, reader.GetValue(ordinal));
+            var owner = Owner(reader, 3, 4);
+            var keyId = new DataKeyId(
+                ProductEventPayloads.GuidValue(reader.GetString(5)));
+            await AppendProtectedAsync(
+                context,
+                hash,
+                "product_review_drafts",
+                "payload",
+                reader.GetString(0),
+                owner,
+                keyId,
+                reader.GetInt32(6),
+                reader,
+                7,
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task AppendReviewRowsAsync(
+        SqliteProjectionAdministrativeContext context,
+        IncrementalHash hash,
+        CancellationToken cancellationToken)
+    {
+        await using var command = context.Connection.CreateCommand();
+        command.Transaction = context.Transaction;
+        command.CommandText = """
+            SELECT document_id,extraction_revision,review_revision,
+                   approved_at_utc,owner_kind,owner_id,key_id,
+                   encryption_version,payload_nonce,payload_ciphertext,
+                   payload_tag
+            FROM product_reviews
+            ORDER BY document_id COLLATE BINARY;
+            """;
+        await using var reader = await command.ExecuteReaderAsync(
+            cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            for (var ordinal = 0; ordinal < 4; ordinal++)
+                AppendValue(hash, reader.GetValue(ordinal));
+            var owner = Owner(reader, 4, 5);
+            var keyId = new DataKeyId(
+                ProductEventPayloads.GuidValue(reader.GetString(6)));
+            await AppendProtectedAsync(
+                context,
+                hash,
+                "product_reviews",
+                "payload",
+                reader.GetString(0),
+                owner,
+                keyId,
+                reader.GetInt32(7),
+                reader,
+                8,
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task AppendTodayRowsAsync(
+        SqliteProjectionAdministrativeContext context,
+        IncrementalHash hash,
+        CancellationToken cancellationToken)
+    {
+        await using var command = context.Connection.CreateCommand();
+        command.Transaction = context.Transaction;
+        command.CommandText = """
+            SELECT case_id,source_document_id,due_date,status,
+                   COALESCE(action_id,''),COALESCE(action_type,0),
+                   owner_kind,owner_id,key_id,encryption_version,
+                   display_nonce,display_ciphertext,display_tag
+            FROM product_today
+            ORDER BY case_id COLLATE BINARY;
+            """;
+        await using var reader = await command.ExecuteReaderAsync(
+            cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            for (var ordinal = 0; ordinal < 6; ordinal++)
+                AppendValue(hash, reader.GetValue(ordinal));
+            if (reader.IsDBNull(6))
+            {
+                if (Enumerable.Range(7, 6)
+                    .Any(ordinal => !reader.IsDBNull(ordinal)))
+                {
+                    throw new VaultRecoveryRequiredException();
+                }
+                continue;
+            }
+            var owner = Owner(reader, 6, 7);
+            var keyId = new DataKeyId(
+                ProductEventPayloads.GuidValue(reader.GetString(8)));
+            await AppendProtectedAsync(
+                context,
+                hash,
+                "product_today",
+                "display",
+                reader.GetString(0),
+                owner,
+                keyId,
+                reader.GetInt32(9),
+                reader,
+                10,
                 cancellationToken).ConfigureAwait(false);
         }
     }
