@@ -58,6 +58,7 @@ public sealed record ExtractionOutboxWorkItem(
     DocumentId DocumentId,
     InboxId InboxId,
     ContentSha256 ContentSha256,
+    ProductDocumentSourceBinding? SourceBinding,
     ExtractionAttemptId AttemptId,
     int TargetRevision,
     OperationId CommitOperationId,
@@ -78,6 +79,7 @@ public sealed record DocumentProcessingRequest(
     int TargetRevision,
     OperationId CommitOperationId,
     ContentSha256 ContentSha256,
+    ProductDocumentSourceBinding? SourceBinding,
     ImmutableArray<string> RequestedLanguages,
     ExtractionCapability RequestedCapabilities);
 

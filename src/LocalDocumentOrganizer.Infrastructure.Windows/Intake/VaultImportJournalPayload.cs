@@ -13,6 +13,7 @@ internal sealed record VaultImportJournalPayload(
     Guid InboxId,
     string ContentSha256,
     long Length,
+    ProductDocumentSourceBinding? SourceBinding,
     Guid ExtractionAttemptId,
     Guid ExtractionCommitOperationId,
     string ReceivedAtUtc,
@@ -27,6 +28,7 @@ internal sealed record VaultImportJournalPayload(
         InboxId inboxId,
         ContentSha256 contentSha256,
         long length,
+        ProductDocumentSourceBinding sourceBinding,
         DateTimeOffset receivedAtUtc,
         string fileName,
         string authenticatedMetadata,
@@ -38,6 +40,7 @@ internal sealed record VaultImportJournalPayload(
             inboxId.Value,
             contentSha256.Hex,
             length,
+            sourceBinding,
             Guid.NewGuid(),
             Guid.NewGuid(),
             receivedAtUtc.ToString("O"),
@@ -71,7 +74,8 @@ internal sealed record VaultImportJournalPayload(
             new LocalDocumentOrganizer.Application.Processing.ExtractionAttemptId(
                 ExtractionAttemptId),
             targetExtractionRevision: 1,
-            new OperationId(ExtractionCommitOperationId));
+            extractionCommitOperationId: new OperationId(ExtractionCommitOperationId),
+            sourceBinding: SourceBinding);
 
     internal byte[] ComputeCommitFingerprint(OperationId operationId)
     {

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Collections.Immutable;
 using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Application.Products;
@@ -114,7 +115,7 @@ public sealed class SqliteProductCommitStore :
         select.CommandText = """
             SELECT o.operation_id,o.aggregate_id,o.inbox_id,d.content_sha256,
                    o.extraction_attempt_id,o.target_extraction_revision,
-                   o.extraction_commit_operation_id,o.automatic_failure_count
+                   o.extraction_commit_operation_id,o.source_binding_json,o.automatic_failure_count
             FROM product_outbox o
             JOIN product_documents d ON d.document_id=o.aggregate_id
             WHERE o.commit_kind IN ('import-committed','explicit-reprocess')
@@ -135,12 +136,13 @@ public sealed class SqliteProductCommitStore :
             new DocumentId(ProductEventPayloads.GuidValue(reader.GetString(1))),
             new InboxId(ProductEventPayloads.GuidValue(reader.GetString(2))),
             new ContentSha256((byte[])reader.GetValue(3)),
+            reader.IsDBNull(7) ? null : ReadSourceBinding(reader.GetString(7)),
             new ExtractionAttemptId(ProductEventPayloads.GuidValue(reader.GetString(4))),
             reader.GetInt32(5),
             new OperationId(ProductEventPayloads.GuidValue(reader.GetString(6))),
             ImmutableArray.Create("en-US", "ko-KR"),
             ExtractionCapability.EmbeddedText | ExtractionCapability.Ocr,
-            reader.GetInt32(7),
+            reader.GetInt32(8),
             ExtractionOutboxState.Running,
             nowUtc.Add(leaseDuration));
         await reader.DisposeAsync().ConfigureAwait(false);
@@ -295,6 +297,23 @@ public sealed class SqliteProductCommitStore :
             inboxId = await inbox.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string
                 ?? throw new VaultRecoveryRequiredException();
         }
+        ProductDocumentSourceBinding? sourceBinding;
+        await using (var source = connection.CreateCommand())
+        {
+            source.Transaction = transaction;
+            source.CommandText = """
+                SELECT source_binding_json FROM product_outbox
+                WHERE aggregate_id=$document AND commit_kind='import-committed'
+                ORDER BY occurred_at_utc COLLATE BINARY,operation_id COLLATE BINARY
+                LIMIT 1;
+                """;
+            source.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(command.DocumentId.Value));
+            var sourceBindingJson = await source.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            sourceBinding = sourceBindingJson is DBNull or null
+                ? null
+                : ReadSourceBinding(sourceBindingJson as string
+                    ?? throw new VaultRecoveryRequiredException());
+        }
         var targetRevision = checked((int)(currentRevision + 1));
         var occurred = ProductEventPayloads.Utc(DateTimeOffset.UtcNow);
         await using (var insert = connection.CreateCommand())
@@ -304,9 +323,9 @@ public sealed class SqliteProductCommitStore :
                 INSERT INTO product_outbox(
                     operation_id,event_id,commit_kind,aggregate_id,inbox_id,occurred_at_utc,
                     dispatch_status,extraction_attempt_id,target_extraction_revision,
-                    extraction_commit_operation_id)
+                    extraction_commit_operation_id,source_binding_json)
                 VALUES($operation,$event,'explicit-reprocess',$document,$inbox,$occurred,
-                    0,$attempt,$revision,$commit_operation);
+                    0,$attempt,$revision,$commit_operation,$source_binding);
                 """;
             insert.Parameters.AddWithValue("$operation", ProductEventPayloads.Canonical(command.CommandOperationId.Value));
             insert.Parameters.AddWithValue("$event", ProductEventPayloads.Canonical(command.CommandOperationId.Value));
@@ -316,6 +335,8 @@ public sealed class SqliteProductCommitStore :
             insert.Parameters.AddWithValue("$attempt", ProductEventPayloads.Canonical(Guid.NewGuid()));
             insert.Parameters.AddWithValue("$revision", targetRevision);
             insert.Parameters.AddWithValue("$commit_operation", ProductEventPayloads.Canonical(Guid.NewGuid()));
+            insert.Parameters.Add("$source_binding", SqliteType.Text).Value =
+                sourceBinding is null ? DBNull.Value : JsonSerializer.Serialize(sourceBinding);
             try
             {
                 if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
@@ -1164,6 +1185,22 @@ public sealed class SqliteProductCommitStore :
         exception is VaultRecoveryRequiredException
             or ProjectionValueRecoveryRequiredException
             or CryptographicException;
+
+    private static ProductDocumentSourceBinding ReadSourceBinding(string value)
+    {
+        try
+        {
+            var sourceBinding = JsonSerializer.Deserialize<ProductDocumentSourceBinding>(value)
+                ?? throw new VaultRecoveryRequiredException();
+            return sourceBinding.IsValid
+                ? sourceBinding
+                : throw new VaultRecoveryRequiredException();
+        }
+        catch (JsonException exception)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
+    }
 
     private static Task DelayBeforeBusyRetryAsync(
         int attempt,

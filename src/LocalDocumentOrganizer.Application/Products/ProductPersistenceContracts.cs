@@ -64,6 +64,26 @@ public enum ProductInboxStatus
     Failed = 8,
 }
 
+public enum ProductDocumentSourceFormat { Pdf = 1, Jpeg = 2, Png = 3, Tiff = 4 }
+
+public sealed record ProductDocumentSourceBinding(
+    ProductDocumentSourceFormat Format,
+    string CanonicalMimeType,
+    string CanonicalExtension,
+    long DeclaredLength)
+{
+    public bool IsValid => Enum.IsDefined(Format)
+        && DeclaredLength >= 0
+        && (Format, CanonicalMimeType, CanonicalExtension) switch
+        {
+            (ProductDocumentSourceFormat.Pdf, "application/pdf", ".pdf") => true,
+            (ProductDocumentSourceFormat.Jpeg, "image/jpeg", ".jpg") => true,
+            (ProductDocumentSourceFormat.Png, "image/png", ".png") => true,
+            (ProductDocumentSourceFormat.Tiff, "image/tiff", ".tiff") => true,
+            _ => false,
+        };
+}
+
 public enum ProductCaseStatus
 {
     Open = 0,
@@ -98,7 +118,8 @@ public sealed record CommitImportCommand
             authenticatedMetadata,
             new ExtractionAttemptId(Guid.NewGuid()),
             targetExtractionRevision: 1,
-            extractionCommitOperationId: new OperationId(Guid.NewGuid()))
+            extractionCommitOperationId: new OperationId(Guid.NewGuid()),
+            sourceBinding: null)
     {
     }
 
@@ -113,7 +134,8 @@ public sealed record CommitImportCommand
         string authenticatedMetadata,
         ExtractionAttemptId extractionAttemptId,
         int targetExtractionRevision,
-        OperationId extractionCommitOperationId)
+        OperationId extractionCommitOperationId,
+        ProductDocumentSourceBinding? sourceBinding)
     {
         ValidateOperation(operationId, eventId);
         ValidateDocument(documentId);
@@ -146,6 +168,9 @@ public sealed record CommitImportCommand
         ExtractionAttemptId = extractionAttemptId;
         TargetExtractionRevision = targetExtractionRevision;
         ExtractionCommitOperationId = extractionCommitOperationId;
+        if (sourceBinding is not null && !sourceBinding.IsValid)
+            throw new ArgumentException("The document source binding is invalid.", nameof(sourceBinding));
+        SourceBinding = sourceBinding;
     }
 
     public OperationId OperationId { get; }
@@ -169,6 +194,8 @@ public sealed record CommitImportCommand
     public int TargetExtractionRevision { get; }
 
     public OperationId ExtractionCommitOperationId { get; }
+
+    public ProductDocumentSourceBinding? SourceBinding { get; }
 
 
     private static void ValidateProtectedText(string value, string parameterName)

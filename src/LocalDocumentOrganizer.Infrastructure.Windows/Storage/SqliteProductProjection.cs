@@ -129,6 +129,7 @@ internal sealed class SqliteProductProjection(
             extraction_attempt_id TEXT NULL CHECK(extraction_attempt_id IS NULL OR length(extraction_attempt_id)=36),
             target_extraction_revision INTEGER NULL CHECK(target_extraction_revision IS NULL OR target_extraction_revision > 0),
             extraction_commit_operation_id TEXT NULL CHECK(extraction_commit_operation_id IS NULL OR length(extraction_commit_operation_id)=36),
+            source_binding_json TEXT NULL,
             automatic_failure_count INTEGER NOT NULL DEFAULT 0 CHECK(automatic_failure_count BETWEEN 0 AND 1),
             lease_owner_id TEXT NULL CHECK(lease_owner_id IS NULL OR length(lease_owner_id)=36),
             lease_expires_at_utc TEXT NULL
@@ -260,6 +261,10 @@ internal sealed class SqliteProductProjection(
         {
             throw new VaultRecoveryRequiredException();
         }
+        if (payload.SourceBinding is { IsValid: false })
+        {
+            throw new VaultRecoveryRequiredException();
+        }
         _ = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
         RequireOwner(
             context,
@@ -338,6 +343,7 @@ internal sealed class SqliteProductProjection(
             attemptId,
             payload.TargetExtractionRevision,
             commitOperationId,
+            payload.SourceBinding,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -359,6 +365,7 @@ internal sealed class SqliteProductProjection(
             "already-imported",
             documentId,
             new InboxId(inboxId),
+            null,
             null,
             null,
             null,
@@ -429,6 +436,7 @@ internal sealed class SqliteProductProjection(
             kind,
             documentId,
             inboxId,
+            null,
             null,
             null,
             null,
@@ -542,6 +550,7 @@ internal sealed class SqliteProductProjection(
             "receivable-case-committed",
             caseId,
             inboxId,
+            null,
             null,
             null,
             null,
@@ -848,7 +857,8 @@ internal sealed class SqliteProductProjection(
             .ConfigureAwait(false);
         return schema is not string sql
             || (sql.Contains("extraction_attempt_id", StringComparison.OrdinalIgnoreCase)
-                && sql.Contains("extraction_commit_operation_id", StringComparison.OrdinalIgnoreCase));
+                && sql.Contains("extraction_commit_operation_id", StringComparison.OrdinalIgnoreCase)
+                && sql.Contains("source_binding_json", StringComparison.OrdinalIgnoreCase));
     }
 
     private static async Task InsertOutboxAsync(
@@ -860,6 +870,7 @@ internal sealed class SqliteProductProjection(
         Guid? extractionAttemptId,
         int? targetExtractionRevision,
         Guid? extractionCommitOperationId,
+        ProductDocumentSourceBinding? sourceBinding,
         CancellationToken cancellationToken)
     {
         await using var outbox = context.Connection.CreateCommand();
@@ -868,10 +879,10 @@ internal sealed class SqliteProductProjection(
             INSERT INTO product_outbox(
                 operation_id,event_id,commit_kind,aggregate_id,inbox_id,
                 occurred_at_utc,dispatch_status,extraction_attempt_id,
-                target_extraction_revision,extraction_commit_operation_id)
+                target_extraction_revision,extraction_commit_operation_id,source_binding_json)
             VALUES(
                 $operation,$event,$kind,$aggregate,$inbox,
-                $occurred,0,$attempt,$revision,$commit_operation);
+                $occurred,0,$attempt,$revision,$commit_operation,$source_binding);
             """;
         outbox.Parameters.AddWithValue(
             "$operation",
@@ -896,6 +907,8 @@ internal sealed class SqliteProductProjection(
             targetExtractionRevision is { } revision ? revision : DBNull.Value;
         outbox.Parameters.Add("$commit_operation", SqliteType.Text).Value =
             extractionCommitOperationId is { } commit ? ProductEventPayloads.Canonical(commit) : DBNull.Value;
+        outbox.Parameters.Add("$source_binding", SqliteType.Text).Value =
+            sourceBinding is null ? DBNull.Value : System.Text.Json.JsonSerializer.Serialize(sourceBinding);
         RequireSingle(await outbox.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false));
     }
 

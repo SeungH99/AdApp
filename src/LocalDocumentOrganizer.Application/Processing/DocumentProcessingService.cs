@@ -152,6 +152,7 @@ public sealed class DocumentProcessingService
             work.TargetRevision,
             work.CommitOperationId,
             work.ContentSha256,
+            work.SourceBinding,
             work.RequestedLanguages,
             work.RequestedCapabilities);
 

@@ -2,7 +2,9 @@ using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text.Json;
 using LocalDocumentOrganizer.Application.Processing;
+using LocalDocumentOrganizer.Application.Products;
 using LocalDocumentOrganizer.Core.Documents;
+using LocalDocumentOrganizer.Infrastructure.Windows.FileSystem;
 
 namespace LocalDocumentOrganizer.Infrastructure.Windows.Documents;
 
@@ -18,6 +20,77 @@ public interface IImmutableVaultExtractionSourceResolver
         CancellationToken cancellationToken);
 }
 
+public sealed class ContentAddressedVaultExtractionSourceResolver(
+    ApprovedRootPathGuard vaultRoot,
+    string expectedWorkerPackageIdentity) : IImmutableVaultExtractionSourceResolver
+{
+    public async Task<ImmutableVaultExtractionSource> OpenAsync(
+        DocumentProcessingRequest request,
+        CancellationToken cancellationToken)
+    {
+        var binding = request.SourceBinding
+            ?? throw new DocumentExtractionException(DocumentExtractionFailureCode.InvalidSourceHandle);
+        if (!binding.IsValid)
+            throw new DocumentExtractionException(DocumentExtractionFailureCode.InvalidSourceHandle);
+        if (string.IsNullOrWhiteSpace(expectedWorkerPackageIdentity))
+            throw new DocumentExtractionException(DocumentExtractionFailureCode.InvalidSourceHandle);
+        var path = Path.Combine(vaultRoot.ApprovedRoot, "objects",
+            request.ContentSha256.Hex[..2], request.ContentSha256.Hex + binding.CanonicalExtension);
+        await using var source = vaultRoot.OpenVerifiedSourceFromApprovedRoot(path);
+        if (source.Length != binding.DeclaredLength
+            || !await HasExpectedMagicAsync(source, binding.Format, cancellationToken).ConfigureAwait(false)
+            || !CryptographicOperations.FixedTimeEquals(
+                await ComputeSha256Async(source, cancellationToken).ConfigureAwait(false),
+                request.ContentSha256.Bytes.Span))
+            throw new DocumentExtractionException(DocumentExtractionFailureCode.InvalidSourceFingerprint);
+        return new ImmutableVaultExtractionSource(path,
+            new DocumentSourceDescriptor(0, ToContainer(binding.Format), binding.CanonicalMimeType,
+                binding.DeclaredLength, ImmutableArray.CreateRange(request.ContentSha256.Bytes.ToArray())),
+            expectedWorkerPackageIdentity);
+    }
+
+    private static async Task<byte[]> ComputeSha256Async(
+        VerifiedStableSource source,
+        CancellationToken cancellationToken)
+    {
+        source.RequireSingleLink();
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[64 * 1024];
+        long offset = 0;
+        while (offset < source.Length)
+        {
+            var count = await RandomAccess.ReadAsync(
+                source.Handle,
+                buffer.AsMemory(0, (int)Math.Min(buffer.Length, source.Length - offset)),
+                offset,
+                cancellationToken).ConfigureAwait(false);
+            if (count == 0)
+                throw new DocumentExtractionException(DocumentExtractionFailureCode.InvalidSourceLength);
+            hash.AppendData(buffer, 0, count);
+            offset += count;
+        }
+        source.RequireSingleLink();
+        return hash.GetHashAndReset();
+    }
+
+    private static async Task<bool> HasExpectedMagicAsync(VerifiedStableSource source, ProductDocumentSourceFormat format, CancellationToken cancellationToken)
+    {
+        var bytes = new byte[8];
+        var read = await RandomAccess.ReadAsync(source.Handle, bytes, 0, cancellationToken).ConfigureAwait(false);
+        return format switch
+        {
+            ProductDocumentSourceFormat.Pdf => read >= 5 && bytes.AsSpan(0, 5).SequenceEqual("%PDF-"u8),
+            ProductDocumentSourceFormat.Jpeg => read >= 3 && bytes.AsSpan(0, 3).SequenceEqual(new byte[] { 0xFF, 0xD8, 0xFF }),
+            ProductDocumentSourceFormat.Png => read >= 8 && bytes.AsSpan().SequenceEqual(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }),
+            ProductDocumentSourceFormat.Tiff => read >= 4 && (bytes.AsSpan(0, 4).SequenceEqual(new byte[] { 73, 73, 42, 0 }) || bytes.AsSpan(0, 4).SequenceEqual(new byte[] { 77, 77, 0, 42 })),
+            _ => false,
+        };
+    }
+
+    private static DocumentContainerKind ToContainer(ProductDocumentSourceFormat format) =>
+        format == ProductDocumentSourceFormat.Pdf ? DocumentContainerKind.Pdf : DocumentContainerKind.RasterImage;
+}
+
 public sealed record ImmutableVaultExtractionSource(
     string FullyQualifiedVaultPath,
     DocumentSourceDescriptor Descriptor,
@@ -28,15 +101,19 @@ public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDisp
 {
     private readonly IImmutableVaultExtractionSourceResolver _sources;
     private readonly DocumentExtractionClient _client;
+    private readonly string _expectedWorkerPackageIdentity;
 
     public DocumentProcessingWorkerDispatcher(
         IImmutableVaultExtractionSourceResolver sources,
-        DocumentExtractionClient client)
+        DocumentExtractionClient client,
+        string expectedWorkerPackageIdentity)
     {
         ArgumentNullException.ThrowIfNull(sources);
         ArgumentNullException.ThrowIfNull(client);
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedWorkerPackageIdentity);
         _sources = sources;
         _client = client;
+        _expectedWorkerPackageIdentity = expectedWorkerPackageIdentity;
     }
 
     public async Task<DocumentProcessingDispatchResult> DispatchAsync(
@@ -45,8 +122,16 @@ public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDisp
     {
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (request.SourceBinding is null)
+                return DocumentProcessingDispatchResult.TransientFailure(DocumentProcessingFailureCode.ResponseBindingInvalid);
             var source = await _sources.OpenAsync(request, cancellationToken).ConfigureAwait(false);
-            if (source.Descriptor.DeclaredLength < 0
+            if (source.Descriptor.DeclaredLength != request.SourceBinding.DeclaredLength
+                || source.Descriptor.DeclaredMimeType != request.SourceBinding.CanonicalMimeType
+                || !string.Equals(
+                    source.WorkerPackageIdentity,
+                    _expectedWorkerPackageIdentity,
+                    StringComparison.Ordinal)
                 || !CryptographicOperations.FixedTimeEquals(
                     source.Descriptor.Sha256.AsSpan(), request.ContentSha256.Bytes.Span))
             {
@@ -84,7 +169,7 @@ public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDisp
                     request.DocumentId,
                     source.Descriptor.DeclaredLength,
                     request.ContentSha256,
-                    source.WorkerPackageIdentity),
+                    _expectedWorkerPackageIdentity),
                 protectedDraft,
                 IsComplete(evaluation.Response),
                 SuggestMarket(request.RequestedLanguages));

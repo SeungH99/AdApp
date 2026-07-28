@@ -188,12 +188,25 @@ public sealed class WindowsDocumentIntakeProcessor :
                 sha.Hex + inspection.Admission.CanonicalExtension);
             const string authenticatedMetadata =
                 """{"schemaVersion":1,"storage":"content-addressed"}""";
+            var sourceBinding = inspection.Admission.Container switch
+            {
+                AdmittedContainer.Pdf => new ProductDocumentSourceBinding(
+                    ProductDocumentSourceFormat.Pdf, "application/pdf", ".pdf", source.Length),
+                AdmittedContainer.Jpeg => new ProductDocumentSourceBinding(
+                    ProductDocumentSourceFormat.Jpeg, "image/jpeg", ".jpg", source.Length),
+                AdmittedContainer.Png => new ProductDocumentSourceBinding(
+                    ProductDocumentSourceFormat.Png, "image/png", ".png", source.Length),
+                AdmittedContainer.Tiff => new ProductDocumentSourceBinding(
+                    ProductDocumentSourceFormat.Tiff, "image/tiff", ".tiff", source.Length),
+                _ => throw new InvalidOperationException(),
+            };
             var payload = VaultImportJournalPayload.Create(
                 eventId,
                 documentId,
                 inboxId,
                 sha,
                 source.Length,
+                sourceBinding,
                 receivedAtUtc,
                 leaf,
                 authenticatedMetadata,

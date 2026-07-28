@@ -39,6 +39,7 @@ internal sealed record ProductImportPayload(
     string ReceivedAtUtc,
     string FileName,
     string AuthenticatedMetadata,
+    ProductDocumentSourceBinding? SourceBinding,
     string ExtractionAttemptId,
     int TargetExtractionRevision,
     string ExtractionCommitOperationId,
@@ -82,6 +83,7 @@ internal static class ProductEventPayloads
                 Utc(command.ReceivedAtUtc),
                 command.FileName,
                 command.AuthenticatedMetadata,
+                command.SourceBinding,
                 Canonical(command.ExtractionAttemptId.Value),
                 command.TargetExtractionRevision,
                 Canonical(command.ExtractionCommitOperationId.Value),
@@ -170,6 +172,7 @@ internal static class ProductEventPayloads
         Add(hash, Utc(command.ReceivedAtUtc));
         Add(hash, command.FileName);
         Add(hash, command.AuthenticatedMetadata);
+        Add(hash, SourceBindingFingerprintValue(command.SourceBinding));
         Add(hash, command.ExtractionAttemptId.Value);
         Add(hash, command.TargetExtractionRevision);
         Add(hash, command.ExtractionCommitOperationId.Value);
@@ -291,6 +294,16 @@ internal static class ProductEventPayloads
 
     private static void Add(IncrementalHash hash, Guid value) =>
         Add(hash, Canonical(value));
+
+    private static string SourceBindingFingerprintValue(
+        ProductDocumentSourceBinding? sourceBinding) =>
+        sourceBinding is null
+            ? string.Empty
+            : string.Join('|',
+                ((int)sourceBinding.Format).ToString(CultureInfo.InvariantCulture),
+                sourceBinding.CanonicalMimeType,
+                sourceBinding.CanonicalExtension,
+                sourceBinding.DeclaredLength.ToString(CultureInfo.InvariantCulture));
 
     private static void Add(IncrementalHash hash, long value) =>
         Add(hash, value.ToString(CultureInfo.InvariantCulture));
