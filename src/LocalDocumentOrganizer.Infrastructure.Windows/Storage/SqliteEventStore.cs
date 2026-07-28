@@ -13,6 +13,7 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
 internal enum SqliteOperationCommitFaultPoint
 {
+    BeforeAppendPathValidation,
     BeforeEventEncryption,
     BeforeEventInsert,
     BeforeProjection,
@@ -1078,6 +1079,8 @@ public sealed class SqliteEventStore : IEventStore, ISensitiveDataDeletionStore,
         ArgumentNullException.ThrowIfNull(command);
         ValidateAppendBatchIdentifiers(command.Events);
         RejectReservedDeletionEvents(command.Events);
+        _operationCommitFaults.ThrowIfRequested(
+            SqliteOperationCommitFaultPoint.BeforeAppendPathValidation);
         SqliteEventStoreSchema.ValidateVaultPath(
             _connectionString, _payloads.KeyRing.MaintenanceGate);
         await using var lease = await _payloads.KeyRing.MaintenanceGate.AcquireMutationAsync(cancellationToken);

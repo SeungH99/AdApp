@@ -1963,6 +1963,8 @@ public sealed class SqliteProductCommitStore :
             ProjectionRebuildRequiredException =>
                 new ProductRecoveryRequired(
                     ProductRecoveryKind.ProjectionRebuildRequired),
+            VaultOptionalSidecarBusyException =>
+                new ProductRecoveryRequired(ProductRecoveryKind.StorageBusy),
             SqliteException sqlite when sqlite.SqliteErrorCode is 5 or 6 =>
                 new ProductRecoveryRequired(ProductRecoveryKind.StorageBusy),
             _ when IsProtectedStateFailure(exception) =>

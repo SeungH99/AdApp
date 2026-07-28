@@ -16,6 +16,7 @@ namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
 internal enum ProductCommitFaultPoint
 {
+    BeforeAppendPathValidation,
     BeforeEvent,
     BeforeDocument,
     BeforeInbox,
@@ -58,7 +59,13 @@ internal sealed class ProductEventStoreFaultAdapter(
 {
     public void ThrowIfRequested(SqliteOperationCommitFaultPoint point)
     {
-        if (point == SqliteOperationCommitFaultPoint.BeforeEventInsert)
+        if (point
+            == SqliteOperationCommitFaultPoint.BeforeAppendPathValidation)
+        {
+            faults.ThrowIfRequested(
+                ProductCommitFaultPoint.BeforeAppendPathValidation);
+        }
+        else if (point == SqliteOperationCommitFaultPoint.BeforeEventInsert)
         {
             faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeEvent);
         }
