@@ -1,8 +1,10 @@
 using System.Buffers.Binary;
 using System.Collections.Immutable;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using LocalDocumentOrganizer.Core.Documents;
+using LocalDocumentOrganizer.Application.Intake;
 using LocalDocumentOrganizer.Infrastructure.Windows.FileSystem;
 using Microsoft.Win32.SafeHandles;
 
@@ -45,7 +47,8 @@ public sealed record DocumentExtractionEvaluationResult(
     DocumentExtractionResponse Response,
     ImmutableArray<byte> SourceSha256);
 
-public sealed class DocumentExtractionClient
+public sealed class DocumentExtractionClient :
+    IDocumentAdmissionInspector
 {
     private const int DiagnosticDrainLimit = 4096;
     private readonly string _workerExecutablePath;
@@ -201,6 +204,126 @@ public sealed class DocumentExtractionClient
         }
     }
 
+    public async Task<DocumentInspectionResponse> InspectDocumentAsync(
+        SafeFileHandle source,
+        DocumentSourceDescriptor descriptor,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(descriptor);
+        try
+        {
+            return await RunWithDeadlineAsync(
+                    cancellationToken,
+                    async deadline =>
+                    {
+                        deadline.ThrowIfCancellationRequested();
+                        if (source.IsClosed || source.IsInvalid)
+                        {
+                            throw new DocumentExtractionException(
+                                DocumentExtractionFailureCode
+                                    .InvalidSourceHandle);
+                        }
+
+                        SafeFileHandle? verificationHandle = null;
+                        try
+                        {
+                            verificationHandle =
+                                DuplicateReadOnly(source);
+                            deadline.ThrowIfCancellationRequested();
+                            await using var verified =
+                                VerifiedStableSource.Create(
+                                    verificationHandle);
+                            verificationHandle = null;
+                            return await InspectVerifiedAsync(
+                                    verified,
+                                    descriptor,
+                                    deadline)
+                                .ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            verificationHandle?.Dispose();
+                        }
+                    })
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (
+            exception is StableSourceBoundaryException
+                or FileSystemBoundaryException)
+        {
+            throw new DocumentExtractionException(
+                DocumentExtractionFailureCode.InvalidSourceHandle);
+        }
+    }
+
+    async Task<DocumentAdmissionInspectionResult>
+        IDocumentAdmissionInspector.InspectPdfAsync(
+            SafeHandle sourceHandle,
+            long verifiedLength,
+            ImmutableArray<byte> sha256,
+            CancellationToken cancellationToken)
+    {
+        if (sourceHandle is not SafeFileHandle source)
+        {
+            return DocumentAdmissionInspectionResult.SourceChanged();
+        }
+
+        try
+        {
+            var response = await InspectDocumentAsync(
+                    source,
+                    new DocumentSourceDescriptor(
+                        InheritedHandle: 1,
+                        DocumentContainerKind.Pdf,
+                        "application/pdf",
+                        verifiedLength,
+                        sha256),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (response.Outcome
+                == DocumentInspectionOutcome.Success)
+            {
+                return DocumentAdmissionInspectionResult.Inspected(
+                    response.PdfPageCount);
+            }
+
+            return response.FailureCode is
+                DocumentExtractionFailureCode.CorruptDocument
+                or DocumentExtractionFailureCode.EncryptedDocument
+                or DocumentExtractionFailureCode.UnsupportedDocument
+                or DocumentExtractionFailureCode.DecoderFailure
+                ? DocumentAdmissionInspectionResult.ContentUnreadable()
+                : response.FailureCode is
+                    DocumentExtractionFailureCode.InvalidSourceHandle
+                    or DocumentExtractionFailureCode
+                        .InvalidSourceFingerprint
+                    or DocumentExtractionFailureCode.InvalidSourceLength
+                    ? DocumentAdmissionInspectionResult.SourceChanged()
+                    : DocumentAdmissionInspectionResult.Unavailable();
+        }
+        catch (DocumentExtractionException exception)
+            when (exception.FailureCode
+                  == DocumentExtractionFailureCode.ExtractionCancelled
+                  && cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+        catch (DocumentExtractionException exception)
+            when (exception.FailureCode is
+                DocumentExtractionFailureCode.InvalidSourceHandle
+                or DocumentExtractionFailureCode
+                    .InvalidSourceFingerprint
+                or DocumentExtractionFailureCode.InvalidSourceLength)
+        {
+            return DocumentAdmissionInspectionResult.SourceChanged();
+        }
+        catch (DocumentExtractionException)
+        {
+            return DocumentAdmissionInspectionResult.Unavailable();
+        }
+    }
+
     public async Task<DocumentExtractionResponse> ExtractAsync(
         string sourcePath,
         DocumentSourceDescriptor descriptor,
@@ -303,6 +426,265 @@ public sealed class DocumentExtractionClient
         {
             throw new DocumentExtractionException(
                 DocumentExtractionFailureCode.InvalidSourceHandle);
+        }
+    }
+
+    private async Task<DocumentInspectionResponse>
+        InspectVerifiedAsync(
+        VerifiedStableSource source,
+        DocumentSourceDescriptor descriptor,
+        IDocumentExtractionDeadline deadline)
+    {
+        byte[]? initialHash = null;
+        try
+        {
+            deadline.ThrowIfCancellationRequested();
+            if (!File.Exists(_workerExecutablePath))
+            {
+                throw new DocumentExtractionException(
+                    DocumentExtractionFailureCode.WorkerTerminated);
+            }
+
+            source.RequireSingleLink();
+            if (descriptor.DeclaredLength != source.Length)
+            {
+                throw new DocumentExtractionException(
+                    DocumentExtractionFailureCode.InvalidSourceLength);
+            }
+
+            if (descriptor.ContainerKind != DocumentContainerKind.Pdf
+                || descriptor.DeclaredMimeType != "application/pdf")
+            {
+                throw new DocumentExtractionException(
+                    DocumentExtractionFailureCode
+                        .ContainerMimeTypeMismatch);
+            }
+
+            if (descriptor.Sha256.IsDefault
+                || descriptor.Sha256.Length
+                    != SHA256.HashSizeInBytes)
+            {
+                throw new DocumentExtractionException(
+                    DocumentExtractionFailureCode
+                        .InvalidSourceFingerprint);
+            }
+
+            initialHash = await _sourceHasher.ComputeSha256Async(
+                    source.Handle,
+                    source.Length,
+                    deadline.Token)
+                .ConfigureAwait(false);
+            if (initialHash.Length != SHA256.HashSizeInBytes
+                || !CryptographicOperations.FixedTimeEquals(
+                    initialHash,
+                    descriptor.Sha256.AsSpan()))
+            {
+                throw new DocumentExtractionException(
+                    DocumentExtractionFailureCode
+                        .InvalidSourceFingerprint);
+            }
+
+            DocumentWorkerSessionLease? worker = null;
+            Exception? primaryException = null;
+            try
+            {
+                IDocumentWorkerSession activeWorker;
+                Task<IDocumentWorkerSession> launch;
+                using (var launchSource =
+                       DuplicateReadOnly(source.Handle))
+                {
+                    deadline.ThrowIfCancellationRequested();
+                    launch = _workerLauncher.LaunchAsync(
+                        _workerExecutablePath,
+                        _workerArguments,
+                        launchSource,
+                        deadline.Capture());
+                    try
+                    {
+                        activeWorker = await launch
+                            .WaitAsync(deadline.Token)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        ObserveLateLaunch(launch);
+                        throw;
+                    }
+                }
+
+                worker = new DocumentWorkerSessionLease(
+                    activeWorker,
+                    _cleanupDiagnostics);
+                deadline.ThrowIfCancellationRequested();
+                var request = new DocumentInspectionRequest(
+                    DocumentExtractionProtocol.CurrentVersion,
+                    Guid.NewGuid(),
+                    new DocumentSourceDescriptor(
+                        activeWorker.InheritedSourceHandle,
+                        DocumentContainerKind.Pdf,
+                        "application/pdf",
+                        source.Length,
+                        ImmutableArray.Create(initialHash)));
+                var requestValidation =
+                    DocumentInspectionValidator.ValidateRequest(request);
+                if (!requestValidation.IsValid)
+                {
+                    worker.Abort();
+                    throw new DocumentExtractionException(
+                        requestValidation.FailureCode);
+                }
+
+                try
+                {
+                    await ReadWorkerReadinessAsync(
+                            activeWorker.StandardOutput,
+                            deadline.Token)
+                        .ConfigureAwait(false);
+                    await WriteInspectionRequestFrameAsync(
+                            activeWorker.StandardInput,
+                            request,
+                            deadline.Token)
+                        .ConfigureAwait(false);
+                    activeWorker.StandardInput.Dispose();
+
+                    var response =
+                        await ReadInspectionResponseFrameAsync(
+                                activeWorker.StandardOutput,
+                                deadline.Token)
+                            .ConfigureAwait(false);
+                    await activeWorker.WaitForExitAsync(deadline.Token)
+                        .ConfigureAwait(false);
+                    if (activeWorker.ExitCode != 0)
+                    {
+                        throw CreateTerminationFailure(activeWorker);
+                    }
+
+                    var responseValidation =
+                        DocumentInspectionValidator.ValidateResponse(
+                            request,
+                            response);
+                    if (!responseValidation.IsValid)
+                    {
+                        throw new DocumentExtractionException(
+                            responseValidation.FailureCode);
+                    }
+
+                    source.RequireSingleLink();
+                    if (WindowsFileSystemNative
+                            .GetStableSourceSnapshot(source.Handle)
+                            .Length
+                        != source.Length)
+                    {
+                        throw new DocumentExtractionException(
+                            DocumentExtractionFailureCode
+                                .InvalidSourceLength);
+                    }
+
+                    var finalHash =
+                        await _sourceHasher.ComputeSha256Async(
+                                source.Handle,
+                                source.Length,
+                                deadline.Token)
+                            .ConfigureAwait(false);
+                    try
+                    {
+                        if (!CryptographicOperations.FixedTimeEquals(
+                                initialHash,
+                                finalHash))
+                        {
+                            throw new DocumentExtractionException(
+                                DocumentExtractionFailureCode
+                                    .InvalidSourceFingerprint);
+                        }
+                    }
+                    finally
+                    {
+                        CryptographicOperations.ZeroMemory(finalHash);
+                    }
+
+                    return response;
+                }
+                catch (OperationCanceledException)
+                {
+                    worker.Abort();
+                    throw;
+                }
+                catch (FrameException exception)
+                {
+                    var failureCode =
+                        activeWorker.WasProcessMemoryLimitReached()
+                            ? DocumentExtractionFailureCode
+                                .WorkerMemoryLimitExceeded
+                            : exception.FailureCode;
+                    worker.Abort();
+                    await DrainDiagnosticsAsync(
+                            activeWorker,
+                            deadline.Token)
+                        .ConfigureAwait(false);
+                    throw new DocumentExtractionException(
+                        failureCode,
+                        exception);
+                }
+                catch (DocumentExtractionException)
+                {
+                    worker.Abort();
+                    await DrainDiagnosticsAsync(
+                            activeWorker,
+                            deadline.Token)
+                        .ConfigureAwait(false);
+                    throw;
+                }
+                catch (Exception exception) when (
+                    exception is IOException
+                        or JsonException
+                        or AppContainerLaunchException)
+                {
+                    worker.Abort();
+                    await DrainDiagnosticsAsync(
+                            activeWorker,
+                            deadline.Token)
+                        .ConfigureAwait(false);
+                    throw CreateTerminationFailure(
+                        activeWorker,
+                        exception);
+                }
+            }
+            catch (Exception exception)
+            {
+                primaryException = exception;
+                throw;
+            }
+            finally
+            {
+                if (worker is not null)
+                {
+                    await CleanupWorkerWithinDeadlineAsync(
+                            worker,
+                            primaryException,
+                            deadline)
+                        .ConfigureAwait(false);
+                }
+            }
+        }
+        catch (Exception exception) when (
+            exception is StableSourceBoundaryException
+                or FileSystemBoundaryException)
+        {
+            throw new DocumentExtractionException(
+                DocumentExtractionFailureCode.InvalidSourceHandle);
+        }
+        catch (AppContainerLaunchException exception)
+        {
+            throw new DocumentExtractionException(
+                DocumentExtractionFailureCode.WorkerTerminated,
+                exception);
+        }
+        finally
+        {
+            if (initialHash is not null)
+            {
+                CryptographicOperations.ZeroMemory(initialHash);
+            }
         }
     }
 
@@ -804,6 +1186,43 @@ public sealed class DocumentExtractionClient
         }
     }
 
+    private static async Task WriteInspectionRequestFrameAsync(
+        Stream output,
+        DocumentInspectionRequest request,
+        CancellationToken cancellationToken)
+    {
+        var payload = JsonSerializer.SerializeToUtf8Bytes(
+            request,
+            DocumentExtractionJsonContext.Default
+                .DocumentInspectionRequest);
+        try
+        {
+            if (payload.Length == 0
+                || payload.Length
+                    > DocumentExtractionLimits
+                        .MaxSerializedResponseBytes)
+            {
+                throw new FrameException(
+                    DocumentExtractionFailureCode.InvalidFraming);
+            }
+
+            var prefix = new byte[sizeof(int)];
+            BinaryPrimitives.WriteInt32LittleEndian(
+                prefix,
+                payload.Length);
+            await output.WriteAsync(prefix, cancellationToken)
+                .ConfigureAwait(false);
+            await output.WriteAsync(payload, cancellationToken)
+                .ConfigureAwait(false);
+            await output.FlushAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(payload);
+        }
+    }
+
     private static async Task<DocumentExtractionResponse> ReadResponseFrameAsync(
         Stream input,
         CancellationToken cancellationToken)
@@ -843,6 +1262,67 @@ public sealed class DocumentExtractionClient
                     payload,
                     DocumentExtractionJsonContext.Default
                         .DocumentExtractionResponse)
+                ?? throw new FrameException(
+                    DocumentExtractionFailureCode.InvalidFraming);
+        }
+        catch (JsonException exception)
+        {
+            throw new FrameException(
+                DocumentExtractionFailureCode.InvalidFraming,
+                exception);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(payload);
+        }
+    }
+
+    private static async Task<DocumentInspectionResponse>
+        ReadInspectionResponseFrameAsync(
+            Stream input,
+            CancellationToken cancellationToken)
+    {
+        var prefix = new byte[sizeof(int)];
+        await ReadExactlyAsync(input, prefix, cancellationToken)
+            .ConfigureAwait(false);
+        var payloadLength =
+            BinaryPrimitives.ReadInt32LittleEndian(prefix);
+        if (payloadLength <= 0)
+        {
+            throw new FrameException(
+                DocumentExtractionFailureCode.InvalidFraming);
+        }
+
+        if (payloadLength
+            > DocumentExtractionLimits.MaxSerializedResponseBytes)
+        {
+            throw new FrameException(
+                DocumentExtractionFailureCode.ResponseTooLarge);
+        }
+
+        var payload = new byte[payloadLength];
+        try
+        {
+            await ReadExactlyAsync(
+                    input,
+                    payload,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var trailing = new byte[1];
+            if (await input.ReadAsync(
+                        trailing,
+                        cancellationToken)
+                    .ConfigureAwait(false)
+                != 0)
+            {
+                throw new FrameException(
+                    DocumentExtractionFailureCode.InvalidFraming);
+            }
+
+            return JsonSerializer.Deserialize(
+                    payload,
+                    DocumentExtractionJsonContext.Default
+                        .DocumentInspectionResponse)
                 ?? throw new FrameException(
                     DocumentExtractionFailureCode.InvalidFraming);
         }

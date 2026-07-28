@@ -8,4 +8,6 @@ namespace LocalDocumentOrganizer.Core.Documents;
     UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow)]
 [JsonSerializable(typeof(DocumentExtractionRequest))]
 [JsonSerializable(typeof(DocumentExtractionResponse))]
+[JsonSerializable(typeof(DocumentInspectionRequest))]
+[JsonSerializable(typeof(DocumentInspectionResponse))]
 public sealed partial class DocumentExtractionJsonContext : JsonSerializerContext;

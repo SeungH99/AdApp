@@ -52,36 +52,11 @@ public static class DocumentExtractionValidator
             return Invalid(DocumentExtractionFailureCode.InvalidJobId);
         }
 
-        if (request.Source is null || request.Source.InheritedHandle == 0)
+        var sourceValidation =
+            DocumentSourceDescriptorValidator.Validate(request.Source);
+        if (!sourceValidation.IsValid)
         {
-            return Invalid(DocumentExtractionFailureCode.InvalidSourceHandle);
-        }
-
-        if (request.Source.Sha256.IsDefaultOrEmpty || request.Source.Sha256.Length != 32)
-        {
-            return Invalid(DocumentExtractionFailureCode.InvalidSourceFingerprint);
-        }
-
-        if (request.Source.DeclaredLength < 0)
-        {
-            return Invalid(DocumentExtractionFailureCode.InvalidSourceLength);
-        }
-
-        if (request.Source.DeclaredLength > DocumentExtractionLimits.MaxEncodedInputBytes)
-        {
-            return Invalid(DocumentExtractionFailureCode.InputTooLarge);
-        }
-
-        if (!IsSupportedMimeType(request.Source.DeclaredMimeType))
-        {
-            return Invalid(DocumentExtractionFailureCode.UnsupportedMimeType);
-        }
-
-        if (!MimeTypeMatchesContainer(
-                request.Source.DeclaredMimeType,
-                request.Source.ContainerKind))
-        {
-            return Invalid(DocumentExtractionFailureCode.ContainerMimeTypeMismatch);
+            return sourceValidation;
         }
 
         if (request.RequestedCapabilities == 0
@@ -224,24 +199,6 @@ public static class DocumentExtractionValidator
 
         return new DocumentContractValidationResult(true, DocumentExtractionFailureCode.None);
     }
-
-    private static bool IsSupportedMimeType(string? mimeType) =>
-        mimeType is "application/pdf"
-            or "image/jpeg"
-            or "image/png"
-            or "image/tiff"
-            or "image/bmp";
-
-    private static bool MimeTypeMatchesContainer(
-        string mimeType,
-        DocumentContainerKind containerKind) =>
-        containerKind switch
-        {
-            DocumentContainerKind.Pdf => mimeType == "application/pdf",
-            DocumentContainerKind.RasterImage => mimeType is
-                "image/jpeg" or "image/png" or "image/tiff" or "image/bmp",
-            _ => false,
-        };
 
     private static bool IsValidLanguageTag(string? language)
     {

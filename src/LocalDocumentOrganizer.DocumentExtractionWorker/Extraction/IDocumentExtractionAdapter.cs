@@ -12,3 +12,13 @@ public interface IDocumentExtractionAdapter
         DocumentExtractionRequest request,
         CancellationToken cancellationToken);
 }
+
+public interface IDocumentInspectionAdapter
+{
+    bool CanInspect(DocumentSourceDescriptor source);
+
+    Task<int> InspectPdfPageCountAsync(
+        InheritedSourceDocument source,
+        DocumentInspectionRequest request,
+        CancellationToken cancellationToken);
+}

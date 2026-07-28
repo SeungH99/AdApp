@@ -6,6 +6,11 @@ using LocalDocumentOrganizer.Core.Documents;
 
 namespace LocalDocumentOrganizer.DocumentExtractionWorker.Protocol;
 
+public sealed record DocumentWorkerRequestEnvelope(
+    DocumentWorkerOperation Operation,
+    DocumentExtractionRequest? ExtractionRequest,
+    DocumentInspectionRequest? InspectionRequest);
+
 public static class FramedJsonTransport
 {
     private const int PrefixLength = sizeof(int);
@@ -13,6 +18,23 @@ public static class FramedJsonTransport
     public static async Task<DocumentExtractionRequest> ReadRequestAsync(
         Stream input,
         CancellationToken cancellationToken)
+    {
+        var operation = await ReadOperationAsync(
+                input,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return operation.Operation
+                   == DocumentWorkerOperation.ExtractDocument
+               && operation.ExtractionRequest is not null
+            ? operation.ExtractionRequest
+            : throw new InvalidDataException(
+                "The protocol operation is not an extraction request.");
+    }
+
+    public static async Task<DocumentWorkerRequestEnvelope>
+        ReadOperationAsync(
+            Stream input,
+            CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(input);
 
@@ -40,10 +62,43 @@ public static class FramedJsonTransport
                 throw new InvalidDataException("The protocol stream contains trailing data.");
             }
 
-            return JsonSerializer.Deserialize(
+            using var document = JsonDocument.Parse(
+                payload.AsMemory(0, payloadLength));
+            if (!document.RootElement.TryGetProperty(
+                    "operation",
+                    out var operationElement))
+            {
+                var extraction = JsonSerializer.Deserialize(
+                        payload.AsSpan(0, payloadLength),
+                        DocumentExtractionJsonContext.Default
+                            .DocumentExtractionRequest)
+                    ?? throw new JsonException(
+                        "The extraction request payload is null.");
+                return new DocumentWorkerRequestEnvelope(
+                    DocumentWorkerOperation.ExtractDocument,
+                    extraction,
+                    InspectionRequest: null);
+            }
+
+            if (operationElement.ValueKind != JsonValueKind.Number
+                || !operationElement.TryGetInt32(out var operationValue)
+                || operationValue
+                    != (int)DocumentWorkerOperation.InspectDocument)
+            {
+                throw new InvalidDataException(
+                    "The protocol operation is invalid.");
+            }
+
+            var inspection = JsonSerializer.Deserialize(
                     payload.AsSpan(0, payloadLength),
-                    DocumentExtractionJsonContext.Default.DocumentExtractionRequest)
-                ?? throw new JsonException("The request payload is null.");
+                    DocumentExtractionJsonContext.Default
+                        .DocumentInspectionRequest)
+                ?? throw new JsonException(
+                    "The inspection request payload is null.");
+            return new DocumentWorkerRequestEnvelope(
+                DocumentWorkerOperation.InspectDocument,
+                ExtractionRequest: null,
+                inspection);
         }
         finally
         {
@@ -81,6 +136,44 @@ public static class FramedJsonTransport
         BinaryPrimitives.WriteInt32LittleEndian(prefix, payload.WrittenCount);
         await output.WriteAsync(prefix, cancellationToken).ConfigureAwait(false);
         await output.WriteAsync(payload.WrittenMemory, cancellationToken).ConfigureAwait(false);
+    }
+
+    public static async Task WriteInspectionResponseAsync(
+        Stream output,
+        DocumentInspectionResponse response,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(response);
+
+        using var payload = new BoundedPooledByteBufferWriter(
+            DocumentExtractionLimits.MaxSerializedResponseBytes);
+        try
+        {
+            using var writer = new Utf8JsonWriter(payload);
+            JsonSerializer.Serialize(
+                writer,
+                response,
+                DocumentExtractionJsonContext.Default
+                    .DocumentInspectionResponse);
+        }
+        catch (InvalidOperationException exception)
+        {
+            throw new InvalidDataException(
+                "The response exceeds the protocol limit.",
+                exception);
+        }
+
+        var prefix = new byte[PrefixLength];
+        BinaryPrimitives.WriteInt32LittleEndian(
+            prefix,
+            payload.WrittenCount);
+        await output.WriteAsync(prefix, cancellationToken)
+            .ConfigureAwait(false);
+        await output.WriteAsync(
+                payload.WrittenMemory,
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     private static async Task ReadExactlyAsync(

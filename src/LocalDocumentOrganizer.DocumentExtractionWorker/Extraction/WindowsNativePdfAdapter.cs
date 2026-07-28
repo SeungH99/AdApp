@@ -9,7 +9,9 @@ using Windows.Storage.Streams;
 
 namespace LocalDocumentOrganizer.DocumentExtractionWorker.Extraction;
 
-public sealed class WindowsNativePdfAdapter : IDocumentExtractionAdapter
+public sealed class WindowsNativePdfAdapter :
+    IDocumentExtractionAdapter,
+    IDocumentInspectionAdapter
 {
     internal const string AdapterIdentifier = "windows-native-pdf-ocr";
     internal const string AdapterApiVersion = "1";
@@ -23,6 +25,31 @@ public sealed class WindowsNativePdfAdapter : IDocumentExtractionAdapter
         source is not null
         && source.ContainerKind == DocumentContainerKind.Pdf
         && source.DeclaredMimeType == "application/pdf";
+
+    public bool CanInspect(DocumentSourceDescriptor source) =>
+        CanHandle(source);
+
+    public async Task<int> InspectPdfPageCountAsync(
+        InheritedSourceDocument source,
+        DocumentInspectionRequest request,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+        _ = DocumentMagicClassifier.Classify(
+            source.Content,
+            source.DeclaredMimeType,
+            source.ContainerKind);
+        var opened = await OpenPdfAsync(
+                source,
+                cancellationToken)
+            .ConfigureAwait(false);
+        using (opened.Stream)
+        {
+            return checked((int)opened.Document.PageCount);
+        }
+    }
 
     public Task<DocumentExtractionResponse> ExtractAsync(
         InheritedSourceDocument source,
@@ -59,36 +86,12 @@ public sealed class WindowsNativePdfAdapter : IDocumentExtractionAdapter
         var stopwatch = Stopwatch.StartNew();
         try
         {
-            using var randomAccess = await WindowsExtractionSupport
-                .CopyToRandomAccessStreamAsync(
-                    source.Content,
-                    source.VerifiedLength,
+            var opened = await OpenPdfAsync(
+                    source,
                     cancellationToken)
                 .ConfigureAwait(false);
-            PdfDocument document;
-            try
-            {
-                document = await PdfDocument.LoadFromStreamAsync(randomAccess)
-                    .AsTask(cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception exception) when (
-                exception.HResult == WrongPasswordHResult)
-            {
-                throw new EncryptedDocumentException(
-                    "Password-protected PDFs are not supported.",
-                    exception);
-            }
-            catch (Exception exception)
-            {
-                throw new CorruptDocumentException(
-                    "Windows could not parse the PDF document.",
-                    exception);
-            }
+            using var randomAccess = opened.Stream;
+            var document = opened.Document;
             DocumentMagicClassifier.ValidatePdfPageCount(document.PageCount);
             if (document.IsPasswordProtected)
             {
@@ -212,4 +215,55 @@ public sealed class WindowsNativePdfAdapter : IDocumentExtractionAdapter
                 exception);
         }
     }
+
+    private static async Task<OpenedPdf> OpenPdfAsync(
+        InheritedSourceDocument source,
+        CancellationToken cancellationToken)
+    {
+        var randomAccess = await WindowsExtractionSupport
+            .CopyToRandomAccessStreamAsync(
+                source.Content,
+                source.VerifiedLength,
+                cancellationToken)
+            .ConfigureAwait(false);
+        try
+        {
+            PdfDocument document;
+            try
+            {
+                document = await PdfDocument
+                    .LoadFromStreamAsync(randomAccess)
+                    .AsTask(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception exception) when (
+                exception.HResult == WrongPasswordHResult)
+            {
+                throw new EncryptedDocumentException(
+                    "Password-protected PDFs are not supported.",
+                    exception);
+            }
+            catch (Exception exception)
+            {
+                throw new CorruptDocumentException(
+                    "Windows could not parse the PDF document.",
+                    exception);
+            }
+
+            return new OpenedPdf(randomAccess, document);
+        }
+        catch
+        {
+            randomAccess.Dispose();
+            throw;
+        }
+    }
+
+    private sealed record OpenedPdf(
+        InMemoryRandomAccessStream Stream,
+        PdfDocument Document);
 }

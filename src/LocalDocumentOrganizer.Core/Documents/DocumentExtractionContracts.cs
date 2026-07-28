@@ -40,6 +40,12 @@ public enum DocumentContainerKind
     RasterImage = 2,
 }
 
+public enum DocumentWorkerOperation
+{
+    ExtractDocument = 1,
+    InspectDocument = 2,
+}
+
 public enum EvidenceCoordinateSystem
 {
     PdfPagePoints = 1,
@@ -103,6 +109,33 @@ public sealed record DocumentSourceDescriptor(
     string DeclaredMimeType,
     long DeclaredLength,
     ImmutableArray<byte> Sha256);
+
+public sealed record DocumentSourceBinding(
+    long DeclaredLength,
+    ImmutableArray<byte> Sha256);
+
+public sealed record DocumentInspectionRequest(
+    int ProtocolVersion,
+    Guid RequestId,
+    DocumentSourceDescriptor Source)
+{
+    public DocumentWorkerOperation Operation =>
+        DocumentWorkerOperation.InspectDocument;
+}
+
+public enum DocumentInspectionOutcome
+{
+    Success = 1,
+    Failure = 2,
+}
+
+public sealed record DocumentInspectionResponse(
+    int ProtocolVersion,
+    Guid RequestId,
+    DocumentSourceBinding Source,
+    DocumentInspectionOutcome Outcome,
+    int PdfPageCount,
+    DocumentExtractionFailureCode FailureCode);
 
 public sealed record DocumentExtractionRequest(
     int ProtocolVersion,
