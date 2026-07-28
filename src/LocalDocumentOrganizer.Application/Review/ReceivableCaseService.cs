@@ -100,14 +100,13 @@ public sealed class ReceivableCaseService
             review.SourceIdentity.Hex,
             current.SourceIdentity.Hex,
             current.SourcePages.IsDefault
-                ? null
-                : current.SourcePages.ToImmutableDictionary(
-                    static page => page.SourceIndex,
+                ? ImmutableArray<ReceivableSourcePage>.Empty
+                : current.SourcePages.Select(
                     static page => new ReceivableSourcePage(
                         page.SourceIndex,
                         page.Width,
                         page.Height,
-                        page.CoordinateSystem))), null);
+                        page.CoordinateSystem)).ToImmutableArray()), null);
         if (decision.Failure is { } failure)
             return new(failure == ReceivableCaseFailureCode.IncomingInvoiceNotSupported
                 ? ReceivableCaseOutcome.NotSupportedInThisVersion : ReceivableCaseOutcome.ReviewInvalid,

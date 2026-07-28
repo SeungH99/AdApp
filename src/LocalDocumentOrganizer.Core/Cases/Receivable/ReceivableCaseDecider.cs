@@ -72,10 +72,10 @@ public sealed record CreateReceivableCaseCommand(
     decimal TotalAmount,
     string Currency,
     ImmutableDictionary<string, ConfirmedReceivableField> Fields,
-    int? CurrentExtractionRevision = null,
-    string? ReviewedSourceIdentity = null,
-    string? CurrentSourceIdentity = null,
-    ImmutableDictionary<int, ReceivableSourcePage>? SourcePages = null);
+    int CurrentExtractionRevision,
+    string ReviewedSourceIdentity,
+    string CurrentSourceIdentity,
+    ImmutableArray<ReceivableSourcePage> SourcePages);
 
 public sealed record ReceivableCaseCreated(
     CaseId CaseId,
@@ -120,11 +120,9 @@ public static class ReceivableCaseDecider
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.IdentityMismatch);
         if (existingCase is not null)
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.CaseAlreadyExists);
-        var currentExtractionRevision =
-            command.CurrentExtractionRevision ?? command.ExtractionRevision;
         if (command.ExtractionRevision <= 0 || command.ReviewRevision <= 0
-            || currentExtractionRevision <= 0
-            || command.ExtractionRevision != currentExtractionRevision
+            || command.CurrentExtractionRevision <= 0
+            || command.ExtractionRevision != command.CurrentExtractionRevision
             || !SourceBindingMatches(command))
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.StaleReviewRevision);
         if (command.ConfirmedMarket is not ("ko-KR" or "en-US"))
@@ -159,25 +157,47 @@ public static class ReceivableCaseDecider
 
     private static bool HasValidFields(
         ImmutableDictionary<string, ConfirmedReceivableField>? fields,
-        ImmutableDictionary<int, ReceivableSourcePage>? sourcePages) =>
+        ImmutableArray<ReceivableSourcePage> sourcePages) =>
         fields is not null
+        && HasValidSourcePages(sourcePages)
         && fields.Count == RequiredFields.Count
         && fields.Keys.ToImmutableHashSet(StringComparer.Ordinal).SetEquals(RequiredFields)
-        && fields.All(pair => pair.Key == pair.Value.FieldId
+        && fields.All(pair => pair.Value is not null
+            && pair.Key == pair.Value.FieldId
             && !string.IsNullOrWhiteSpace(pair.Value.ConfirmedNormalizedValue)
             && !pair.Value.Evidence.IsDefaultOrEmpty
             && pair.Value.Evidence.All(evidence =>
-                IsValidEvidence(evidence, sourcePages)));
+                evidence is not null
+                && IsValidEvidence(evidence, sourcePages)));
+
+    private static bool HasValidSourcePages(
+        ImmutableArray<ReceivableSourcePage> sourcePages)
+    {
+        if (sourcePages.IsDefaultOrEmpty
+            || sourcePages.Any(static page => page is null
+                || page.SourceIndex < 0
+                || !double.IsFinite(page.Width)
+                || !double.IsFinite(page.Height)
+                || page.Width <= 0
+                || page.Height <= 0
+                || !Enum.IsDefined(page.CoordinateSystem)))
+        {
+            return false;
+        }
+
+        var indexes = sourcePages
+            .Select(static page => page.SourceIndex)
+            .Order()
+            .ToArray();
+        return indexes.Distinct().Count() == indexes.Length
+            && indexes.Select((sourceIndex, position) =>
+                    sourceIndex == position)
+                .All(static contiguous => contiguous);
+    }
 
     private static bool SourceBindingMatches(
         CreateReceivableCaseCommand command)
     {
-        if (command.ReviewedSourceIdentity is null
-            && command.CurrentSourceIdentity is null)
-        {
-            return true;
-        }
-
         return IsSha256(command.ReviewedSourceIdentity)
             && IsSha256(command.CurrentSourceIdentity)
             && string.Equals(
@@ -194,24 +214,17 @@ public static class ReceivableCaseDecider
 
     private static bool IsValidEvidence(
         ReceivableEvidence evidence,
-        ImmutableDictionary<int, ReceivableSourcePage>? sourcePages)
+        ImmutableArray<ReceivableSourcePage> sourcePages)
     {
         if (!evidence.IsValid)
         {
             return false;
         }
-        if (sourcePages is null)
-        {
-            return true;
-        }
-        if (!sourcePages.TryGetValue(evidence.SourceIndex, out var page)
-            || page.SourceIndex != evidence.SourceIndex
-            || !Enum.IsDefined(page.CoordinateSystem)
+        var page = sourcePages.SingleOrDefault(
+            candidate => candidate.SourceIndex == evidence.SourceIndex);
+        if (page is null
             || evidence.CoordinateSystem != page.CoordinateSystem
-            || !double.IsFinite(page.Width)
-            || !double.IsFinite(page.Height)
-            || page.Width <= 0
-            || page.Height <= 0)
+            || !Enum.IsDefined(evidence.CoordinateSystem))
         {
             return false;
         }
