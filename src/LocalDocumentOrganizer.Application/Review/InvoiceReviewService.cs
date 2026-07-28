@@ -34,6 +34,14 @@ public sealed class InvoiceReviewService
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(command);
+        if (!command.Fields.IsDefault
+            && command.Fields.Any(static field =>
+                field is not null
+                && !field.Evidence.IsDefault
+                && field.Evidence.Any(static evidence => evidence is null)))
+        {
+            return Failed(InvoiceReviewFailureCode.EvidenceInvalid, command);
+        }
         if (!InvoiceReviewSubmissionFingerprint.TryCreate(
                 command,
                 out var submissionFingerprint))
