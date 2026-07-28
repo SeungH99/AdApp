@@ -17,6 +17,11 @@ using Microsoft.Data.Sqlite;
 
 namespace LocalDocumentOrganizer.Infrastructure.Windows.Storage;
 
+internal interface IProductReviewSnapshotReadBarrier
+{
+    ValueTask AfterRowsReadAsync(CancellationToken cancellationToken);
+}
+
 public sealed class SqliteProductCommitStore :
     IProductCommitStore,
     IProductQueryStore,
@@ -31,6 +36,7 @@ public sealed class SqliteProductCommitStore :
     private readonly SqliteProjectionRegistration _registration;
     private readonly SqliteProjectionRegistry _registry;
     private readonly SqliteEventStore _events;
+    private readonly IProductReviewSnapshotReadBarrier? _reviewReadBarrier;
 
     public SqliteProductCommitStore(
         string connectionString,
@@ -45,11 +51,13 @@ public sealed class SqliteProductCommitStore :
     internal SqliteProductCommitStore(
         string connectionString,
         TimeProvider? timeProvider,
-        IProductCommitFaultInjector? faultInjector)
+        IProductCommitFaultInjector? faultInjector,
+        IProductReviewSnapshotReadBarrier? reviewReadBarrier = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
         _connectionString =
             SqliteEventStoreSchema.CanonicalizeConnectionString(connectionString);
+        _reviewReadBarrier = reviewReadBarrier;
         var source = new SqliteConnectionStringBuilder(_connectionString).DataSource;
         if (string.IsNullOrWhiteSpace(source)
             || string.Equals(source, ":memory:", StringComparison.OrdinalIgnoreCase))
@@ -1072,31 +1080,125 @@ public sealed class SqliteProductCommitStore :
     {
         try
         {
-            var state = await ReadProjectedReviewStateAsync(
-                    documentId,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            var draftProjection = await LoadCurrentDraftAsync(
-                    documentId,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            var review = await LoadConfirmedAsync(documentId, cancellationToken)
-                .ConfigureAwait(false);
-            if (draftProjection is null)
+            await using var lease = await _keyRing.MaintenanceGate
+                .AcquireReadAsync(cancellationToken).ConfigureAwait(false);
+            await using var connection =
+                await SqliteEventStoreSchema.OpenConnectionAsync(
+                    _connectionString,
+                    _keyRing.MaintenanceGate,
+                    cancellationToken).ConfigureAwait(false);
+            await using var transaction = connection.BeginTransaction(deferred: true);
+            await ValidateReadBoundaryAsync(
+                connection,
+                transaction,
+                cancellationToken).ConfigureAwait(false);
+            var administrative = SqliteProjectionContexts.CreateAdministrative(
+                connection,
+                transaction,
+                _keyRing,
+                lease,
+                _registration);
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT d.content_sha256,i.current_extraction_revision,
+                       i.current_stream_version,i.status,
+                       rd.extraction_revision,rd.current_stream_version,
+                       rd.owner_kind,rd.owner_id,rd.key_id,rd.encryption_version,
+                       rd.payload_nonce,rd.payload_ciphertext,rd.payload_tag,
+                       r.extraction_revision,r.review_revision,
+                       r.owner_kind,r.owner_id,r.key_id,r.encryption_version,
+                       r.payload_nonce,r.payload_ciphertext,r.payload_tag
+                FROM product_documents d
+                JOIN product_inbox i ON i.document_id=d.document_id
+                LEFT JOIN product_review_drafts rd
+                    ON rd.document_id=d.document_id
+                LEFT JOIN product_reviews r
+                    ON r.document_id=d.document_id
+                WHERE d.document_id=$document;
+                """;
+            var logicalKey = ProductEventPayloads.Canonical(documentId.Value);
+            command.Parameters.AddWithValue("$document", logicalKey);
+            await using var reader = await command.ExecuteReaderAsync(
+                cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                throw new VaultRecoveryRequiredException();
+
+            var sourceIdentity = new ContentSha256((byte[])reader.GetValue(0));
+            var extractionRevision = reader.GetInt32(1);
+            var streamVersion = reader.GetInt64(2);
+            var rawStatus = reader.GetInt32(3);
+            ProjectedEncryptedValue? draftValue = reader.IsDBNull(4)
+                ? null
+                : ReadProjectedEncryptedValue(reader, 4, 5, null, 6);
+            ProjectedEncryptedValue? reviewValue = reader.IsDBNull(13)
+                ? null
+                : ReadProjectedEncryptedValue(reader, 13, null, 14, 15);
+            if (extractionRevision <= 0
+                || streamVersion < 0
+                || !Enum.IsDefined(typeof(ProductInboxStatus), rawStatus)
+                || await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
+                throw new VaultRecoveryRequiredException();
+            }
+            await reader.DisposeAsync().ConfigureAwait(false);
+            if (_reviewReadBarrier is not null)
+            {
+                await _reviewReadBarrier.AfterRowsReadAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            ConfirmedInvoiceReview? review = null;
+            if (reviewValue is not null)
+            {
+                var reviewPayload = await administrative.Values.UnprotectAsync(
+                    "product_reviews",
+                    "payload",
+                    logicalKey,
+                    reviewValue.Owner,
+                    reviewValue.KeyId,
+                    reviewValue.Encrypted,
+                    (plaintext, _) => ValueTask.FromResult(
+                        new UTF8Encoding(false, true).GetString(plaintext.Span)),
+                    cancellationToken).ConfigureAwait(false);
+                review = ParseReview(reviewPayload);
+                if (review.ExtractionRevision != reviewValue.ExtractionRevision
+                    || review.ReviewRevision != reviewValue.ReviewRevision)
+                {
+                    throw new VaultRecoveryRequiredException();
+                }
+            }
+
+            if (draftValue is null)
+            {
+                await transaction.CommitAsync(cancellationToken)
+                    .ConfigureAwait(false);
                 return null;
             }
-            if (draftProjection.ExtractionRevision != state.ExtractionRevision
-                || draftProjection.StreamVersion != state.StreamVersion)
+            if (draftValue.ExtractionRevision != extractionRevision
+                || draftValue.StreamVersion != streamVersion)
             {
                 throw new VaultRecoveryRequiredException();
             }
 
             if (review is not null
-                && !state.SourceIdentity.Equals(review.SourceIdentity))
+                && !sourceIdentity.Equals(review.SourceIdentity))
             {
                 throw new VaultRecoveryRequiredException();
             }
+
+            var draftPayload = await administrative.Values.UnprotectAsync(
+                "product_review_drafts",
+                "payload",
+                logicalKey,
+                draftValue.Owner,
+                draftValue.KeyId,
+                draftValue.Encrypted,
+                (plaintext, _) => ValueTask.FromResult(
+                    new UTF8Encoding(false, true).GetString(plaintext.Span)),
+                cancellationToken).ConfigureAwait(false);
+            var draft = AuthenticatedExtractionDraftSerializer.Deserialize(
+                draftPayload);
 
             var fields = review is null
                 ? ImmutableDictionary.Create<string, ReviewExtractionField>(
@@ -1107,18 +1209,21 @@ public sealed class SqliteProductCommitStore :
                         field.FieldId,
                         field.OriginalNormalizedValue),
                     StringComparer.Ordinal);
-            var sourcePages = draftProjection.Draft.Extraction.SourcePages;
-            return new InvoiceReviewSnapshot(
+            var sourcePages = draft.Extraction.SourcePages;
+            var snapshot = new InvoiceReviewSnapshot(
                 documentId,
-                state.SourceIdentity,
-                state.ExtractionRevision,
+                sourceIdentity,
+                extractionRevision,
                 review?.ReviewRevision ?? 0,
-                state.StreamVersion,
-                state.Status,
+                new StreamVersion(streamVersion),
+                (ProductInboxStatus)rawStatus,
                 fields,
                 sourcePages.Length,
-                draftProjection.Draft,
+                draft,
                 sourcePages);
+            await transaction.CommitAsync(cancellationToken)
+                .ConfigureAwait(false);
+            return snapshot;
         }
         catch (OperationCanceledException)
         {
@@ -1129,13 +1234,15 @@ public sealed class SqliteProductCommitStore :
             throw;
         }
         catch (Exception exception) when (
-            exception is ProjectionValueRecoveryRequiredException
+            exception is SqliteException
+                or ProjectionValueRecoveryRequiredException
                 or ExtractionDraftSerializationException
                 or JsonException
                 or DecoderFallbackException
                 or FormatException
                 or InvalidCastException
-                or OverflowException)
+                or OverflowException
+                or CryptographicException)
         {
             throw new VaultRecoveryRequiredException(exception);
         }
@@ -1763,6 +1870,38 @@ public sealed class SqliteProductCommitStore :
                 ProductEventPayloads.GuidValue(reader.GetString(idOrdinal))));
     }
 
+    private static ProjectedEncryptedValue ReadProjectedEncryptedValue(
+        SqliteDataReader reader,
+        int extractionRevisionOrdinal,
+        int? streamVersionOrdinal,
+        int? reviewRevisionOrdinal,
+        int ownerKindOrdinal)
+    {
+        var owner = ReadOwner(
+            reader,
+            ownerKindOrdinal,
+            ownerKindOrdinal + 1);
+        var keyId = new DataKeyId(
+            ProductEventPayloads.GuidValue(
+                reader.GetString(ownerKindOrdinal + 2)));
+        return new ProjectedEncryptedValue(
+            reader.GetInt32(extractionRevisionOrdinal),
+            streamVersionOrdinal is { } stream
+                ? reader.GetInt64(stream)
+                : null,
+            reviewRevisionOrdinal is { } review
+                ? reader.GetInt32(review)
+                : null,
+            owner,
+            keyId,
+            new EncryptedProjectionValue(
+                reader.GetInt32(ownerKindOrdinal + 3),
+                keyId,
+                (byte[])reader.GetValue(ownerKindOrdinal + 4),
+                (byte[])reader.GetValue(ownerKindOrdinal + 5),
+                (byte[])reader.GetValue(ownerKindOrdinal + 6)));
+    }
+
     private static PayloadProtection DocumentProtection(DocumentId documentId) =>
         new PayloadProtection.Shreddable(
             new SensitiveObjectRef(
@@ -1842,6 +1981,14 @@ public sealed class SqliteProductCommitStore :
         int ExtractionRevision,
         StreamVersion StreamVersion,
         AuthenticatedExtractionDraft Draft);
+
+    private sealed record ProjectedEncryptedValue(
+        int ExtractionRevision,
+        long? StreamVersion,
+        int? ReviewRevision,
+        SensitiveObjectRef Owner,
+        DataKeyId KeyId,
+        EncryptedProjectionValue Encrypted);
 
     private sealed record TodayProtectedPayload(
         int Version,
