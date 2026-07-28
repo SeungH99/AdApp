@@ -30,6 +30,12 @@ internal interface IProductCommitFaultInjector
 internal sealed class InjectedProductCommitFaultException(ProductCommitFaultPoint point)
     : InvalidOperationException($"Injected product commit fault at {point}.");
 
+internal sealed class ProductProjectionConflictException(ProductConflictKind kind)
+    : InvalidOperationException("The product projection precondition was not satisfied.")
+{
+    internal ProductConflictKind Kind { get; } = kind;
+}
+
 internal sealed class NoOpProductCommitFaultInjector : IProductCommitFaultInjector
 {
     internal static NoOpProductCommitFaultInjector Instance { get; } = new();
@@ -63,7 +69,7 @@ internal sealed class SqliteProductProjection(
     IProductCommitFaultInjector? faultInjector = null) : ISqliteProjection
 {
     internal const string ProjectionName = "product";
-    internal const int ProjectionSchemaVersion = 6;
+    internal const int ProjectionSchemaVersion = 7;
 
     private const string SchemaSql = """
         CREATE TABLE IF NOT EXISTS product_documents(
@@ -80,6 +86,7 @@ internal sealed class SqliteProductProjection(
             received_at_utc TEXT NOT NULL,
             status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 8),
             current_stream_version INTEGER NOT NULL DEFAULT 0 CHECK(current_stream_version>=0),
+            current_extraction_revision INTEGER NOT NULL DEFAULT 0 CHECK(current_extraction_revision>=0),
             owner_kind INTEGER NOT NULL,
             owner_id TEXT NOT NULL CHECK(length(owner_id)=36),
             key_id TEXT NOT NULL CHECK(length(key_id)=36),
@@ -194,6 +201,21 @@ internal sealed class SqliteProductProjection(
         var legacyOutbox =
             !await OutboxHasExtractionFieldsAsync(context, cancellationToken)
             .ConfigureAwait(false);
+        var legacyInbox =
+            !await InboxHasExtractionRevisionAsync(context, cancellationToken)
+                .ConfigureAwait(false);
+        if (legacyInbox)
+        {
+            await ExecuteAsync(
+                context.Connection,
+                context.Transaction,
+                """
+                ALTER TABLE product_inbox
+                ADD COLUMN current_extraction_revision INTEGER NOT NULL DEFAULT 0
+                    CHECK(current_extraction_revision>=0);
+                """,
+                cancellationToken).ConfigureAwait(false);
+        }
         if (legacyOutbox)
         {
             await ExecuteAsync(
@@ -205,7 +227,7 @@ internal sealed class SqliteProductProjection(
         await ExecuteAsync(context.Connection, context.Transaction, SchemaSql, cancellationToken)
             .ConfigureAwait(false);
         return new ProjectionCompatibilityResult(
-            existing == Tables.Length && !legacyOutbox
+            existing == Tables.Length && !legacyOutbox && !legacyInbox
                 ? ProjectionCompatibility.Compatible
                 : ProjectionCompatibility.CreatedEmpty);
     }
@@ -405,6 +427,12 @@ internal sealed class SqliteProductProjection(
         {
             if (extractionRevision <= 0 || reviewRevision <= 0)
                 throw new VaultRecoveryRequiredException();
+            await RequireReviewCommitPreconditionAsync(
+                context,
+                documentId,
+                extractionRevision,
+                reviewRevision,
+                cancellationToken).ConfigureAwait(false);
             var encrypted = await context.Values.ProtectAsync("product_reviews", "payload",
                 ProductEventPayloads.Canonical(documentId), context.Values.BoundOwner,
                 context.Values.BoundDataKeyId, Encoding.UTF8.GetBytes(payload.AuthenticatedPayload), cancellationToken).ConfigureAwait(false);
@@ -467,15 +495,37 @@ internal sealed class SqliteProductProjection(
             complete.Parameters.AddWithValue("$revision", replayRevision);
             RequireSingle(await complete.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false));
         }
+        int? currentExtractionRevision = null;
+        if (kind == "extraction-committed")
+        {
+            currentExtractionRevision = payload.ClaimTargetRevision
+                ?? await ReadNextExtractionRevisionAsync(
+                    context,
+                    documentId,
+                    cancellationToken).ConfigureAwait(false);
+            if (currentExtractionRevision <= 0)
+                throw new VaultRecoveryRequiredException();
+        }
         _faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeInbox);
         await using (var update = context.Connection.CreateCommand())
         {
             update.Transaction = context.Transaction;
-            update.CommandText = """
-                UPDATE product_inbox SET status=$status,current_stream_version=$version WHERE document_id=$document;
-                """;
+            update.CommandText = currentExtractionRevision is null
+                ? """
+                  UPDATE product_inbox
+                  SET status=$status,current_stream_version=$version
+                  WHERE document_id=$document;
+                  """
+                : """
+                  UPDATE product_inbox
+                  SET status=$status,current_stream_version=$version,
+                      current_extraction_revision=$extraction_revision
+                  WHERE document_id=$document;
+                  """;
             update.Parameters.AddWithValue("$status", (int)status);
             update.Parameters.AddWithValue("$version", replayEvent.Metadata.StreamVersion.Value);
+            if (currentExtractionRevision is { } revision)
+                update.Parameters.AddWithValue("$extraction_revision", revision);
             update.Parameters.AddWithValue(
                 "$document",
                 ProductEventPayloads.Canonical(documentId));
@@ -518,11 +568,21 @@ internal sealed class SqliteProductProjection(
         {
             await using var confirmed = context.Connection.CreateCommand();
             confirmed.Transaction = context.Transaction;
-            confirmed.CommandText = "SELECT 1 FROM product_reviews WHERE document_id=$document AND review_revision=$review;";
+            confirmed.CommandText = """
+                SELECT 1
+                FROM product_reviews r
+                JOIN product_inbox i ON i.document_id=r.document_id
+                WHERE r.document_id=$document
+                  AND r.review_revision=$review
+                  AND r.extraction_revision=i.current_extraction_revision
+                  AND i.status=$reviewed;
+                """;
             confirmed.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(documentId));
             confirmed.Parameters.AddWithValue("$review", confirmedReviewRevision);
+            confirmed.Parameters.AddWithValue("$reviewed", (int)ProductInboxStatus.Reviewed);
             if (await confirmed.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is null)
-                throw new VaultRecoveryRequiredException();
+                throw new ProductProjectionConflictException(
+                    ProductConflictKind.StreamVersionMismatch);
         }
         var logicalKey = ProductEventPayloads.Canonical(caseId);
         var metadata = await context.Values.ProtectAsync(
@@ -623,6 +683,66 @@ internal sealed class SqliteProductProjection(
             null,
             null,
             cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task RequireReviewCommitPreconditionAsync(
+        SqliteProjectionApplyContext context,
+        Guid documentId,
+        int extractionRevision,
+        int reviewRevision,
+        CancellationToken cancellationToken)
+    {
+        await using var command = context.Connection.CreateCommand();
+        command.Transaction = context.Transaction;
+        command.CommandText = """
+            SELECT i.current_extraction_revision,i.status,
+                   COALESCE(r.review_revision,0)
+            FROM product_inbox i
+            LEFT JOIN product_reviews r ON r.document_id=i.document_id
+            WHERE i.document_id=$document;
+            """;
+        command.Parameters.AddWithValue(
+            "$document",
+            ProductEventPayloads.Canonical(documentId));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            throw new ProductProjectionConflictException(
+                ProductConflictKind.StreamVersionMismatch);
+        var currentExtractionRevision = reader.GetInt32(0);
+        var rawStatus = reader.GetInt32(1);
+        var currentReviewRevision = reader.GetInt32(2);
+        if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+            || currentExtractionRevision != extractionRevision
+            || rawStatus is not ((int)ProductInboxStatus.ReadyForReview)
+                and not ((int)ProductInboxStatus.NeedsReview)
+            || reviewRevision != checked(currentReviewRevision + 1))
+        {
+            throw new ProductProjectionConflictException(
+                ProductConflictKind.StreamVersionMismatch);
+        }
+    }
+
+    private static async Task<int> ReadNextExtractionRevisionAsync(
+        SqliteProjectionApplyContext context,
+        Guid documentId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = context.Connection.CreateCommand();
+        command.Transaction = context.Transaction;
+        command.CommandText = """
+            SELECT current_extraction_revision
+            FROM product_inbox
+            WHERE document_id=$document;
+            """;
+        command.Parameters.AddWithValue(
+            "$document",
+            ProductEventPayloads.Canonical(documentId));
+        var value = await command.ExecuteScalarAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return value is long revision && revision >= 0 && revision < int.MaxValue
+            ? checked((int)revision + 1)
+            : throw new VaultRecoveryRequiredException();
     }
 
     public async Task PurgeOwnerAsync(
@@ -931,6 +1051,25 @@ internal sealed class SqliteProductProjection(
             return false;
         command.CommandText = "SELECT 1 FROM sqlite_master WHERE type='index' AND name='product_outbox_extraction_revision';";
         return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+    }
+
+    private static async Task<bool> InboxHasExtractionRevisionAsync(
+        SqliteProjectionAdministrativeContext context,
+        CancellationToken cancellationToken)
+    {
+        await using var command = context.Connection.CreateCommand();
+        command.Transaction = context.Transaction;
+        command.CommandText = """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type='table' AND name='product_inbox';
+            """;
+        var schema = await command.ExecuteScalarAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return schema is not string sql
+            || sql.Contains(
+                "current_extraction_revision",
+                StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task InsertOutboxAsync(
