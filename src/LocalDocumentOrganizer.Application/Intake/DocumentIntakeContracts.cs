@@ -39,6 +39,7 @@ public enum DocumentIntakeFailureCode
     StorageUnavailable = 15,
     ProductCommitConflict = 16,
     RecoveryEvidenceInvalid = 17,
+    RasterDimensionsUnavailable = 18,
 }
 
 public sealed record DocumentIntakeRequest
@@ -122,6 +123,7 @@ public sealed record DocumentIntakeReceipt(
 public sealed record DocumentIntakeQueueState(
     int Capacity,
     int QueuedCount,
+    int WaitingCount,
     int ActiveCount,
     long AcceptedCount,
     long CompletedCount);

@@ -9,10 +9,10 @@ public sealed class DocumentIntakeService :
     private readonly IDocumentIntakeProcessor _processor;
     private readonly Channel<QueuedIntake> _channel;
     private readonly CancellationTokenSource _shutdown = new();
-    private readonly SemaphoreSlim _writerGate = new(1, 1);
     private readonly Task _consumer;
     private readonly int _capacity;
     private int _queued;
+    private int _waiting;
     private int _active;
     private long _accepted;
     private long _completed;
@@ -63,6 +63,7 @@ public sealed class DocumentIntakeService :
         new(
             _capacity,
             Volatile.Read(ref _queued),
+            Volatile.Read(ref _waiting),
             Volatile.Read(ref _active),
             Interlocked.Read(ref _accepted),
             Interlocked.Read(ref _completed));
@@ -101,9 +102,8 @@ public sealed class DocumentIntakeService :
             Guid.NewGuid(),
             request,
             cancellationToken);
-        await _writerGate.WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
         var written = false;
+        Interlocked.Increment(ref _waiting);
         try
         {
             while (await _channel.Writer.WaitToWriteAsync(
@@ -121,7 +121,7 @@ public sealed class DocumentIntakeService :
         }
         finally
         {
-            _writerGate.Release();
+            Interlocked.Decrement(ref _waiting);
         }
 
         ObjectDisposedException.ThrowIf(!written, this);
@@ -142,9 +142,13 @@ public sealed class DocumentIntakeService :
                 Interlocked.Increment(ref _active);
                 try
                 {
+                    using var processingCancellation =
+                        CancellationTokenSource.CreateLinkedTokenSource(
+                            item.CancellationToken,
+                            _shutdown.Token);
                     var result = await _processor.ProcessAsync(
                             item.Request,
-                            item.CancellationToken)
+                            processingCancellation.Token)
                         .ConfigureAwait(false);
                     item.Completion.TrySetResult(result);
                 }
@@ -153,9 +157,11 @@ public sealed class DocumentIntakeService :
                     item.Completion.TrySetCanceled(
                         exception.CancellationToken);
                 }
-                catch (Exception exception)
+                catch (Exception)
                 {
-                    item.Completion.TrySetException(exception);
+                    item.Completion.TrySetResult(
+                        DocumentIntakeResult.RetryRequired(
+                            DocumentIntakeFailureCode.StorageUnavailable));
                 }
                 finally
                 {

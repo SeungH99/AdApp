@@ -126,6 +126,12 @@ internal static class DocumentAdmissionInspector
                         DocumentIntakeFailureCode.DecodedPixelLimitExceeded);
                 }
             }
+            else
+            {
+                return (
+                    null,
+                    DocumentIntakeFailureCode.RasterDimensionsUnavailable);
+            }
 
             return (
                 new DocumentAdmission(actual, CanonicalExtension(actual)),
@@ -250,6 +256,8 @@ internal static class DocumentAdmissionInspector
         out long height,
         out long decodedPixels)
     {
+        long frameWidth = 0;
+        var sawZeroHeightFrame = false;
         var offset = 2;
         while (offset + 3 < bytes.Length)
         {
@@ -270,7 +278,12 @@ internal static class DocumentAdmissionInspector
             }
 
             var marker = bytes[offset++];
-            if (marker is 0xd8 or 0xd9
+            if (marker == 0xd9)
+            {
+                break;
+            }
+
+            if (marker is 0x00 or 0x01 or 0xd8
                 || marker is >= 0xd0 and <= 0xd7)
             {
                 continue;
@@ -291,12 +304,39 @@ internal static class DocumentAdmissionInspector
 
             if (IsStartOfFrame(marker) && segmentLength >= 7)
             {
-                height =
+                var frameHeight =
                     BinaryPrimitives.ReadUInt16BigEndian(bytes[(offset + 3)..]);
-                width =
+                frameWidth =
                     BinaryPrimitives.ReadUInt16BigEndian(bytes[(offset + 5)..]);
-                decodedPixels = SaturatingProduct(width, height);
-                return width > 0 && height > 0;
+                if (frameWidth <= 0)
+                {
+                    break;
+                }
+
+                if (frameHeight > 0)
+                {
+                    width = frameWidth;
+                    height = frameHeight;
+                    decodedPixels = SaturatingProduct(width, height);
+                    return true;
+                }
+
+                sawZeroHeightFrame = true;
+            }
+            else if (marker == 0xdc
+                     && sawZeroHeightFrame
+                     && segmentLength == 4)
+            {
+                var lineCount =
+                    BinaryPrimitives.ReadUInt16BigEndian(
+                        bytes[(offset + 2)..]);
+                if (lineCount > 0)
+                {
+                    width = frameWidth;
+                    height = lineCount;
+                    decodedPixels = SaturatingProduct(width, height);
+                    return true;
+                }
             }
 
             offset += segmentLength;

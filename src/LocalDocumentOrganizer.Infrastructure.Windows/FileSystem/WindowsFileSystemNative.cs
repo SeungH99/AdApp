@@ -222,7 +222,7 @@ internal static class WindowsFileSystemNative
         RequireWindows();
         var handle = CreateFile(
             ToExtendedPath(canonicalPath),
-            GenericRead | Delete,
+            GenericRead | GenericWrite | Delete,
             FileShareRead | FileShareDelete,
             IntPtr.Zero,
             OpenExisting,

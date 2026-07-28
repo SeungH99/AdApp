@@ -146,11 +146,13 @@ public sealed record TransitionOperationCommand
                 "The verified transition requires the applied destination identity.",
                 nameof(appliedIdentity));
         }
-        if (nextState != OperationJournalState.Verified
+        if (nextState is not (
+                OperationJournalState.Copying
+                or OperationJournalState.Verified)
             && appliedIdentity is not null)
         {
             throw new ArgumentException(
-                "The applied destination identity is accepted only at the verified transition.",
+                "The applied destination identity is accepted only at the copying or verified transition.",
                 nameof(appliedIdentity));
         }
         if (nextState != OperationJournalState.ManualRecovery
@@ -720,7 +722,9 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 {
                     throw new OperationJournalRecoveryRequiredException();
                 }
-                if (command.NextState == OperationJournalState.Verified
+                if (command.NextState is
+                        OperationJournalState.Copying
+                        or OperationJournalState.Verified
                     && !IdentitiesEqual(
                         current.AppliedIdentity,
                         command.AppliedIdentity))
@@ -751,7 +755,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
             }
 
             OperationJournalStateMachine.EnsureCanTransition(
-                row.Kind,
+                current.Kind,
                 row.State,
                 command.NextState);
             if (row.Revision != command.ExpectedRevision)
@@ -770,7 +774,9 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                     ? command.Identity
                     : current.Identity;
             var nextAppliedIdentity =
-                command.NextState == OperationJournalState.Verified
+                command.NextState is
+                    OperationJournalState.Copying
+                    or OperationJournalState.Verified
                     ? command.AppliedIdentity
                     : current.AppliedIdentity;
             var nextManualRecoveryEvidence =
@@ -788,7 +794,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 nextCommitFingerprint = null;
             }
             RequireCanonicalIdentity(
-                row.Kind,
+                current.Kind,
                 command.NextState,
                 nextRevision,
                 nextIdentity,
@@ -797,7 +803,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 command.NextState,
                 nextManualRecoveryEvidence);
             RequireCanonicalCommitFingerprint(
-                row.Kind,
+                current.Kind,
                 command.NextState,
                 nextRevision,
                 nextCommitFingerprint);
@@ -1278,12 +1284,12 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                     }
 
                     RequireCanonicalCommitFingerprint(
-                        row.Kind,
+                        intent.Kind,
                         row.State,
                         row.Revision,
                         payload.CommitFingerprint);
                     RequireCanonicalIdentity(
-                        row.Kind,
+                        intent.Kind,
                         row.State,
                         row.Revision,
                         payload.Identity,
@@ -1364,16 +1370,28 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
             FileOperationKind.CrossVolumeMove
             or FileOperationKind.UndoCrossVolumeMove
             or FileOperationKind.VaultImport;
-        var requiresAppliedIdentity = isCrossVolume
-            && (state is
-                    OperationJournalState.Verified
-                    or OperationJournalState.DeletingSource
+        var requiresAppliedIdentity = kind == FileOperationKind.VaultImport
+            ? state is
+                    OperationJournalState.Copying
+                    or OperationJournalState.Copied
+                    or OperationJournalState.Verified
+                    or OperationJournalState.Publishing
                     or OperationJournalState.FileApplied
                     or OperationJournalState.EventAndProjectionCommitted
                     or OperationJournalState.SideEffectsPending
                     or OperationJournalState.Completed
                 || state == OperationJournalState.ManualRecovery
-                    && revision >= 6);
+                    && revision >= 4
+            : isCrossVolume
+              && (state is
+                      OperationJournalState.Verified
+                      or OperationJournalState.DeletingSource
+                      or OperationJournalState.FileApplied
+                      or OperationJournalState.EventAndProjectionCommitted
+                      or OperationJournalState.SideEffectsPending
+                      or OperationJournalState.Completed
+                  || state == OperationJournalState.ManualRecovery
+                      && revision >= 6);
         if (requiresAppliedIdentity != (appliedIdentity is not null))
         {
             throw new OperationJournalRecoveryRequiredException();

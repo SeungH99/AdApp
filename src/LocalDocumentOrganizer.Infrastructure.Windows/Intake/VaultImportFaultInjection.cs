@@ -17,6 +17,8 @@ public enum VaultImportFaultPoint
     ProductCommitted,
     EventAndProjectionCommitted,
     SideEffectsPending,
+    SourceHashing,
+    AdmissionRevalidated,
 }
 
 internal interface IVaultImportFaultInjector

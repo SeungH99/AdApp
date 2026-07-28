@@ -79,6 +79,23 @@ public sealed record StableFileIdentity
             & fingerprintEqual;
     }
 
+    public bool IdentifiesSameFileObject(StableFileIdentity? other)
+    {
+        if (other is null)
+        {
+            return false;
+        }
+
+        var lengthEqual = Length == other.Length;
+        var volumeEqual = CryptographicOperations.FixedTimeEquals(
+            _volumeId,
+            other._volumeId);
+        var fileEqual = CryptographicOperations.FixedTimeEquals(
+            _fileId,
+            other._fileId);
+        return lengthEqual & volumeEqual & fileEqual;
+    }
+
     private static byte[] SnapshotNonEmpty(byte[] value, string parameterName)
     {
         ArgumentNullException.ThrowIfNull(value);

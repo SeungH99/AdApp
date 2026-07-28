@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text.Json;
 using LocalDocumentOrganizer.Application.Intake;
@@ -20,6 +21,8 @@ public sealed class WindowsDocumentIntakeProcessor :
     private const int SourceAttemptLimit = 3;
     private static readonly TimeSpan SourceRetryDelay =
         TimeSpan.FromMilliseconds(75);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim>
+        ImportGates = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly IOperationJournalStore _journal;
     private readonly IProductCommitStore _products;
@@ -27,6 +30,7 @@ public sealed class WindowsDocumentIntakeProcessor :
     private readonly TimeProvider _timeProvider;
     private readonly ApprovedRootFileStore _vault;
     private readonly IVaultImportFaultInjector _faultInjector;
+    private readonly SemaphoreSlim _importGate;
 
     public WindowsDocumentIntakeProcessor(
         string vaultRoot,
@@ -64,9 +68,50 @@ public sealed class WindowsDocumentIntakeProcessor :
         _faultInjector = faultInjector;
         _vault = new ApprovedRootFileStore(
             new ApprovedRootPathGuard(vaultRoot));
+        _importGate = ImportGates.GetOrAdd(
+            _vault.ApprovedRoot,
+            static _ => new SemaphoreSlim(1, 1));
     }
 
     public async Task<DocumentIntakeResult> ProcessAsync(
+        DocumentIntakeRequest request,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+        await _importGate.WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+        try
+        {
+            return await ProcessExclusiveAsync(request, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (InjectedVaultImportFaultException)
+        {
+            throw;
+        }
+        catch (OperationJournalRecoveryRequiredException)
+        {
+            return DocumentIntakeResult.ManualRecoveryRequired(
+                DocumentIntakeFailureCode.RecoveryEvidenceInvalid);
+        }
+        catch (Exception)
+        {
+            return DocumentIntakeResult.RetryRequired(
+                DocumentIntakeFailureCode.StorageUnavailable);
+        }
+        finally
+        {
+            _importGate.Release();
+        }
+    }
+
+    private async Task<DocumentIntakeResult> ProcessExclusiveAsync(
         DocumentIntakeRequest request,
         CancellationToken cancellationToken)
     {
@@ -99,6 +144,8 @@ public sealed class WindowsDocumentIntakeProcessor :
         }
 
         await using var source = sourceResult.Source;
+        _faultInjector.OnFaultPoint(
+            VaultImportFaultPoint.SourceHashing);
         var shaBytes = await source.ComputeSha256Async(cancellationToken)
             .ConfigureAwait(false);
         try
@@ -122,6 +169,8 @@ public sealed class WindowsDocumentIntakeProcessor :
                         inspection.Failure);
             }
 
+            _faultInjector.OnFaultPoint(
+                VaultImportFaultPoint.AdmissionRevalidated);
             source.Revalidate();
             var sha = new ContentSha256(shaBytes);
             var operationId = new OperationId(Guid.NewGuid());
@@ -194,22 +243,26 @@ public sealed class WindowsDocumentIntakeProcessor :
             _vault.EnsureDirectoryVerified(".staging");
             _vault.EnsureDirectoryVerified(
                 Path.Combine("objects", sha.Hex[..2]));
+            using var temporaryHandle = _vault.CreateNewPromotableVerified(
+                temporaryRelativePath,
+                source.Length);
+            using var temporaryProof =
+                VerifiedStableSource.Create(temporaryHandle);
+            var temporaryIdentity =
+                temporaryProof.CreateIdentity(shaBytes);
             entry = await AdvanceAsync(
                     entry,
                     OperationJournalState.Copying,
                     OperationSourceHealth.Healthy,
+                    appliedIdentity: temporaryIdentity,
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
             _faultInjector.OnFaultPoint(
                 VaultImportFaultPoint.Copying);
-
-            using var temporaryHandle = _vault.CreateNewPromotableVerified(
-                temporaryRelativePath,
-                source.Length);
             _faultInjector.OnFaultPoint(
                 VaultImportFaultPoint.TemporaryCreated);
             using (var destination =
-                   new RandomAccessDestinationStream(temporaryHandle))
+                   new RandomAccessDestinationStream(temporaryProof.Handle))
             {
                 await source.CopyToAsync(destination, cancellationToken)
                     .ConfigureAwait(false);
@@ -217,6 +270,8 @@ public sealed class WindowsDocumentIntakeProcessor :
             }
 
             source.Revalidate();
+            using var verifiedTemporary =
+                VerifiedStableSource.Create(temporaryHandle);
             entry = await AdvanceAsync(
                     entry,
                     OperationJournalState.Copied,
@@ -225,22 +280,20 @@ public sealed class WindowsDocumentIntakeProcessor :
                 .ConfigureAwait(false);
             _faultInjector.OnFaultPoint(VaultImportFaultPoint.Copied);
             var temporarySha = await ComputeShaAsync(
-                    temporaryHandle,
+                    verifiedTemporary.Handle,
                     source.Length,
                     cancellationToken)
                 .ConfigureAwait(false);
             if (!CryptographicOperations.FixedTimeEquals(
                     shaBytes,
-                    temporarySha))
+                    temporarySha)
+                || !temporaryIdentity.IdentifiesSameFileObject(
+                    verifiedTemporary.CreateIdentity(shaBytes)))
             {
                 throw new FileSystemBoundaryException(
                     "The immutable Vault copy failed verification.");
             }
 
-            using var temporaryProof =
-                VerifiedStableSource.Create(temporaryHandle);
-            var temporaryIdentity =
-                temporaryProof.CreateIdentity(temporarySha);
             entry = await AdvanceAsync(
                     entry,
                     OperationJournalState.Verified,
@@ -260,7 +313,7 @@ public sealed class WindowsDocumentIntakeProcessor :
 
             var ownership = new FilePromotionOwnership();
             var published = _vault.PromoteCreatedNoReplace(
-                temporaryProof.Handle,
+                verifiedTemporary.Handle,
                 temporaryRelativePath,
                 destinationRelativePath,
                 source.Length,
@@ -274,7 +327,7 @@ public sealed class WindowsDocumentIntakeProcessor :
                         cancellationToken)
                     .ConfigureAwait(false);
                 _vault.DeleteOwnedOnClose(
-                    temporaryProof,
+                    verifiedTemporary,
                     temporaryRelativePath,
                     source.Length);
             }
@@ -349,6 +402,22 @@ public sealed class WindowsDocumentIntakeProcessor :
     }
 
     public async Task RecoverPendingAsync(
+        CancellationToken cancellationToken)
+    {
+        await _importGate.WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+        try
+        {
+            await RecoverPendingExclusiveAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _importGate.Release();
+        }
+    }
+
+    private async Task RecoverPendingExclusiveAsync(
         CancellationToken cancellationToken)
     {
         var entries = await _journal.GetNonTerminalAsync(cancellationToken)
@@ -489,19 +558,49 @@ public sealed class WindowsDocumentIntakeProcessor :
 
                         await source.DisposeAsync().ConfigureAwait(false);
                         EnsureVaultDirectories(payload);
+                        StableFileIdentity temporaryIdentity;
+                        try
+                        {
+                            using var handle =
+                                _vault.CreateNewPromotableVerified(
+                                    payload.TemporaryRelativePath,
+                                    payload.Length);
+                            using var temporary =
+                                VerifiedStableSource.Create(handle);
+                            temporaryIdentity =
+                                temporary.CreateIdentity(expectedSha);
+                        }
+                        catch (Exception exception) when (
+                            exception is FileSystemBoundaryException
+                                or FileStoreEntryAlreadyExistsException)
+                        {
+                            await MarkManualAsync(
+                                    entry,
+                                    OperationManualRecoveryReason
+                                        .VaultImportTemporaryOwnershipAmbiguous,
+                                    cancellationToken)
+                                .ConfigureAwait(false);
+                            return;
+                        }
+
                         entry = await AdvanceAsync(
                                 entry,
                                 OperationJournalState.Copying,
                                 OperationSourceHealth.Healthy,
+                                appliedIdentity: temporaryIdentity,
                                 cancellationToken: cancellationToken)
                             .ConfigureAwait(false);
                         break;
                     }
                     case OperationJournalState.Copying:
                     {
-                        if (!await ResetOwnedTemporaryAsync(
+                        await using var temporary =
+                            await OpenOwnedTemporaryForCopyAsync(
+                                entry,
                                 payload,
-                                cancellationToken).ConfigureAwait(false))
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        if (temporary is null)
                         {
                             await MarkManualAsync(
                                     entry,
@@ -531,11 +630,9 @@ public sealed class WindowsDocumentIntakeProcessor :
                         }
 
                         await using (source)
-                        using (var handle = _vault.CreateNewPromotableVerified(
-                                   payload.TemporaryRelativePath,
-                                   payload.Length))
                         using (var destination =
-                               new RandomAccessDestinationStream(handle))
+                               new RandomAccessDestinationStream(
+                                   temporary.Handle))
                         {
                             await source.CopyToAsync(
                                     destination,
@@ -562,7 +659,7 @@ public sealed class WindowsDocumentIntakeProcessor :
                                 temporary,
                                 payload,
                                 expectedSha,
-                                expectedIdentity: null,
+                                entry.AppliedIdentity,
                                 cancellationToken).ConfigureAwait(false))
                         {
                             await MarkManualAsync(
@@ -578,8 +675,7 @@ public sealed class WindowsDocumentIntakeProcessor :
                                 entry,
                                 OperationJournalState.Verified,
                                 OperationSourceHealth.Healthy,
-                                appliedIdentity:
-                                    temporary!.CreateIdentity(expectedSha),
+                                appliedIdentity: entry.AppliedIdentity,
                                 cancellationToken: cancellationToken)
                             .ConfigureAwait(false);
                         break;
@@ -921,7 +1017,8 @@ public sealed class WindowsDocumentIntakeProcessor :
         _vault.EnsureDirectoryVerified(destinationParent);
     }
 
-    private async Task<bool> ResetOwnedTemporaryAsync(
+    private Task<VerifiedStableSource?> OpenOwnedTemporaryForCopyAsync(
+        OperationJournalEntry entry,
         VaultImportJournalPayload payload,
         CancellationToken cancellationToken)
     {
@@ -930,41 +1027,24 @@ public sealed class WindowsDocumentIntakeProcessor :
         VerifiedStableSource? temporary = null;
         try
         {
-            try
+            temporary = _vault.OpenExistingPromotableVerified(
+                payload.TemporaryRelativePath);
+            if (entry.AppliedIdentity is null
+                || temporary.Length != payload.Length
+                || !entry.AppliedIdentity.IdentifiesSameFileObject(
+                    temporary.CreateIdentity(
+                        entry.AppliedIdentity.KeyedFingerprint)))
             {
-                temporary = _vault.OpenExistingPromotableVerified(
-                    payload.TemporaryRelativePath);
-            }
-            catch (FileSystemBoundaryException)
-            {
-                temporary = null;
-            }
-            if (temporary is null)
-            {
-                return true;
+                temporary.Dispose();
+                return Task.FromResult<VerifiedStableSource?>(null);
             }
 
-            if (temporary.Length != payload.Length)
-            {
-                return false;
-            }
-
-            _vault.DeleteOwnedOnClose(
-                temporary,
-                payload.TemporaryRelativePath,
-                payload.Length);
-            return true;
+            return Task.FromResult<VerifiedStableSource?>(temporary);
         }
         catch (FileSystemBoundaryException)
         {
-            return false;
-        }
-        finally
-        {
-            if (temporary is not null)
-            {
-                await temporary.DisposeAsync().ConfigureAwait(false);
-            }
+            temporary?.Dispose();
+            return Task.FromResult<VerifiedStableSource?>(null);
         }
     }
 
@@ -988,7 +1068,7 @@ public sealed class WindowsDocumentIntakeProcessor :
                     actual,
                     expectedSha)
                 && (expectedIdentity is null
-                    || expectedIdentity.FixedTimeEquals(
+                    || expectedIdentity.IdentifiesSameFileObject(
                         temporary.CreateIdentity(actual)));
         }
         finally
