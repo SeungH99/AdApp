@@ -216,6 +216,45 @@ internal static class WindowsFileSystemNative
         }
     }
 
+    internal static SafeFileHandle OpenOwnedExistingPromotableFileHandle(
+        string canonicalPath)
+    {
+        RequireWindows();
+        var handle = CreateFile(
+            ToExtendedPath(canonicalPath),
+            GenericRead | Delete,
+            FileShareRead | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint | FileFlagSequentialScan,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw CreateNativeException(error);
+        }
+
+        try
+        {
+            var information = GetAttributeTagInfo(handle);
+            if ((information.FileAttributes
+                    & (FileAttributeDirectory
+                        | FileAttributeReparsePoint)) != 0)
+            {
+                throw new FileSystemBoundaryException(
+                    "The promotable entry is not an approved regular file.");
+            }
+
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
     internal static bool MoveNoReplace(
         string sourceCanonicalPath,
         string destinationCanonicalPath)

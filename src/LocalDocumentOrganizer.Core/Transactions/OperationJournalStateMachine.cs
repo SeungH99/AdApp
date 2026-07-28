@@ -38,6 +38,16 @@ public static class OperationJournalStateMachine
         new(FileOperationKind.UndoCrossVolumeMove, OperationJournalState.EventAndProjectionCommitted, OperationJournalState.SideEffectsPending),
         new(FileOperationKind.UndoCrossVolumeMove, OperationJournalState.SideEffectsPending, OperationJournalState.Completed),
 
+        new(FileOperationKind.VaultImport, OperationJournalState.IntentPersisted, OperationJournalState.IdentityLocked),
+        new(FileOperationKind.VaultImport, OperationJournalState.IdentityLocked, OperationJournalState.Copying),
+        new(FileOperationKind.VaultImport, OperationJournalState.Copying, OperationJournalState.Copied),
+        new(FileOperationKind.VaultImport, OperationJournalState.Copied, OperationJournalState.Verified),
+        new(FileOperationKind.VaultImport, OperationJournalState.Verified, OperationJournalState.Publishing),
+        new(FileOperationKind.VaultImport, OperationJournalState.Publishing, OperationJournalState.FileApplied),
+        new(FileOperationKind.VaultImport, OperationJournalState.FileApplied, OperationJournalState.EventAndProjectionCommitted),
+        new(FileOperationKind.VaultImport, OperationJournalState.EventAndProjectionCommitted, OperationJournalState.SideEffectsPending),
+        new(FileOperationKind.VaultImport, OperationJournalState.SideEffectsPending, OperationJournalState.Completed),
+
         new(FileOperationKind.SameVolumeMove, OperationJournalState.IntentPersisted, OperationJournalState.ManualRecovery),
         new(FileOperationKind.SameVolumeMove, OperationJournalState.IdentityLocked, OperationJournalState.ManualRecovery),
         new(FileOperationKind.SameVolumeMove, OperationJournalState.Renaming, OperationJournalState.ManualRecovery),
@@ -81,6 +91,16 @@ public static class OperationJournalStateMachine
         new(FileOperationKind.UndoCrossVolumeMove, OperationJournalState.FileApplied, OperationJournalState.ManualRecovery),
         new(FileOperationKind.UndoCrossVolumeMove, OperationJournalState.EventAndProjectionCommitted, OperationJournalState.ManualRecovery),
         new(FileOperationKind.UndoCrossVolumeMove, OperationJournalState.SideEffectsPending, OperationJournalState.ManualRecovery),
+
+        new(FileOperationKind.VaultImport, OperationJournalState.IntentPersisted, OperationJournalState.ManualRecovery),
+        new(FileOperationKind.VaultImport, OperationJournalState.IdentityLocked, OperationJournalState.ManualRecovery),
+        new(FileOperationKind.VaultImport, OperationJournalState.Copying, OperationJournalState.ManualRecovery),
+        new(FileOperationKind.VaultImport, OperationJournalState.Copied, OperationJournalState.ManualRecovery),
+        new(FileOperationKind.VaultImport, OperationJournalState.Verified, OperationJournalState.ManualRecovery),
+        new(FileOperationKind.VaultImport, OperationJournalState.Publishing, OperationJournalState.ManualRecovery),
+        new(FileOperationKind.VaultImport, OperationJournalState.FileApplied, OperationJournalState.ManualRecovery),
+        new(FileOperationKind.VaultImport, OperationJournalState.EventAndProjectionCommitted, OperationJournalState.ManualRecovery),
+        new(FileOperationKind.VaultImport, OperationJournalState.SideEffectsPending, OperationJournalState.ManualRecovery),
     ];
 
     public static OperationRecoveryDecision DecideSameVolumeRecovery(

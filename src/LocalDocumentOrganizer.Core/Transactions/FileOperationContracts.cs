@@ -10,6 +10,7 @@ public enum FileOperationKind
     UndoSameVolumeMove = 1,
     CrossVolumeMove = 2,
     UndoCrossVolumeMove = 3,
+    VaultImport = 4,
 }
 
 public sealed record StableFileIdentity

@@ -285,6 +285,61 @@ public sealed class ApprovedRootFileStore : IDisposable
         }
     }
 
+    public VerifiedStableSource OpenExistingPromotableVerified(
+        string relativePath)
+    {
+        var normalized = NormalizeRelativePath(relativePath);
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            RevalidateCore();
+            var absolute = GetAbsolutePath(normalized);
+            var parent = Path.GetDirectoryName(absolute)
+                ?? throw Boundary();
+            PinnedDirectoryPathScope? parentScope = null;
+            SafeFileHandle? opened = null;
+            try
+            {
+                parentScope = _guard.OpenPinnedDirectoryPath(parent);
+                ValidateDirectoryScope(
+                    parentScope,
+                    GetRelativeParent(normalized));
+                opened = WindowsFileSystemNative
+                    .OpenOwnedExistingPromotableFileHandle(absolute);
+                ValidateFileHandle(
+                    opened,
+                    normalized,
+                    expectedLength: null);
+                var source = VerifiedStableSource.Create(opened);
+                opened = null;
+                try
+                {
+                    source.Revalidate();
+                    ValidateFileHandle(
+                        source.Handle,
+                        normalized,
+                        source.Length);
+                    RevalidateCore();
+                    RetainDirectoryScope(
+                        parentScope,
+                        GetRelativeParent(normalized));
+                    parentScope = null;
+                    return source;
+                }
+                catch
+                {
+                    source.Dispose();
+                    throw;
+                }
+            }
+            finally
+            {
+                opened?.Dispose();
+                parentScope?.Dispose();
+            }
+        }
+    }
+
     public SafeFileHandle OpenExistingMutableVerified(
         string relativePath)
     {

@@ -14,6 +14,7 @@ public enum OperationJournalState
     SideEffectsPending = 9,
     Completed = 10,
     ManualRecovery = 11,
+    Publishing = DeletingSource,
 }
 
 public enum OperationSourceHealth
@@ -58,6 +59,11 @@ public enum OperationManualRecoveryReason
     UndoDifferentVolume = 11,
     UndoNativeAmbiguity = 12,
     UndoRaceDetected = 13,
+    VaultImportSourceChanged = 14,
+    VaultImportTemporaryOwnershipAmbiguous = 15,
+    VaultImportPublishedObjectMismatch = 16,
+    VaultImportProductCommitConflict = 17,
+    VaultImportEvidenceInvalid = 18,
 }
 
 public enum OperationManualRecoveryAction
@@ -67,6 +73,7 @@ public enum OperationManualRecoveryAction
     InspectAtomicCommitContributions = 2,
     RestoreUndoPreconditionsOrEscalate = 3,
     InspectUndoRaceWithoutMutation = 4,
+    InspectVaultImportEvidenceWithoutMutation = 5,
 }
 
 public sealed record OperationManualRecoveryEvidence

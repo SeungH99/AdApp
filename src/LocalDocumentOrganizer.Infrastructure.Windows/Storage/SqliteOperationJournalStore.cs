@@ -85,6 +85,8 @@ public sealed record TransitionOperationResult
 
 public sealed record TransitionOperationCommand
 {
+    private readonly byte[]? _commitFingerprint;
+
     public TransitionOperationCommand(
         OperationId operationId,
         long expectedRevision,
@@ -92,7 +94,8 @@ public sealed record TransitionOperationCommand
         OperationSourceHealth sourceHealth,
         StableFileIdentity? identity = null,
         OperationManualRecoveryEvidence? manualRecoveryEvidence = null,
-        StableFileIdentity? appliedIdentity = null)
+        StableFileIdentity? appliedIdentity = null,
+        byte[]? commitFingerprint = null)
     {
         if (operationId.Value == Guid.Empty)
         {
@@ -157,6 +160,14 @@ public sealed record TransitionOperationCommand
                 "Manual-recovery evidence is accepted only for a manual-recovery transition.",
                 nameof(manualRecoveryEvidence));
         }
+        if (commitFingerprint is { } fingerprint
+            && (nextState != OperationJournalState.EventAndProjectionCommitted
+                || fingerprint.Length != 32))
+        {
+            throw new ArgumentException(
+                "A product-commit fingerprint is accepted only at the commit boundary and must contain 32 bytes.",
+                nameof(commitFingerprint));
+        }
 
         OperationId = operationId;
         ExpectedRevision = expectedRevision;
@@ -173,6 +184,7 @@ public sealed record TransitionOperationCommand
                 ?? CreateUnspecifiedEvidence(
                     OperationJournalState.IntentPersisted)
             : null;
+        _commitFingerprint = commitFingerprint?.ToArray();
     }
 
     public OperationId OperationId { get; }
@@ -188,6 +200,9 @@ public sealed record TransitionOperationCommand
     public StableFileIdentity? AppliedIdentity { get; }
 
     public OperationManualRecoveryEvidence? ManualRecoveryEvidence { get; }
+
+    public byte[]? CommitFingerprint =>
+        _commitFingerprint?.ToArray();
 
     internal bool HasExplicitManualRecoveryEvidence { get; }
 
@@ -677,6 +692,13 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 keySession,
                 cancellationToken).ConfigureAwait(false);
             var current = currentPayload.Entry;
+            var suppliedCommitFingerprint =
+                command.CommitFingerprint;
+            if (suppliedCommitFingerprint is not null
+                && current.Kind != FileOperationKind.VaultImport)
+            {
+                throw new OperationJournalRecoveryRequiredException();
+            }
             if (command.NextState
                     == OperationJournalState.Completed)
             {
@@ -709,6 +731,14 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                     && command.HasExplicitManualRecoveryEvidence
                     && current.ManualRecoveryEvidence
                         != command.ManualRecoveryEvidence)
+                {
+                    throw new OperationJournalRecoveryRequiredException();
+                }
+                if (suppliedCommitFingerprint is not null
+                    && (currentPayload.CommitFingerprint is null
+                        || !CryptographicOperations.FixedTimeEquals(
+                            currentPayload.CommitFingerprint,
+                            suppliedCommitFingerprint)))
                 {
                     throw new OperationJournalRecoveryRequiredException();
                 }
@@ -750,6 +780,13 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         : TransitionOperationCommand
                             .CreateUnspecifiedEvidence(current.State)
                     : current.ManualRecoveryEvidence;
+            var nextCommitFingerprint =
+                suppliedCommitFingerprint
+                ?? currentPayload.CommitFingerprint;
+            if (nextCommitFingerprint is { Length: 0 })
+            {
+                nextCommitFingerprint = null;
+            }
             RequireCanonicalIdentity(
                 row.Kind,
                 command.NextState,
@@ -763,7 +800,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 row.Kind,
                 command.NextState,
                 nextRevision,
-                currentPayload.CommitFingerprint);
+                nextCommitFingerprint);
             var updatedAtUtc = NextTimestamp(row.UpdatedAtUtc);
             var nextEnvelope = await keySession.ResolveDataKeyAsync(
                 row.Owner,
@@ -787,7 +824,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                         nextAppliedIdentity,
                         current.RecoveryRecipe,
                         nextManualRecoveryEvidence,
-                        currentPayload.CommitFingerprint));
+                        nextCommitFingerprint));
                 },
                 cancellationToken).ConfigureAwait(false);
 
@@ -1235,7 +1272,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                     var intent = payload.Intent;
                     if (intent.OperationId != row.OperationId
                         || intent.Owner != row.Owner
-                        || intent.Kind != row.Kind)
+                        || StoredKind(intent.Kind) != row.Kind)
                     {
                         throw new OperationJournalRecoveryRequiredException();
                     }
@@ -1325,7 +1362,8 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
 
         var isCrossVolume = kind is
             FileOperationKind.CrossVolumeMove
-            or FileOperationKind.UndoCrossVolumeMove;
+            or FileOperationKind.UndoCrossVolumeMove
+            or FileOperationKind.VaultImport;
         var requiresAppliedIdentity = isCrossVolume
             && (state is
                     OperationJournalState.Verified
@@ -1367,6 +1405,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
                 or FileOperationKind.UndoSameVolumeMove => 5,
             FileOperationKind.CrossVolumeMove
                 or FileOperationKind.UndoCrossVolumeMove => 8,
+            FileOperationKind.VaultImport => 8,
             _ => throw new OperationJournalRecoveryRequiredException(),
         };
 
@@ -1380,7 +1419,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
             keyId,
             intent.Owner,
             intent.OperationId,
-            intent.Kind,
+            StoredKind(intent.Kind),
             state,
             revision,
             PayloadSchemaVersion);
@@ -1424,7 +1463,7 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         command.Parameters.Add("$operation_id", SqliteType.Text).Value =
             intent.OperationId.Value.ToString("D");
         command.Parameters.Add("$operation_kind", SqliteType.Integer).Value =
-            (int)intent.Kind;
+            (int)StoredKind(intent.Kind);
         command.Parameters.Add("$state", SqliteType.Integer).Value =
             (int)OperationJournalState.IntentPersisted;
         command.Parameters.Add("$revision", SqliteType.Integer).Value = 1L;
@@ -2186,6 +2225,11 @@ public sealed class SqliteOperationJournalStore : IOperationJournalStore
         kind is
             FileOperationKind.UndoSameVolumeMove
             or FileOperationKind.UndoCrossVolumeMove;
+
+    private static FileOperationKind StoredKind(FileOperationKind kind) =>
+        kind == FileOperationKind.VaultImport
+            ? FileOperationKind.CrossVolumeMove
+            : kind;
 
     private static void RequireCanonicalObject(
         JsonElement element,
