@@ -15,6 +15,7 @@ internal static class WindowsVaultPathGuard
     private const uint BackupSemantics = 0x02000000;
     private const int ErrorFileNotFound = 2;
     private const int ErrorPathNotFound = 3;
+    private const int ErrorAccessDenied = 5;
 
     internal static string NormalizeLocalDrivePath(string path)
     {
@@ -66,12 +67,27 @@ internal static class WindowsVaultPathGuard
         }
     }
 
-    internal static void RequireSafeForOpen(string path)
+    internal static void RequireSafeForOpen(string path) =>
+        RequireSafeForOpen(path, allowFinalDisappearance: false);
+
+    private static void RequireSafeOptionalForOpen(string path) =>
+        RequireSafeForOpen(path, allowFinalDisappearance: true);
+
+    private static void RequireSafeForOpen(
+        string path,
+        bool allowFinalDisappearance)
     {
         try
         {
             var fullPath = NormalizeLocalDrivePath(path);
-            RequireNoReparseOrShortAliases(fullPath);
+            RequireNoReparseOrShortAliases(
+                fullPath,
+                allowFinalDisappearance: allowFinalDisappearance);
+        }
+        catch (VaultOptionalSidecarBusyException) when (
+            allowFinalDisappearance)
+        {
+            throw;
         }
         catch (VaultRecoveryRequiredException)
         {
@@ -105,9 +121,9 @@ internal static class WindowsVaultPathGuard
     internal static void RequireSafeDatabaseSet(string databasePath)
     {
         RequireSafeForOpen(databasePath);
-        RequireSafeForOpen(databasePath + "-journal");
-        RequireSafeForOpen(databasePath + "-wal");
-        RequireSafeForOpen(databasePath + "-shm");
+        RequireSafeOptionalForOpen(databasePath + "-journal");
+        RequireSafeOptionalForOpen(databasePath + "-wal");
+        RequireSafeOptionalForOpen(databasePath + "-shm");
     }
 
     internal static void RequireSafeEntryShape(string path)
@@ -203,21 +219,37 @@ internal static class WindowsVaultPathGuard
 
     private static void RequireNoReparseOrShortAliases(
         string fullPath,
-        bool requireCanonicalSingleLink = true)
+        bool requireCanonicalSingleLink = true,
+        bool allowFinalDisappearance = false)
     {
         for (var current = fullPath; current.Length >= 3; current = Path.GetDirectoryName(current)!)
         {
-            if (!TryGetEntryAttributes(current, out var attributes)) continue;
+            var isFinal = string.Equals(
+                current,
+                fullPath,
+                StringComparison.OrdinalIgnoreCase);
+            if (!TryGetEntryAttributes(
+                    current,
+                    out var attributes,
+                    classifyAccessDeniedAsBusy:
+                        allowFinalDisappearance && isFinal))
+            {
+                continue;
+            }
 
             if ((attributes & FileAttributes.ReparsePoint) != 0)
                 throw new VaultRecoveryRequiredException();
 
-            if (string.Equals(current, fullPath, StringComparison.OrdinalIgnoreCase))
+            if (isFinal)
             {
                 if ((attributes & FileAttributes.Directory) != 0)
                     throw new VaultRecoveryRequiredException();
                 if (requireCanonicalSingleLink)
-                    RequireCanonicalSingleLinkFile(current);
+                {
+                    RequireCanonicalSingleLinkFile(
+                        current,
+                        allowFinalDisappearance);
+                }
             }
             else if ((attributes & FileAttributes.Directory) == 0)
             {
@@ -264,7 +296,10 @@ internal static class WindowsVaultPathGuard
         return stem[3] is >= '1' and <= '9' or '\u00B9' or '\u00B2' or '\u00B3';
     }
 
-    private static bool TryGetEntryAttributes(string path, out FileAttributes attributes)
+    private static bool TryGetEntryAttributes(
+        string path,
+        out FileAttributes attributes,
+        bool classifyAccessDeniedAsBusy = false)
     {
         var rawAttributes = GetFileAttributes(path);
         if (rawAttributes != InvalidFileAttributes)
@@ -279,11 +314,17 @@ internal static class WindowsVaultPathGuard
             attributes = default;
             return false;
         }
+        if (classifyAccessDeniedAsBusy && error == ErrorAccessDenied)
+        {
+            throw new VaultOptionalSidecarBusyException();
+        }
 
         throw new VaultRecoveryRequiredException();
     }
 
-    private static void RequireCanonicalSingleLinkFile(string path)
+    private static void RequireCanonicalSingleLinkFile(
+        string path,
+        bool allowDisappearance = false)
     {
         using var handle = CreateFile(
             path,
@@ -293,7 +334,33 @@ internal static class WindowsVaultPathGuard
             OpenExisting,
             BackupSemantics,
             IntPtr.Zero);
-        RequireCanonicalSingleLinkFile(path, handle);
+        if (allowDisappearance
+            && handle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            if (error is ErrorFileNotFound or ErrorPathNotFound)
+                return;
+            if (error == ErrorAccessDenied)
+                throw new VaultOptionalSidecarBusyException();
+        }
+        try
+        {
+            RequireCanonicalSingleLinkFile(path, handle);
+        }
+        catch (VaultRecoveryRequiredException)
+        {
+            if (!allowDisappearance
+                || TryGetEntryAttributes(
+                    path,
+                    out _,
+                    classifyAccessDeniedAsBusy: true))
+            {
+                throw;
+            }
+
+            // SQLite may unlink an optional WAL/SHM sidecar after this
+            // verifier opens it. Absence is safe; a replacement is not.
+        }
     }
 
     private static void RequireCanonicalSingleLinkFile(
@@ -371,4 +438,8 @@ internal static class WindowsVaultPathGuard
         public uint FileIndexHigh;
         public uint FileIndexLow;
     }
+}
+
+internal sealed class VaultOptionalSidecarBusyException : IOException
+{
 }

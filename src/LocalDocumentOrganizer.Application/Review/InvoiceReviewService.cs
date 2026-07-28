@@ -76,6 +76,14 @@ public sealed class InvoiceReviewService
         {
             throw;
         }
+        catch (InvoiceReviewStorageBusyException)
+        {
+            return await ReconcileBusyOperationAsync(
+                    command,
+                    submissionFingerprint,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
         catch
         {
             return new(
@@ -128,10 +136,30 @@ public sealed class InvoiceReviewService
 
         if (snapshot.InboxStatus == ProductInboxStatus.Reviewed)
         {
-            var existing = await _reviews.LoadConfirmedAsync(
-                    command.DocumentId,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            ConfirmedInvoiceReview? existing;
+            try
+            {
+                existing = await _reviews.LoadConfirmedAsync(
+                        command.DocumentId,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (InvoiceReviewStorageBusyException)
+            {
+                return await ReconcileBusyOperationAsync(
+                        command,
+                        submissionFingerprint,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                return Recovery(command);
+            }
             if (existing is not null
                 && existing.CommitOperationId == command.OperationId)
             {
@@ -172,7 +200,10 @@ public sealed class InvoiceReviewService
                 Kind: ProductConflictKind.StreamVersionMismatch,
             })
         {
-            return await MapStreamConflictAsync(command, cancellationToken)
+            return await MapStreamConflictAsync(
+                    command,
+                    submissionFingerprint,
+                    cancellationToken)
                 .ConfigureAwait(false);
         }
         if (commit is ProductRecoveryRequired
@@ -223,6 +254,10 @@ public sealed class InvoiceReviewService
             catch (OperationCanceledException)
             {
                 throw;
+            }
+            catch (InvoiceReviewStorageBusyException)
+            {
+                // The winning writer may still hold SQLite's write lock.
             }
             catch
             {
@@ -286,6 +321,7 @@ public sealed class InvoiceReviewService
 
     private async Task<InvoiceReviewResult> MapStreamConflictAsync(
         ConfirmInvoiceReviewCommand command,
+        string submissionFingerprint,
         CancellationToken cancellationToken)
     {
         try
@@ -320,6 +356,14 @@ public sealed class InvoiceReviewService
         catch (OperationCanceledException)
         {
             throw;
+        }
+        catch (InvoiceReviewStorageBusyException)
+        {
+            return await ReconcileBusyOperationAsync(
+                    command,
+                    submissionFingerprint,
+                    cancellationToken)
+                .ConfigureAwait(false);
         }
         catch
         {

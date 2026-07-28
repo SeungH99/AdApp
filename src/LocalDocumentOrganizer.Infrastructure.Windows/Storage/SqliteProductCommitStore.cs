@@ -936,6 +936,15 @@ public sealed class SqliteProductCommitStore :
         {
             throw;
         }
+        catch (VaultOptionalSidecarBusyException exception)
+        {
+            throw new InvoiceReviewStorageBusyException(exception);
+        }
+        catch (SqliteException exception) when (
+            exception.SqliteErrorCode is 5 or 6)
+        {
+            throw new InvoiceReviewStorageBusyException(exception);
+        }
         catch (VaultRecoveryRequiredException)
         {
             throw;
@@ -1056,6 +1065,15 @@ public sealed class SqliteProductCommitStore :
         catch (OperationCanceledException)
         {
             throw;
+        }
+        catch (VaultOptionalSidecarBusyException exception)
+        {
+            throw new InvoiceReviewStorageBusyException(exception);
+        }
+        catch (SqliteException exception) when (
+            exception.SqliteErrorCode is 5 or 6)
+        {
+            throw new InvoiceReviewStorageBusyException(exception);
         }
         catch (VaultRecoveryRequiredException)
         {
@@ -1228,6 +1246,15 @@ public sealed class SqliteProductCommitStore :
         catch (OperationCanceledException)
         {
             throw;
+        }
+        catch (VaultOptionalSidecarBusyException exception)
+        {
+            throw new InvoiceReviewStorageBusyException(exception);
+        }
+        catch (SqliteException exception) when (
+            exception.SqliteErrorCode is 5 or 6)
+        {
+            throw new InvoiceReviewStorageBusyException(exception);
         }
         catch (VaultRecoveryRequiredException)
         {

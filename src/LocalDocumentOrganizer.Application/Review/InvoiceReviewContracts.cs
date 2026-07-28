@@ -262,3 +262,11 @@ public interface IInvoiceReviewQueryStore
         OperationId operationId,
         CancellationToken cancellationToken);
 }
+
+public sealed class InvoiceReviewStorageBusyException : Exception
+{
+    public InvoiceReviewStorageBusyException(Exception? innerException = null)
+        : base("Review storage is temporarily busy.", innerException)
+    {
+    }
+}
