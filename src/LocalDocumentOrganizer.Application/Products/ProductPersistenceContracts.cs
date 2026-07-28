@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Core.Cases;
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
@@ -53,9 +54,13 @@ public sealed class ContentSha256 : IEquatable<ContentSha256>
 public enum ProductInboxStatus
 {
     Imported = 0,
-    Extracted = 1,
-    Reviewed = 2,
-    CaseCreated = 3,
+    Processing = 1,
+    ReadyForReview = 2,
+    NeedsReview = 3,
+    Unsupported = 4,
+    Failed = 5,
+    Reviewed = 6,
+    CaseCreated = 7,
 }
 
 public enum ProductCaseStatus
@@ -81,6 +86,33 @@ public sealed record CommitImportCommand
         DateTimeOffset receivedAtUtc,
         string fileName,
         string authenticatedMetadata)
+        : this(
+            operationId,
+            eventId,
+            documentId,
+            inboxId,
+            contentSha256,
+            receivedAtUtc,
+            fileName,
+            authenticatedMetadata,
+            new ExtractionAttemptId(Guid.NewGuid()),
+            targetExtractionRevision: 1,
+            extractionCommitOperationId: new OperationId(Guid.NewGuid()))
+    {
+    }
+
+    public CommitImportCommand(
+        OperationId operationId,
+        EventId eventId,
+        DocumentId documentId,
+        InboxId inboxId,
+        ContentSha256 contentSha256,
+        DateTimeOffset receivedAtUtc,
+        string fileName,
+        string authenticatedMetadata,
+        ExtractionAttemptId extractionAttemptId,
+        int targetExtractionRevision,
+        OperationId extractionCommitOperationId)
     {
         ValidateOperation(operationId, eventId);
         ValidateDocument(documentId);
@@ -97,6 +129,11 @@ public sealed record CommitImportCommand
         }
 
         ValidateProtectedText(authenticatedMetadata, nameof(authenticatedMetadata));
+        if (targetExtractionRevision != 1
+            || extractionCommitOperationId.Value == Guid.Empty)
+        {
+            throw new ArgumentOutOfRangeException(nameof(targetExtractionRevision));
+        }
         OperationId = operationId;
         EventId = eventId;
         DocumentId = documentId;
@@ -105,6 +142,9 @@ public sealed record CommitImportCommand
         ReceivedAtUtc = receivedAtUtc;
         FileName = fileName;
         AuthenticatedMetadata = authenticatedMetadata;
+        ExtractionAttemptId = extractionAttemptId;
+        TargetExtractionRevision = targetExtractionRevision;
+        ExtractionCommitOperationId = extractionCommitOperationId;
     }
 
     public OperationId OperationId { get; }
@@ -122,6 +162,13 @@ public sealed record CommitImportCommand
     public string FileName { get; }
 
     public string AuthenticatedMetadata { get; }
+
+    public ExtractionAttemptId ExtractionAttemptId { get; }
+
+    public int TargetExtractionRevision { get; }
+
+    public OperationId ExtractionCommitOperationId { get; }
+
 
     private static void ValidateProtectedText(string value, string parameterName)
     {
@@ -169,7 +216,8 @@ public sealed record CommitExtractionCommand
         DocumentId documentId,
         StreamVersion expectedVersion,
         DateTimeOffset extractedAtUtc,
-        string authenticatedExtraction)
+        string authenticatedExtraction,
+        ProductInboxStatus inboxStatus = ProductInboxStatus.ReadyForReview)
     {
         CommitImportCommand.ValidateOperation(operationId, eventId);
         CommitImportCommand.ValidateDocument(documentId);
@@ -177,12 +225,20 @@ public sealed record CommitExtractionCommand
         CommitImportCommand.ValidateProtectedPayload(
             authenticatedExtraction,
             nameof(authenticatedExtraction));
+        if (inboxStatus is not (ProductInboxStatus.ReadyForReview
+            or ProductInboxStatus.NeedsReview
+            or ProductInboxStatus.Unsupported
+            or ProductInboxStatus.Failed))
+        {
+            throw new ArgumentOutOfRangeException(nameof(inboxStatus));
+        }
         OperationId = operationId;
         EventId = eventId;
         DocumentId = documentId;
         ExpectedVersion = expectedVersion;
         ExtractedAtUtc = extractedAtUtc;
         AuthenticatedExtraction = authenticatedExtraction;
+        InboxStatus = inboxStatus;
     }
 
     public OperationId OperationId { get; }
@@ -196,6 +252,8 @@ public sealed record CommitExtractionCommand
     public DateTimeOffset ExtractedAtUtc { get; }
 
     public string AuthenticatedExtraction { get; }
+
+    public ProductInboxStatus InboxStatus { get; }
 }
 
 public sealed record CommitReviewCommand
