@@ -378,6 +378,31 @@ internal sealed class SqliteProductProjection(
         _ = ProductEventPayloads.UtcValue(payload.OccurredAtUtc);
         _ = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
         RequireOwner(context, SensitiveObjectKind.DocumentEvidence, documentId);
+        if (kind == "extraction-committed" && payload.ClaimOwnerId is not null)
+        {
+            if (payload.ClaimAttemptId is null
+                || payload.ClaimTargetRevision is null
+                || string.IsNullOrWhiteSpace(payload.ClaimLeaseExpiresAtUtc))
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+            await using var complete = context.Connection.CreateCommand();
+            complete.Transaction = context.Transaction;
+            complete.CommandText = """
+                UPDATE product_outbox
+                SET dispatch_status=3,lease_owner_id=NULL,lease_expires_at_utc=NULL
+                WHERE aggregate_id=$document AND extraction_attempt_id=$attempt
+                  AND target_extraction_revision=$revision
+                  AND lease_owner_id=$owner AND dispatch_status=1
+                  AND lease_expires_at_utc>=$occurred;
+                """;
+            complete.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(documentId));
+            complete.Parameters.AddWithValue("$attempt", ProductEventPayloads.Canonical(payload.ClaimAttemptId.Value));
+            complete.Parameters.AddWithValue("$revision", payload.ClaimTargetRevision.Value);
+            complete.Parameters.AddWithValue("$owner", ProductEventPayloads.Canonical(payload.ClaimOwnerId.Value));
+            complete.Parameters.AddWithValue("$occurred", ProductEventPayloads.UtcValue(payload.OccurredAtUtc).ToString("O"));
+            RequireSingle(await complete.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false));
+        }
         _faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeInbox);
         await using (var update = context.Connection.CreateCommand())
         {

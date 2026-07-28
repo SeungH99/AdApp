@@ -55,6 +55,10 @@ internal sealed record ProductDocumentProgressPayload(
     string OccurredAtUtc,
     string AuthenticatedPayload,
     int? InboxStatus,
+    Guid? ClaimOwnerId,
+    Guid? ClaimAttemptId,
+    int? ClaimTargetRevision,
+    string? ClaimLeaseExpiresAtUtc,
     string CommitFingerprint);
 
 internal sealed record ProductReceivableCasePayload(
@@ -104,6 +108,10 @@ internal static class ProductEventPayloads
                 Utc(command.ExtractedAtUtc),
                 command.AuthenticatedExtraction,
                 (int)command.InboxStatus,
+                command.ClaimBinding?.OwnerId,
+                command.ClaimBinding?.AttemptId,
+                command.ClaimBinding?.TargetRevision,
+                command.ClaimBinding is { } claim ? Utc(claim.LeaseExpiresAtUtc) : null,
                 Convert.ToHexString(fingerprint).ToLowerInvariant()));
 
     internal static byte[] SerializeReview(
@@ -114,6 +122,10 @@ internal static class ProductEventPayloads
                 Canonical(command.DocumentId.Value),
                 Utc(command.ReviewedAtUtc),
                 command.AuthenticatedReview,
+                null,
+                null,
+                null,
+                null,
                 null,
                 Convert.ToHexString(fingerprint).ToLowerInvariant()));
 

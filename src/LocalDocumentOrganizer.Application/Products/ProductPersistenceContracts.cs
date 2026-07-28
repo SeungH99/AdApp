@@ -218,7 +218,8 @@ public sealed record CommitExtractionCommand
         StreamVersion expectedVersion,
         DateTimeOffset extractedAtUtc,
         string authenticatedExtraction,
-        ProductInboxStatus inboxStatus = ProductInboxStatus.ReadyForReview)
+        ProductInboxStatus inboxStatus = ProductInboxStatus.ReadyForReview,
+        ExtractionClaimBinding? claimBinding = null)
     {
         CommitImportCommand.ValidateOperation(operationId, eventId);
         CommitImportCommand.ValidateDocument(documentId);
@@ -240,6 +241,7 @@ public sealed record CommitExtractionCommand
         ExtractedAtUtc = extractedAtUtc;
         AuthenticatedExtraction = authenticatedExtraction;
         InboxStatus = inboxStatus;
+        ClaimBinding = claimBinding;
     }
 
     public OperationId OperationId { get; }
@@ -255,7 +257,15 @@ public sealed record CommitExtractionCommand
     public string AuthenticatedExtraction { get; }
 
     public ProductInboxStatus InboxStatus { get; }
+
+    public ExtractionClaimBinding? ClaimBinding { get; }
 }
+
+public sealed record ExtractionClaimBinding(
+    Guid OwnerId,
+    Guid AttemptId,
+    int TargetRevision,
+    DateTimeOffset LeaseExpiresAtUtc);
 
 public sealed record CommitReviewCommand
 {

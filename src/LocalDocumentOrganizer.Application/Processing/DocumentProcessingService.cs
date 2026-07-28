@@ -103,7 +103,12 @@ public sealed class DocumentProcessingService
             success.AuthenticatedDraft,
             success.IsComplete
                 ? ProductInboxStatus.ReadyForReview
-                : ProductInboxStatus.NeedsReview);
+                : ProductInboxStatus.NeedsReview,
+            new ExtractionClaimBinding(
+                claim.OwnerId,
+                claim.Work.AttemptId.Value,
+                claim.Work.TargetRevision,
+                claim.Work.LeaseExpiresAtUtc ?? throw new InvalidOperationException()));
         await _outbox.CompleteAsync(
             new ExtractionOutboxCompletionCommand(
                 claim,
