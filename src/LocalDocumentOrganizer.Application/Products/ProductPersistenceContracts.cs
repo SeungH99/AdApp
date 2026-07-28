@@ -303,6 +303,20 @@ public sealed record CommitReviewCommand
         StreamVersion expectedVersion,
         DateTimeOffset reviewedAtUtc,
         string authenticatedReview)
+        : this(operationId, eventId, documentId, expectedVersion, reviewedAtUtc,
+            authenticatedReview, expectedExtractionRevision: null, reviewRevision: null)
+    {
+    }
+
+    public CommitReviewCommand(
+        OperationId operationId,
+        EventId eventId,
+        DocumentId documentId,
+        StreamVersion expectedVersion,
+        DateTimeOffset reviewedAtUtc,
+        string authenticatedReview,
+        int? expectedExtractionRevision,
+        int? reviewRevision)
     {
         CommitImportCommand.ValidateOperation(operationId, eventId);
         CommitImportCommand.ValidateDocument(documentId);
@@ -316,6 +330,10 @@ public sealed record CommitReviewCommand
         ExpectedVersion = expectedVersion;
         ReviewedAtUtc = reviewedAtUtc;
         AuthenticatedReview = authenticatedReview;
+        if (expectedExtractionRevision is <= 0 || reviewRevision is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(expectedExtractionRevision));
+        ExpectedExtractionRevision = expectedExtractionRevision;
+        ReviewRevision = reviewRevision;
     }
 
     public OperationId OperationId { get; }
@@ -329,6 +347,10 @@ public sealed record CommitReviewCommand
     public DateTimeOffset ReviewedAtUtc { get; }
 
     public string AuthenticatedReview { get; }
+
+    public int? ExpectedExtractionRevision { get; }
+
+    public int? ReviewRevision { get; }
 }
 
 public sealed record CommitReceivableCaseCommand
@@ -341,6 +363,20 @@ public sealed record CommitReceivableCaseCommand
         DateOnly dueDate,
         DateTimeOffset createdAtUtc,
         string authenticatedMetadata)
+        : this(operationId, eventId, caseId, sourceDocumentId, dueDate, createdAtUtc,
+            authenticatedMetadata, confirmedReviewRevision: null)
+    {
+    }
+
+    public CommitReceivableCaseCommand(
+        OperationId operationId,
+        EventId eventId,
+        CaseId caseId,
+        DocumentId sourceDocumentId,
+        DateOnly dueDate,
+        DateTimeOffset createdAtUtc,
+        string authenticatedMetadata,
+        int? confirmedReviewRevision)
     {
         CommitImportCommand.ValidateOperation(operationId, eventId);
         if (caseId.Value == Guid.Empty)
@@ -360,6 +396,9 @@ public sealed record CommitReceivableCaseCommand
         DueDate = dueDate;
         CreatedAtUtc = createdAtUtc;
         AuthenticatedMetadata = authenticatedMetadata;
+        if (confirmedReviewRevision is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(confirmedReviewRevision));
+        ConfirmedReviewRevision = confirmedReviewRevision;
     }
 
     public OperationId OperationId { get; }
@@ -375,6 +414,8 @@ public sealed record CommitReceivableCaseCommand
     public DateTimeOffset CreatedAtUtc { get; }
 
     public string AuthenticatedMetadata { get; }
+
+    public int? ConfirmedReviewRevision { get; }
 }
 
 public enum ProductConflictKind

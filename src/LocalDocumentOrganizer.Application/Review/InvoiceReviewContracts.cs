@@ -87,6 +87,17 @@ public sealed record ConfirmedInvoiceReviewField(
     bool IsCorrected,
     ImmutableArray<ReviewEvidence> Evidence);
 
+/// <summary>Bounded encrypted persistence shape; never accepted from UI.</summary>
+public sealed record PersistedConfirmedInvoiceReview(
+    string DocumentId,
+    string SourceIdentitySha256,
+    int ExtractionRevision,
+    int ReviewRevision,
+    string ConfirmedMarket,
+    bool IsOutboundInvoice,
+    DateTimeOffset ApprovedAtUtc,
+    ImmutableArray<ConfirmedInvoiceReviewField> Fields);
+
 public sealed record InvoiceReviewResult(
     InvoiceReviewOutcome Outcome,
     InvoiceReviewFailureCode FailureCode,

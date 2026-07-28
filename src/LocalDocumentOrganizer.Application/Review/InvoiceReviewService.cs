@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using LocalDocumentOrganizer.Application.Contracts;
 using LocalDocumentOrganizer.Application.Products;
+using LocalDocumentOrganizer.Core.Cases.Receivable;
 
 namespace LocalDocumentOrganizer.Application.Review;
 
@@ -11,8 +12,6 @@ public sealed class InvoiceReviewService
 {
     private static readonly ImmutableHashSet<string> RequiredFields =
         PilotCatalog.RequiredFieldIds.ToImmutableHashSet(StringComparer.Ordinal);
-    private static readonly ImmutableHashSet<string> SupportedCurrencies =
-        ImmutableHashSet.Create(StringComparer.Ordinal, "USD", "KRW");
 
     private readonly IInvoiceReviewQueryStore _reviews;
     private readonly IProductCommitStore _commits;
@@ -148,7 +147,7 @@ public sealed class InvoiceReviewService
                     && amount > 0 && SetAmount(amount, out display, out normalized);
             case "currency":
                 display = supplied.Trim().ToUpperInvariant(); normalized = display;
-                return SupportedCurrencies.Contains(display);
+                return Iso4217CurrencyCatalog.IsValid(display);
             default:
                 return false;
         }
@@ -162,7 +161,7 @@ public sealed class InvoiceReviewService
 
     private static string SerializeBounded(ConfirmedInvoiceReview review)
     {
-        var json = JsonSerializer.Serialize(new PersistedReview(
+        var json = JsonSerializer.Serialize(new PersistedConfirmedInvoiceReview(
             review.DocumentId.Value.ToString("D"), review.SourceIdentity.Hex,
             review.ExtractionRevision, review.ReviewRevision, review.ConfirmedMarket,
             review.IsOutboundInvoice, review.ApprovedAtUtc, review.Fields));
@@ -174,13 +173,4 @@ public sealed class InvoiceReviewService
     private static InvoiceReviewResult Failed(InvoiceReviewFailureCode failure, ConfirmInvoiceReviewCommand command) =>
         new(InvoiceReviewOutcome.InvalidReview, failure, null, command);
 
-    private sealed record PersistedReview(
-        string DocumentId,
-        string SourceIdentitySha256,
-        int ExtractionRevision,
-        int ReviewRevision,
-        string ConfirmedMarket,
-        bool IsOutboundInvoice,
-        DateTimeOffset ApprovedAtUtc,
-        ImmutableArray<ConfirmedInvoiceReviewField> Fields);
 }

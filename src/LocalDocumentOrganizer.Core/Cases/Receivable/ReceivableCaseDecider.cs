@@ -96,9 +96,6 @@ public static class ReceivableCaseDecider
             "issuer_name", "invoice_number", "issue_date", "payment_due_date",
             "total_amount", "currency");
 
-    private static readonly ImmutableHashSet<string> SupportedCurrencies =
-        ImmutableHashSet.Create(StringComparer.Ordinal, "USD", "KRW");
-
     public static ReceivableCaseDecision Decide(
         CreateReceivableCaseCommand command,
         CaseId? existingCase)
@@ -128,7 +125,7 @@ public static class ReceivableCaseDecider
         if (command.TotalAmount <= 0
             || !MatchesAmount(command.Fields["total_amount"].ConfirmedNormalizedValue, command.TotalAmount))
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.InvalidAmount);
-        if (!SupportedCurrencies.Contains(command.Currency)
+        if (!Iso4217CurrencyCatalog.IsValid(command.Currency)
             || !string.Equals(command.Fields["currency"].ConfirmedNormalizedValue, command.Currency, StringComparison.Ordinal))
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.InvalidCurrency);
 
