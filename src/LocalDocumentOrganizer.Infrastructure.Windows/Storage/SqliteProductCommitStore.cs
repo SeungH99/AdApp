@@ -835,13 +835,23 @@ public sealed class SqliteProductCommitStore :
     {
         var review = await LoadConfirmedAsync(documentId, cancellationToken).ConfigureAwait(false);
         if (review is null) return null;
-        var stream = await _events.ReadStreamAsync(new StreamId(documentId.Value), cancellationToken).ConfigureAwait(false);
-        if (stream.Count == 0) throw new VaultRecoveryRequiredException();
+        var version = await ReadProjectedStreamVersionAsync(documentId, cancellationToken).ConfigureAwait(false);
         return new InvoiceReviewSnapshot(documentId, review.SourceIdentity, review.ExtractionRevision,
-            review.ReviewRevision, stream[^1].Metadata.StreamVersion, ProductInboxStatus.Reviewed,
+            review.ReviewRevision, version, ProductInboxStatus.Reviewed,
             review.Fields.ToImmutableDictionary(field => field.FieldId,
                 field => new ReviewExtractionField(field.FieldId, field.OriginalNormalizedValue), StringComparer.Ordinal),
             review.Fields.SelectMany(field => field.Evidence).Select(e => e.Box.SourceIndex).DefaultIfEmpty(-1).Max() + 1);
+    }
+
+    private async Task<StreamVersion> ReadProjectedStreamVersionAsync(DocumentId documentId, CancellationToken cancellationToken)
+    {
+        await using var lease = await _keyRing.MaintenanceGate.AcquireReadAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await SqliteEventStoreSchema.OpenConnectionAsync(_connectionString, _keyRing.MaintenanceGate, cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT current_stream_version FROM product_inbox WHERE document_id=$document;";
+        command.Parameters.AddWithValue("$document", ProductEventPayloads.Canonical(documentId.Value));
+        var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return value is long raw && raw >= 0 ? new StreamVersion(raw) : throw new VaultRecoveryRequiredException();
     }
 
     private async Task<string?> LoadReviewPayloadAsync(DocumentId documentId, CancellationToken cancellationToken)
