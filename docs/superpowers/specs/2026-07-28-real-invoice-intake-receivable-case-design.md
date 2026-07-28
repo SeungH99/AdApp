@@ -143,7 +143,11 @@ product instance. A second launch redirects activation to the current instance
 and exits without opening the Vault.
 
 Document extraction remains out of process. This epic does not introduce a
-daemon, Windows service, or new IPC protocol.
+daemon, Windows service, or new IPC transport. The existing attested Worker
+protocol gains one admission-only `InspectDocument` operation that returns an
+authoritatively validated PDF page count. It reuses the existing source-byte
+binding, package attestation, limits, and AppContainer isolation, extracts no
+document fields, and exists only to enforce the pre-Vault page limit.
 
 Picker and drag/drop requests enter one bounded `Channel`. The import consumer
 processes one document at a time, and the extraction consumer runs one Worker
@@ -175,6 +179,10 @@ Responsibilities:
 - apply the existing extraction limits uniformly: at most 20 MiB encoded
   input, 20 PDF pages, 16,384 pixels per raster dimension, and 100,000,000
   decoded pixels;
+- use the existing attested Worker protocol's admission-only
+  `InspectDocument` operation for authoritative PDF page counting, including
+  object-stream and xref-stream documents; untrusted PDF parsing never moves
+  into the WinUI process;
 - obtain a stable read-only source handle;
 - bind source identity, length, and SHA-256;
 - check the content index for an existing document;
@@ -709,9 +717,9 @@ finding above. Run with Codex; checkbox as you ship.
   - Surfaced by: Architecture review 1A, performance review 9A, Outside Voice 11A.
   - Files: `src/LocalDocumentOrganizer.Core/`, `src/LocalDocumentOrganizer.Infrastructure.Windows/Storage/`.
   - Verify: atomic commit, rebuild, keyset paging, and concurrent duplicate integration tests.
-- [ ] **T3 (P1, human: ~2d / CC: ~3h)** — Intake — Implement bounded picker/drop intake with `VaultImport` recovery.
+- [ ] **T3 (P1, human: ~2d / CC: ~3h)** — Intake — Implement bounded picker/drop intake with `VaultImport` recovery and admission-only Worker inspection.
   - Surfaced by: scope decision 0A, architecture review 2A, performance review 8A.
-  - Files: `src/LocalDocumentOrganizer.Application/`, `src/LocalDocumentOrganizer.Infrastructure.Windows/FileSystem/`.
+  - Files: `src/LocalDocumentOrganizer.Application/`, `src/LocalDocumentOrganizer.Infrastructure.Windows/FileSystem/`, existing Worker protocol/client/adapter.
   - Verify: format/limit, stable-handle, every crash point, restart, and source-unchanged tests.
 - [ ] **T4 (P1, human: ~2d / CC: ~3h)** — Extraction — Persist attempt identity and make retry/reprocessing idempotent.
   - Surfaced by: Outside Voice 12A and test review 7A.
