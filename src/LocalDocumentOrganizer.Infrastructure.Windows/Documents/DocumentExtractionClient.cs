@@ -378,6 +378,23 @@ public sealed class DocumentExtractionClient :
             DocumentSourceDescriptor descriptor,
             ImmutableArray<string> requestedLanguages,
             CancellationToken cancellationToken)
+        => await ExtractForEvaluationAsync(
+                sourcePath,
+                descriptor,
+                Guid.NewGuid(),
+                ExtractionCapability.EmbeddedText | ExtractionCapability.Ocr,
+                requestedLanguages,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    public async Task<DocumentExtractionEvaluationResult>
+        ExtractForEvaluationAsync(
+            string sourcePath,
+            DocumentSourceDescriptor descriptor,
+            Guid jobId,
+            ExtractionCapability requestedCapabilities,
+            ImmutableArray<string> requestedLanguages,
+            CancellationToken cancellationToken)
     {
         if (_approvedRoot is null)
         {
@@ -385,7 +402,7 @@ public sealed class DocumentExtractionClient :
                 "A path extraction requires an approved root.");
         }
 
-        if (requestedLanguages.IsDefaultOrEmpty)
+        if (jobId == Guid.Empty || requestedLanguages.IsDefaultOrEmpty)
         {
             throw new ArgumentException(
                 "At least one requested language is required.",
@@ -408,9 +425,9 @@ public sealed class DocumentExtractionClient :
                                     verified,
                                     descriptor,
                                     deadline,
-                                    ExtractionCapability.EmbeddedText
-                                        | ExtractionCapability.Ocr,
-                                    requestedLanguages)
+                                    requestedCapabilities,
+                                    requestedLanguages,
+                                    jobId)
                                 .ConfigureAwait(false);
                         }
                     })
@@ -694,7 +711,8 @@ public sealed class DocumentExtractionClient :
         DocumentSourceDescriptor descriptor,
         IDocumentExtractionDeadline deadline,
         ExtractionCapability requestedCapabilities,
-        ImmutableArray<string> requestedLanguages)
+        ImmutableArray<string> requestedLanguages,
+        Guid? durableJobId = null)
     {
         byte[]? initialHash = null;
         try
@@ -769,7 +787,7 @@ public sealed class DocumentExtractionClient :
                 deadline.ThrowIfCancellationRequested();
                 var request = new DocumentExtractionRequest(
                     DocumentExtractionProtocol.CurrentVersion,
-                    Guid.NewGuid(),
+                    durableJobId ?? Guid.NewGuid(),
                     new DocumentSourceDescriptor(
                         activeWorker.InheritedSourceHandle,
                         descriptor.ContainerKind,

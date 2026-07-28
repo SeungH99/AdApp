@@ -57,6 +57,8 @@ public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDisp
             var evaluation = await _client.ExtractForEvaluationAsync(
                 source.FullyQualifiedVaultPath,
                 source.Descriptor,
+                request.AttemptId.Value,
+                request.RequestedCapabilities,
                 request.RequestedLanguages,
                 cancellationToken).ConfigureAwait(false);
             if (!CryptographicOperations.FixedTimeEquals(
