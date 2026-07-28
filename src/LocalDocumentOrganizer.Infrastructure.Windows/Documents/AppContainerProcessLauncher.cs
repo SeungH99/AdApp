@@ -207,6 +207,11 @@ public sealed class AppContainerProcessLauncher
                 "The pinned source handle is unavailable.");
         }
 
+        using var executableLease = new FileStream(
+            executablePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var workerPackageIdentity = Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(executableLease)).ToLowerInvariant();
+
         deadline?.ThrowIfExpired();
         SafeFileHandle? childInput = null;
         SafeFileHandle? parentInput = null;
@@ -399,6 +404,7 @@ public sealed class AppContainerProcessLauncher
                 outputStream,
                 processInformation.ProcessId,
                 unchecked((ulong)handles[2].ToInt64()),
+                workerPackageIdentity,
                 _profile,
                 _faultInjector);
             inputStream = null;
@@ -716,6 +722,7 @@ public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
         Stream standardOutput,
         uint processId,
         ulong inheritedSourceHandle,
+        string workerPackageIdentity,
         AppContainerProfile profile,
         IWorkerLaunchFaultInjector faultInjector)
     {
@@ -727,6 +734,7 @@ public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
         StandardOutput = standardOutput;
         ProcessId = processId;
         InheritedSourceHandle = inheritedSourceHandle;
+        WorkerPackageIdentity = workerPackageIdentity;
     }
 
     public Stream StandardInput { get; }
@@ -736,6 +744,8 @@ public sealed class LaunchedAppContainerProcess : IAsyncDisposable, IDisposable
     public uint ProcessId { get; }
 
     public ulong InheritedSourceHandle { get; }
+
+    public string WorkerPackageIdentity { get; }
 
     public uint ExitCode
     {

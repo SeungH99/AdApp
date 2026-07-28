@@ -45,7 +45,8 @@ public sealed class DocumentExtractionException : Exception
 
 public sealed record DocumentExtractionEvaluationResult(
     DocumentExtractionResponse Response,
-    ImmutableArray<byte> SourceSha256);
+    ImmutableArray<byte> SourceSha256,
+    string WorkerPackageIdentity);
 
 public sealed class DocumentExtractionClient :
     IDocumentAdmissionInspector
@@ -872,7 +873,8 @@ public sealed class DocumentExtractionClient :
 
                     return new DocumentExtractionEvaluationResult(
                         response,
-                        ImmutableArray.CreateRange(initialHash));
+                        ImmutableArray.CreateRange(initialHash),
+                        activeWorker.WorkerPackageIdentity);
                 }
                 catch (OperationCanceledException)
                 {
@@ -1223,7 +1225,6 @@ public sealed class DocumentExtractionClient :
                 throw new FrameException(
                     DocumentExtractionFailureCode.InvalidFraming);
             }
-
             var prefix = new byte[sizeof(int)];
             BinaryPrimitives.WriteInt32LittleEndian(
                 prefix,

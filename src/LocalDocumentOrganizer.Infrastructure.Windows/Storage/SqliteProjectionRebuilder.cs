@@ -432,10 +432,12 @@ internal sealed class SqliteProjectionRebuilder
                                         payloadSession,
                                         registration,
                                         owner,
-                                        dataKeyId)
+                                        dataKeyId,
+                                        ProjectionApplyMode.RebuildReplay)
                                     : SqliteProjectionContexts.CreateDisabledApply(
                                         temporaryConnection,
-                                        temporaryTransaction),
+                                        temporaryTransaction,
+                                        ProjectionApplyMode.RebuildReplay),
                                 cancellationToken)).ConfigureAwait(false);
                     }
                 }

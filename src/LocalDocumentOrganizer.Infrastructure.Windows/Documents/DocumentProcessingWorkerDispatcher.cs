@@ -20,9 +20,13 @@ public interface IImmutableVaultExtractionSourceResolver
 }
 
 public sealed class ContentAddressedVaultExtractionSourceResolver(
-    ApprovedRootPathGuard vaultRoot,
-    string expectedWorkerPackageIdentity) : IImmutableVaultExtractionSourceResolver
+    ApprovedRootPathGuard vaultRoot) : IImmutableVaultExtractionSourceResolver
 {
+    public ContentAddressedVaultExtractionSourceResolver(
+        ApprovedRootPathGuard vaultRoot,
+        string ignoredWorkerPackageIdentity) : this(vaultRoot)
+    {
+    }
     public async Task<ImmutableVaultExtractionSource> OpenAsync(
         DocumentProcessingRequest request,
         CancellationToken cancellationToken)
@@ -30,8 +34,6 @@ public sealed class ContentAddressedVaultExtractionSourceResolver(
         var binding = request.SourceBinding
             ?? throw new DocumentExtractionException(DocumentExtractionFailureCode.InvalidSourceHandle);
         if (!binding.IsValid)
-            throw new DocumentExtractionException(DocumentExtractionFailureCode.InvalidSourceHandle);
-        if (string.IsNullOrWhiteSpace(expectedWorkerPackageIdentity))
             throw new DocumentExtractionException(DocumentExtractionFailureCode.InvalidSourceHandle);
         var path = Path.Combine(vaultRoot.ApprovedRoot, "objects",
             request.ContentSha256.Hex[..2], request.ContentSha256.Hex + binding.CanonicalExtension);
@@ -46,8 +48,7 @@ public sealed class ContentAddressedVaultExtractionSourceResolver(
                 throw new DocumentExtractionException(DocumentExtractionFailureCode.InvalidSourceFingerprint);
             return new ImmutableVaultExtractionSource(path,
                 new DocumentSourceDescriptor(0, ToContainer(binding.Format), binding.CanonicalMimeType,
-                    binding.DeclaredLength, ImmutableArray.CreateRange(request.ContentSha256.Bytes.ToArray())),
-                expectedWorkerPackageIdentity);
+                    binding.DeclaredLength, ImmutableArray.CreateRange(request.ContentSha256.Bytes.ToArray())));
         }
         catch (FileSystemBoundaryException exception)
         {
@@ -101,8 +102,17 @@ public sealed class ContentAddressedVaultExtractionSourceResolver(
 
 public sealed record ImmutableVaultExtractionSource(
     string FullyQualifiedVaultPath,
-    DocumentSourceDescriptor Descriptor,
-    string WorkerPackageIdentity);
+    DocumentSourceDescriptor Descriptor)
+{
+    public string WorkerPackageIdentity => string.Empty;
+
+    public ImmutableVaultExtractionSource(
+        string fullyQualifiedVaultPath,
+        DocumentSourceDescriptor descriptor,
+        string ignoredWorkerPackageIdentity) : this(fullyQualifiedVaultPath, descriptor)
+    {
+    }
+}
 
 /// <summary>Application port adapter for the existing attested AppContainer Worker.</summary>
 public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDispatcher
@@ -140,10 +150,6 @@ public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDisp
             var source = await _sources.OpenAsync(request, cancellationToken).ConfigureAwait(false);
             if (source.Descriptor.DeclaredLength != request.SourceBinding.DeclaredLength
                 || source.Descriptor.DeclaredMimeType != request.SourceBinding.CanonicalMimeType
-                || !string.Equals(
-                    source.WorkerPackageIdentity,
-                    _expectedWorkerPackageIdentity,
-                    StringComparison.Ordinal)
                 || !CryptographicOperations.FixedTimeEquals(
                     source.Descriptor.Sha256.AsSpan(), request.ContentSha256.Bytes.Span))
             {
@@ -164,6 +170,14 @@ public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDisp
                 return DocumentProcessingDispatchResult.TransientFailure(
                     DocumentProcessingFailureCode.ResponseBindingInvalid);
             }
+            if (!string.Equals(
+                    evaluation.WorkerPackageIdentity,
+                    _expectedWorkerPackageIdentity,
+                    StringComparison.Ordinal))
+            {
+                return DocumentProcessingDispatchResult.TransientFailure(
+                    DocumentProcessingFailureCode.WorkerAttestationInvalid);
+            }
 
             if (evaluation.Response.Outcome == DocumentExtractionOutcome.Failure)
             {
@@ -183,7 +197,7 @@ public sealed class DocumentProcessingWorkerDispatcher : IDocumentProcessingDisp
                     request.DocumentId,
                     source.Descriptor.DeclaredLength,
                     request.ContentSha256,
-                    _expectedWorkerPackageIdentity),
+                    evaluation.WorkerPackageIdentity),
                 protectedDraft,
                 IsComplete(evaluation.Response),
                 marketSuggestion.MarketId);

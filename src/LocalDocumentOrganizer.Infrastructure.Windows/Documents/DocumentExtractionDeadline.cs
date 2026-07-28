@@ -133,6 +133,7 @@ internal interface IDocumentWorkerSessionLauncher
 
 internal interface IDocumentWorkerSession
 {
+    string WorkerPackageIdentity { get; }
     Stream StandardInput { get; }
 
     Stream StandardOutput { get; }
@@ -305,6 +306,8 @@ internal sealed class AppContainerDocumentWorkerSession
     public Stream StandardOutput => _worker.StandardOutput;
 
     public ulong InheritedSourceHandle => _worker.InheritedSourceHandle;
+
+    public string WorkerPackageIdentity => _worker.WorkerPackageIdentity;
 
     public uint ExitCode => _worker.ExitCode;
 

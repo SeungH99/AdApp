@@ -48,7 +48,8 @@ internal sealed class SqliteProjectionApplyContext
     internal SqliteProjectionApplyContext(
         SqliteConnection connection,
         SqliteTransaction transaction,
-        IProjectionApplyValues values)
+        IProjectionApplyValues values,
+        ProjectionApplyMode mode = ProjectionApplyMode.LiveAppend)
     {
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentNullException.ThrowIfNull(transaction);
@@ -59,6 +60,7 @@ internal sealed class SqliteProjectionApplyContext
         Connection = connection;
         Transaction = transaction;
         Values = values;
+        Mode = mode;
     }
 
     public SqliteConnection Connection { get; }
@@ -66,6 +68,14 @@ internal sealed class SqliteProjectionApplyContext
     public SqliteTransaction Transaction { get; }
 
     public IProjectionApplyValues Values { get; }
+
+    public ProjectionApplyMode Mode { get; }
+}
+
+internal enum ProjectionApplyMode
+{
+    LiveAppend = 0,
+    RebuildReplay = 1,
 }
 
 internal sealed class SqliteProjectionAdministrativeContext
@@ -116,17 +126,19 @@ internal static class SqliteProjectionContexts
         VaultKeyRingStore.VaultKeyRingSession session,
         SqliteProjectionRegistration registration,
         SensitiveObjectRef owner,
-        DataKeyId dataKeyId) =>
+        DataKeyId dataKeyId,
+        ProjectionApplyMode mode = ProjectionApplyMode.LiveAppend) =>
         new(
             connection,
             transaction,
             new SqliteProjectionValueProtector(keyRing, session, registration)
-                .CreateApplyValues(owner, dataKeyId));
+                .CreateApplyValues(owner, dataKeyId), mode);
 
     internal static SqliteProjectionApplyContext CreateDisabledApply(
         SqliteConnection connection,
-        SqliteTransaction transaction) =>
-        new(connection, transaction, UnavailableProjectionValues.Instance);
+        SqliteTransaction transaction,
+        ProjectionApplyMode mode = ProjectionApplyMode.LiveAppend) =>
+        new(connection, transaction, UnavailableProjectionValues.Instance, mode);
 
     internal static SqliteProjectionApplyContext CreateApply(
         SqliteConnection connection,
@@ -135,12 +147,13 @@ internal static class SqliteProjectionContexts
         SqliteEventPayloadReadSession readSession,
         SqliteProjectionRegistration registration,
         SensitiveObjectRef owner,
-        DataKeyId dataKeyId) =>
+        DataKeyId dataKeyId,
+        ProjectionApplyMode mode = ProjectionApplyMode.LiveAppend) =>
         new(
             connection,
             transaction,
             new SqliteProjectionValueProtector(keyRing, readSession, registration)
-                .CreateApplyValues(owner, dataKeyId));
+                .CreateApplyValues(owner, dataKeyId), mode);
 
     internal static SqliteProjectionAdministrativeContext CreateAdministrative(
         SqliteConnection connection,

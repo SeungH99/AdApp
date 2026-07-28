@@ -63,7 +63,7 @@ internal sealed class SqliteProductProjection(
     IProductCommitFaultInjector? faultInjector = null) : ISqliteProjection
 {
     internal const string ProjectionName = "product";
-    internal const int ProjectionSchemaVersion = 3;
+    internal const int ProjectionSchemaVersion = 4;
 
     private const string SchemaSql = """
         CREATE TABLE IF NOT EXISTS product_documents(
@@ -136,9 +136,10 @@ internal sealed class SqliteProductProjection(
         ) STRICT;
         CREATE INDEX IF NOT EXISTS product_outbox_dispatch_order
             ON product_outbox(dispatch_status,occurred_at_utc COLLATE BINARY,operation_id COLLATE BINARY);
-        CREATE UNIQUE INDEX IF NOT EXISTS product_outbox_explicit_reprocess_revision
+        CREATE UNIQUE INDEX IF NOT EXISTS product_outbox_extraction_revision
             ON product_outbox(aggregate_id,target_extraction_revision)
-            WHERE commit_kind='explicit-reprocess';
+            WHERE extraction_attempt_id IS NOT NULL
+              AND target_extraction_revision IS NOT NULL;
         """;
 
     private static readonly ProjectionOwnedTable[] Tables =
@@ -385,7 +386,9 @@ internal sealed class SqliteProductProjection(
         _ = ProductEventPayloads.UtcValue(payload.OccurredAtUtc);
         _ = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
         RequireOwner(context, SensitiveObjectKind.DocumentEvidence, documentId);
-        if (kind == "extraction-committed" && payload.ClaimOwnerId is not null)
+        if (kind == "extraction-committed"
+            && context.Mode == ProjectionApplyMode.LiveAppend
+            && payload.ClaimOwnerId is not null)
         {
             if (payload.ClaimAttemptId is null
                 || payload.ClaimTargetRevision is null
@@ -407,7 +410,7 @@ internal sealed class SqliteProductProjection(
             complete.Parameters.AddWithValue("$attempt", ProductEventPayloads.Canonical(payload.ClaimAttemptId.Value));
             complete.Parameters.AddWithValue("$revision", payload.ClaimTargetRevision.Value);
             complete.Parameters.AddWithValue("$owner", ProductEventPayloads.Canonical(payload.ClaimOwnerId.Value));
-            complete.Parameters.AddWithValue("$occurred", ProductEventPayloads.UtcValue(payload.OccurredAtUtc).ToString("O"));
+            complete.Parameters.AddWithValue("$occurred", ProductEventPayloads.Utc(replayEvent.Metadata.RecordedAtUtc));
             RequireSingle(await complete.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false));
         }
         _faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeInbox);
@@ -855,10 +858,14 @@ internal sealed class SqliteProductProjection(
             """;
         var schema = await command.ExecuteScalarAsync(cancellationToken)
             .ConfigureAwait(false);
-        return schema is not string sql
-            || (sql.Contains("extraction_attempt_id", StringComparison.OrdinalIgnoreCase)
+        if (schema is not string sql)
+            return true;
+        if (!(sql.Contains("extraction_attempt_id", StringComparison.OrdinalIgnoreCase)
                 && sql.Contains("extraction_commit_operation_id", StringComparison.OrdinalIgnoreCase)
-                && sql.Contains("source_binding_json", StringComparison.OrdinalIgnoreCase));
+                && sql.Contains("source_binding_json", StringComparison.OrdinalIgnoreCase)))
+            return false;
+        command.CommandText = "SELECT 1 FROM sqlite_master WHERE type='index' AND name='product_outbox_extraction_revision';";
+        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
     }
 
     private static async Task InsertOutboxAsync(
