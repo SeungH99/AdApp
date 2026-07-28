@@ -34,8 +34,58 @@ public sealed class InvoiceReviewService
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(command);
-        var snapshot = await _reviews.LoadCurrentAsync(command.DocumentId, cancellationToken)
-            .ConfigureAwait(false);
+        if (!InvoiceReviewSubmissionFingerprint.TryCreate(
+                command,
+                out var submissionFingerprint))
+        {
+            return Failed(InvoiceReviewFailureCode.InputTooLarge, command);
+        }
+
+        InvoiceReviewOperationHistory? historical;
+        InvoiceReviewSnapshot? snapshot;
+        try
+        {
+            historical = await _reviews.LoadByOperationAsync(
+                    command.OperationId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (historical is not null)
+            {
+                return historical.EventId == command.EventId
+                    && historical.DocumentId == command.DocumentId
+                    && string.Equals(
+                        historical.SubmissionFingerprint,
+                        submissionFingerprint,
+                        StringComparison.Ordinal)
+                    ? new InvoiceReviewResult(
+                        InvoiceReviewOutcome.AlreadyConfirmed,
+                        InvoiceReviewFailureCode.None,
+                        historical.Review,
+                        null)
+                    : new InvoiceReviewResult(
+                        InvoiceReviewOutcome.ConcurrentConflict,
+                        InvoiceReviewFailureCode.StorageConflict,
+                        null,
+                        command);
+            }
+
+            snapshot = await _reviews.LoadCurrentAsync(
+                    command.DocumentId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return new(
+                InvoiceReviewOutcome.RecoveryRequired,
+                InvoiceReviewFailureCode.StorageRecoveryRequired,
+                null,
+                command);
+        }
         if (snapshot is null)
             return Failed(InvoiceReviewFailureCode.DocumentUnavailable, command);
         if (snapshot.DocumentId != command.DocumentId || !snapshot.SourceIdentity.Equals(command.ExpectedSourceIdentity))
@@ -116,7 +166,8 @@ public sealed class InvoiceReviewService
         var commit = await _commits.CommitReviewAsync(
             new CommitReviewCommand(command.OperationId, command.EventId, command.DocumentId,
                 snapshot.CurrentStreamVersion, command.ApprovedAtUtc, payload,
-                command.ExpectedExtractionRevision, review.ReviewRevision),
+                command.ExpectedExtractionRevision, review.ReviewRevision,
+                submissionFingerprint),
             cancellationToken).ConfigureAwait(false);
         if (commit is ProductConflict
             {
@@ -146,21 +197,28 @@ public sealed class InvoiceReviewService
                     command.DocumentId,
                     cancellationToken)
                 .ConfigureAwait(false);
-            return current is null
-                || current.CurrentExtractionRevision
-                    != command.ExpectedExtractionRevision
-                || !current.SourceIdentity.Equals(
-                    command.ExpectedSourceIdentity)
-                ? new InvoiceReviewResult(
+            if (current is null)
+            {
+                return new InvoiceReviewResult(
+                    InvoiceReviewOutcome.RecoveryRequired,
+                    InvoiceReviewFailureCode.StorageRecoveryRequired,
+                    null,
+                    command);
+            }
+            if (current.CurrentExtractionRevision
+                != command.ExpectedExtractionRevision)
+            {
+                return new InvoiceReviewResult(
                     InvoiceReviewOutcome.StaleRevision,
                     InvoiceReviewFailureCode.StaleExtractionRevision,
                     null,
-                    command)
-                : new InvoiceReviewResult(
-                    InvoiceReviewOutcome.ConcurrentConflict,
-                    InvoiceReviewFailureCode.StorageConflict,
-                    null,
                     command);
+            }
+            return new InvoiceReviewResult(
+                InvoiceReviewOutcome.ConcurrentConflict,
+                InvoiceReviewFailureCode.StorageConflict,
+                null,
+                command);
         }
         catch (OperationCanceledException)
         {

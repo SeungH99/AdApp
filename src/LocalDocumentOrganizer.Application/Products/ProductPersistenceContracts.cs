@@ -329,7 +329,8 @@ public sealed record CommitReviewCommand
         DateTimeOffset reviewedAtUtc,
         string authenticatedReview,
         int? expectedExtractionRevision,
-        int? reviewRevision)
+        int? reviewRevision,
+        string? submissionFingerprint = null)
     {
         CommitImportCommand.ValidateOperation(operationId, eventId);
         CommitImportCommand.ValidateDocument(documentId);
@@ -345,8 +346,19 @@ public sealed record CommitReviewCommand
         AuthenticatedReview = authenticatedReview;
         if (expectedExtractionRevision is <= 0 || reviewRevision is <= 0)
             throw new ArgumentOutOfRangeException(nameof(expectedExtractionRevision));
+        if (submissionFingerprint is not null
+            && (submissionFingerprint.Length != 64
+                || submissionFingerprint.Any(static character =>
+                    character is not (>= '0' and <= '9'
+                        or >= 'a' and <= 'f'))))
+        {
+            throw new ArgumentException(
+                "The review submission fingerprint is invalid.",
+                nameof(submissionFingerprint));
+        }
         ExpectedExtractionRevision = expectedExtractionRevision;
         ReviewRevision = reviewRevision;
+        SubmissionFingerprint = submissionFingerprint;
     }
 
     public OperationId OperationId { get; }
@@ -364,6 +376,8 @@ public sealed record CommitReviewCommand
     public int? ExpectedExtractionRevision { get; }
 
     public int? ReviewRevision { get; }
+
+    public string? SubmissionFingerprint { get; }
 }
 
 public sealed record CommitReceivableCaseCommand

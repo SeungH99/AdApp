@@ -944,6 +944,130 @@ public sealed class SqliteProductCommitStore :
         }
     }
 
+    public async Task<InvoiceReviewOperationHistory?> LoadByOperationAsync(
+        OperationId operationId,
+        CancellationToken cancellationToken)
+    {
+        if (operationId.Value == Guid.Empty)
+            throw new ArgumentException(
+                "An operation ID cannot be empty.",
+                nameof(operationId));
+        try
+        {
+            await using var lease = await _keyRing.MaintenanceGate
+                .AcquireReadAsync(cancellationToken).ConfigureAwait(false);
+            await using var connection =
+                await SqliteEventStoreSchema.OpenConnectionAsync(
+                    _connectionString,
+                    _keyRing.MaintenanceGate,
+                    cancellationToken).ConfigureAwait(false);
+            await using var transaction = connection.BeginTransaction(deferred: true);
+            await ValidateReadBoundaryAsync(
+                connection,
+                transaction,
+                cancellationToken).ConfigureAwait(false);
+            var administrative = SqliteProjectionContexts.CreateAdministrative(
+                connection,
+                transaction,
+                _keyRing,
+                lease,
+                _registration);
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT event_id,document_id,extraction_revision,review_revision,
+                       submission_fingerprint,owner_kind,owner_id,key_id,
+                       encryption_version,payload_nonce,payload_ciphertext,payload_tag
+                FROM product_review_operations
+                WHERE operation_id=$operation;
+                """;
+            var logicalKey = ProductEventPayloads.Canonical(operationId.Value);
+            command.Parameters.AddWithValue("$operation", logicalKey);
+            await using var reader = await command.ExecuteReaderAsync(
+                cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                await transaction.CommitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                return null;
+            }
+
+            var eventId = new EventId(
+                ProductEventPayloads.GuidValue(reader.GetString(0)));
+            var documentId = new DocumentId(
+                ProductEventPayloads.GuidValue(reader.GetString(1)));
+            var extractionRevision = reader.GetInt32(2);
+            var reviewRevision = reader.GetInt32(3);
+            var fingerprint = reader.GetString(4);
+            _ = ProductEventPayloads.FingerprintValue(fingerprint);
+            var owner = ReadOwner(reader, 5, 6);
+            var keyId = new DataKeyId(
+                ProductEventPayloads.GuidValue(reader.GetString(7)));
+            var encrypted = new EncryptedProjectionValue(
+                reader.GetInt32(8),
+                keyId,
+                (byte[])reader.GetValue(9),
+                (byte[])reader.GetValue(10),
+                (byte[])reader.GetValue(11));
+            if (extractionRevision <= 0
+                || reviewRevision <= 0
+                || owner.Kind != SensitiveObjectKind.DocumentEvidence
+                || owner.Id.Value != documentId.Value
+                || await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+            await reader.DisposeAsync().ConfigureAwait(false);
+            var payload = await administrative.Values.UnprotectAsync(
+                "product_review_operations",
+                "payload",
+                logicalKey,
+                owner,
+                keyId,
+                encrypted,
+                (plaintext, _) => ValueTask.FromResult(
+                    new UTF8Encoding(false, true).GetString(plaintext.Span)),
+                cancellationToken).ConfigureAwait(false);
+            var review = ParseReview(payload);
+            if (review.DocumentId != documentId
+                || review.ExtractionRevision != extractionRevision
+                || review.ReviewRevision != reviewRevision
+                || review.CommitOperationId != operationId
+                || review.CommitEventId != eventId)
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new InvoiceReviewOperationHistory(
+                operationId,
+                eventId,
+                documentId,
+                fingerprint,
+                review);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (VaultRecoveryRequiredException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (
+            exception is SqliteException
+                or ProjectionValueRecoveryRequiredException
+                or ExtractionDraftSerializationException
+                or JsonException
+                or DecoderFallbackException
+                or FormatException
+                or InvalidCastException
+                or OverflowException
+                or CryptographicException)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
+    }
+
     public async Task<InvoiceReviewSnapshot?> LoadCurrentAsync(DocumentId documentId, CancellationToken cancellationToken)
     {
         try

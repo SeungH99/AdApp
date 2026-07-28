@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using LocalDocumentOrganizer.Application.Review;
 using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Application.Products;
 using LocalDocumentOrganizer.Core.Cases.Receivable;
@@ -72,7 +73,7 @@ internal sealed class SqliteProductProjection(
     IProductCommitFaultInjector? faultInjector = null) : ISqliteProjection
 {
     internal const string ProjectionName = "product";
-    internal const int ProjectionSchemaVersion = 9;
+    internal const int ProjectionSchemaVersion = 10;
 
     private const string SchemaSql = """
         CREATE TABLE IF NOT EXISTS product_documents(
@@ -127,6 +128,25 @@ internal sealed class SqliteProductProjection(
             payload_ciphertext BLOB NOT NULL,
             payload_tag BLOB NOT NULL CHECK(length(payload_tag)=16)
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS product_review_operations(
+            operation_id TEXT PRIMARY KEY CHECK(length(operation_id)=36),
+            event_id TEXT NOT NULL UNIQUE CHECK(length(event_id)=36),
+            document_id TEXT NOT NULL CHECK(length(document_id)=36)
+                REFERENCES product_documents(document_id) ON DELETE CASCADE,
+            extraction_revision INTEGER NOT NULL CHECK(extraction_revision>0),
+            review_revision INTEGER NOT NULL CHECK(review_revision>0),
+            submission_fingerprint TEXT NOT NULL
+                CHECK(length(submission_fingerprint)=64),
+            owner_kind INTEGER NOT NULL,
+            owner_id TEXT NOT NULL CHECK(length(owner_id)=36),
+            key_id TEXT NOT NULL CHECK(length(key_id)=36),
+            encryption_version INTEGER NOT NULL CHECK(encryption_version=1),
+            payload_nonce BLOB NOT NULL CHECK(length(payload_nonce)=12),
+            payload_ciphertext BLOB NOT NULL,
+            payload_tag BLOB NOT NULL CHECK(length(payload_tag)=16)
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS product_review_operations_document
+            ON product_review_operations(document_id,review_revision);
         CREATE TABLE IF NOT EXISTS product_cases(
             case_id TEXT PRIMARY KEY CHECK(length(case_id)=36),
             source_document_id TEXT NOT NULL CHECK(length(source_document_id)=36)
@@ -209,6 +229,7 @@ internal sealed class SqliteProductProjection(
         new("product_inbox"),
         new("product_reviews"),
         new("product_review_drafts"),
+        new("product_review_operations"),
         new("product_cases"),
         new("product_today"),
         new("product_outbox"),
@@ -220,6 +241,7 @@ internal sealed class SqliteProductProjection(
         new("product_inbox", "metadata"),
         new("product_reviews", "payload"),
         new("product_review_drafts", "payload"),
+        new("product_review_operations", "payload"),
         new("product_cases", "metadata"),
         new("product_today", "display"),
     ];
@@ -508,6 +530,18 @@ internal sealed class SqliteProductProjection(
             AddOwnerAndKey(review, context.Values.BoundOwner, encrypted);
             review.Parameters.Add("$nonce", SqliteType.Blob).Value=encrypted.Nonce.ToArray(); review.Parameters.Add("$cipher", SqliteType.Blob).Value=encrypted.Ciphertext.ToArray(); review.Parameters.Add("$tag", SqliteType.Blob).Value=encrypted.Tag.ToArray();
             RequireSingle(await review.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false));
+            if (payload.ReviewSubmissionFingerprint is { } submissionFingerprint)
+            {
+                await InsertReviewOperationAsync(
+                    replayEvent,
+                    context,
+                    documentId,
+                    extractionRevision,
+                    reviewRevision,
+                    submissionFingerprint,
+                    payload.AuthenticatedPayload,
+                    cancellationToken).ConfigureAwait(false);
+            }
         }
         if (kind == "extraction-committed"
             && context.Mode == ProjectionApplyMode.LiveAppend
@@ -634,6 +668,96 @@ internal sealed class SqliteProductProjection(
             null,
             null,
             cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task InsertReviewOperationAsync(
+        DecryptedEvent replayEvent,
+        SqliteProjectionApplyContext context,
+        Guid documentId,
+        int extractionRevision,
+        int reviewRevision,
+        string submissionFingerprint,
+        string authenticatedPayload,
+        CancellationToken cancellationToken)
+    {
+        _ = ProductEventPayloads.FingerprintValue(submissionFingerprint);
+        PersistedConfirmedInvoiceReview persisted;
+        try
+        {
+            persisted = JsonSerializer.Deserialize<PersistedConfirmedInvoiceReview>(
+                    authenticatedPayload)
+                ?? throw new VaultRecoveryRequiredException();
+        }
+        catch (JsonException exception)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
+
+        if (!Guid.TryParseExact(persisted.DocumentId, "D", out var persistedDocument)
+            || persistedDocument != documentId
+            || persisted.ExtractionRevision != extractionRevision
+            || persisted.ReviewRevision != reviewRevision
+            || !Guid.TryParseExact(
+                persisted.CommitOperationId,
+                "D",
+                out var persistedOperation)
+            || persistedOperation != replayEvent.Metadata.OperationId.Value
+            || !Guid.TryParseExact(
+                persisted.CommitEventId,
+                "D",
+                out var persistedEvent)
+            || persistedEvent != replayEvent.Metadata.EventId.Value
+            || persisted.CommittedStreamVersion
+                != replayEvent.Metadata.StreamVersion.Value)
+        {
+            throw new VaultRecoveryRequiredException();
+        }
+
+        var logicalKey = ProductEventPayloads.Canonical(
+            replayEvent.Metadata.OperationId.Value);
+        var encrypted = await context.Values.ProtectAsync(
+            "product_review_operations",
+            "payload",
+            logicalKey,
+            context.Values.BoundOwner,
+            context.Values.BoundDataKeyId,
+            Encoding.UTF8.GetBytes(authenticatedPayload),
+            cancellationToken).ConfigureAwait(false);
+        await using var command = context.Connection.CreateCommand();
+        command.Transaction = context.Transaction;
+        command.CommandText = """
+            INSERT INTO product_review_operations(
+                operation_id,event_id,document_id,extraction_revision,
+                review_revision,submission_fingerprint,
+                owner_kind,owner_id,key_id,encryption_version,
+                payload_nonce,payload_ciphertext,payload_tag)
+            VALUES(
+                $operation,$event,$document,$extraction,$review,$fingerprint,
+                $owner_kind,$owner_id,$key_id,$version,$nonce,$cipher,$tag);
+            """;
+        command.Parameters.AddWithValue("$operation", logicalKey);
+        command.Parameters.AddWithValue(
+            "$event",
+            ProductEventPayloads.Canonical(
+                replayEvent.Metadata.EventId.Value));
+        command.Parameters.AddWithValue(
+            "$document",
+            ProductEventPayloads.Canonical(documentId));
+        command.Parameters.AddWithValue("$extraction", extractionRevision);
+        command.Parameters.AddWithValue("$review", reviewRevision);
+        command.Parameters.AddWithValue(
+            "$fingerprint",
+            submissionFingerprint);
+        AddOwnerAndKey(command, context.Values.BoundOwner, encrypted);
+        command.Parameters.Add("$nonce", SqliteType.Blob).Value =
+            encrypted.Nonce.ToArray();
+        command.Parameters.Add("$cipher", SqliteType.Blob).Value =
+            encrypted.Ciphertext.ToArray();
+        command.Parameters.Add("$tag", SqliteType.Blob).Value =
+            encrypted.Tag.ToArray();
+        RequireSingle(
+            await command.ExecuteNonQueryAsync(cancellationToken)
+                .ConfigureAwait(false));
     }
 
     private static async Task ReplaceCurrentReviewDraftAsync(
@@ -1087,6 +1211,10 @@ internal sealed class SqliteProductProjection(
             context,
             hash,
             cancellationToken).ConfigureAwait(false);
+        await AppendReviewOperationRowsAsync(
+            context,
+            hash,
+            cancellationToken).ConfigureAwait(false);
         await AppendCaseRowsAsync(context, hash, cancellationToken).ConfigureAwait(false);
         await AppendTodayRowsAsync(
             context,
@@ -1236,6 +1364,45 @@ internal sealed class SqliteProductProjection(
                 reader.GetInt32(7),
                 reader,
                 8,
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task AppendReviewOperationRowsAsync(
+        SqliteProjectionAdministrativeContext context,
+        IncrementalHash hash,
+        CancellationToken cancellationToken)
+    {
+        await using var command = context.Connection.CreateCommand();
+        command.Transaction = context.Transaction;
+        command.CommandText = """
+            SELECT operation_id,event_id,document_id,extraction_revision,
+                   review_revision,submission_fingerprint,
+                   owner_kind,owner_id,key_id,encryption_version,
+                   payload_nonce,payload_ciphertext,payload_tag
+            FROM product_review_operations
+            ORDER BY operation_id COLLATE BINARY;
+            """;
+        await using var reader = await command.ExecuteReaderAsync(
+            cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            for (var ordinal = 0; ordinal < 6; ordinal++)
+                AppendValue(hash, reader.GetValue(ordinal));
+            var owner = Owner(reader, 6, 7);
+            var keyId = new DataKeyId(
+                ProductEventPayloads.GuidValue(reader.GetString(8)));
+            await AppendProtectedAsync(
+                context,
+                hash,
+                "product_review_operations",
+                "payload",
+                reader.GetString(0),
+                owner,
+                keyId,
+                reader.GetInt32(9),
+                reader,
+                10,
                 cancellationToken).ConfigureAwait(false);
         }
     }
@@ -1433,7 +1600,8 @@ internal sealed class SqliteProductProjection(
             WHERE type='table'
               AND name IN (
                 'product_documents','product_inbox','product_reviews',
-                'product_review_drafts','product_cases','product_today',
+                'product_review_drafts','product_review_operations',
+                'product_cases','product_today',
                 'product_outbox');
             """;
         return Convert.ToInt32(

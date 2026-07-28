@@ -1,4 +1,8 @@
 using System.Collections.Immutable;
+using System.Buffers.Binary;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using LocalDocumentOrganizer.Application.Contracts;
 using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Application.Products;
@@ -126,6 +130,124 @@ public sealed record InvoiceReviewResult(
     ConfirmedInvoiceReview? Review,
     ConfirmInvoiceReviewCommand? PreservedSubmission);
 
+public sealed record InvoiceReviewOperationHistory(
+    OperationId OperationId,
+    EventId EventId,
+    DocumentId DocumentId,
+    string SubmissionFingerprint,
+    ConfirmedInvoiceReview Review);
+
+public static class InvoiceReviewSubmissionFingerprint
+{
+    public static bool TryCreate(
+        ConfirmInvoiceReviewCommand command,
+        out string fingerprint)
+    {
+        fingerprint = string.Empty;
+        if (command is null
+            || command.OperationId.Value == Guid.Empty
+            || command.EventId is null
+            || command.EventId.Value == Guid.Empty
+            || command.DocumentId.Value == Guid.Empty
+            || command.ExpectedExtractionRevision <= 0
+            || command.ExpectedSourceIdentity is null
+            || command.ConfirmedMarket is null
+            || Encoding.UTF8.GetByteCount(command.ConfirmedMarket) > 32
+            || command.Fields.IsDefault
+            || command.Fields.Length > PilotCatalog.RequiredFieldIds.Length)
+        {
+            return false;
+        }
+
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        Add(hash, "invoice-review-submission.v1");
+        Add(hash, command.DocumentId.Value);
+        Add(hash, command.ExpectedExtractionRevision);
+        Add(hash, command.ExpectedSourceIdentity.Bytes.Span);
+        Add(hash, command.ConfirmedMarket);
+        Add(hash, command.IsOutboundInvoice);
+        Add(hash, command.IsExplicitlyApproved);
+        Add(
+            hash,
+            command.ApprovedAtUtc.ToString(
+                "O",
+                CultureInfo.InvariantCulture));
+        foreach (var field in command.Fields
+                     .OrderBy(static field => field?.FieldId, StringComparer.Ordinal))
+        {
+            if (field is null
+                || field.FieldId is null
+                || Encoding.UTF8.GetByteCount(field.FieldId) > 128
+                || field.ConfirmedValue is null
+                || Encoding.UTF8.GetByteCount(field.ConfirmedValue)
+                    > InvoiceReviewLimits.MaxConfirmedValueUtf8Bytes
+                || field.Evidence.IsDefault
+                || field.Evidence.Length > InvoiceReviewLimits.MaxEvidencePerField
+                || field.Evidence.Any(static evidence => evidence is null))
+            {
+                return false;
+            }
+
+            Add(hash, field.FieldId);
+            Add(hash, field.ConfirmedValue);
+            Add(hash, field.Evidence.Length);
+            foreach (var evidence in field.Evidence)
+            {
+                Add(hash, evidence.ExtractionRevision);
+                Add(hash, evidence.Box?.SourceIndex ?? -1);
+                Add(hash, evidence.Box?.X ?? double.NaN);
+                Add(hash, evidence.Box?.Y ?? double.NaN);
+                Add(hash, evidence.Box?.Width ?? double.NaN);
+                Add(hash, evidence.Box?.Height ?? double.NaN);
+                Add(hash, (int)evidence.CoordinateSystem);
+            }
+        }
+
+        fingerprint = Convert.ToHexString(hash.GetHashAndReset())
+            .ToLowerInvariant();
+        return true;
+    }
+
+    private static void Add(IncrementalHash hash, string value) =>
+        Add(hash, Encoding.UTF8.GetBytes(value));
+
+    private static void Add(IncrementalHash hash, Guid value)
+    {
+        Span<byte> bytes = stackalloc byte[16];
+        value.TryWriteBytes(bytes, bigEndian: true, out _);
+        Add(hash, bytes);
+    }
+
+    private static void Add(IncrementalHash hash, int value)
+    {
+        Span<byte> bytes = stackalloc byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(bytes, value);
+        Add(hash, bytes);
+    }
+
+    private static void Add(IncrementalHash hash, bool value) =>
+        Add(hash, value ? 1 : 0);
+
+    private static void Add(IncrementalHash hash, double value)
+    {
+        Span<byte> bytes = stackalloc byte[8];
+        BinaryPrimitives.WriteInt64BigEndian(
+            bytes,
+            BitConverter.DoubleToInt64Bits(value));
+        Add(hash, bytes);
+    }
+
+    private static void Add(
+        IncrementalHash hash,
+        ReadOnlySpan<byte> value)
+    {
+        Span<byte> length = stackalloc byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(length, value.Length);
+        hash.AppendData(length);
+        hash.AppendData(value);
+    }
+}
+
 public interface IInvoiceReviewQueryStore
 {
     Task<InvoiceReviewSnapshot?> LoadCurrentAsync(
@@ -134,5 +256,9 @@ public interface IInvoiceReviewQueryStore
 
     Task<ConfirmedInvoiceReview?> LoadConfirmedAsync(
         DocumentId documentId,
+        CancellationToken cancellationToken);
+
+    Task<InvoiceReviewOperationHistory?> LoadByOperationAsync(
+        OperationId operationId,
         CancellationToken cancellationToken);
 }

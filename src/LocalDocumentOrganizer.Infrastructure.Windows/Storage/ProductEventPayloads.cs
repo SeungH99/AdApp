@@ -64,7 +64,8 @@ internal sealed record ProductDocumentProgressPayload(
     int? ExpectedExtractionRevision,
     int? ReviewRevision,
     string CommitFingerprint,
-    int? ExtractionDraftFormatVersion = null);
+    int? ExtractionDraftFormatVersion = null,
+    string? ReviewSubmissionFingerprint = null);
 
 internal sealed record ProductReceivableCasePayload(
     string CaseId,
@@ -144,7 +145,9 @@ internal static class ProductEventPayloads
                 null,
                 command.ExpectedExtractionRevision,
                 command.ReviewRevision,
-                Convert.ToHexString(fingerprint).ToLowerInvariant()));
+                Convert.ToHexString(fingerprint).ToLowerInvariant(),
+                null,
+                command.SubmissionFingerprint));
 
     internal static byte[] SerializeReceivableCase(
         CommitReceivableCaseCommand command,
@@ -233,6 +236,7 @@ internal static class ProductEventPayloads
         Add(hash, command.AuthenticatedReview);
         Add(hash, command.ExpectedExtractionRevision ?? 0);
         Add(hash, command.ReviewRevision ?? 0);
+        Add(hash, command.SubmissionFingerprint ?? string.Empty);
         return hash.GetHashAndReset();
     }
 
