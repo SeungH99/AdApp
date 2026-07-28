@@ -76,12 +76,20 @@ public sealed class ReceivableCaseService
         }
         if (review is null || current is null)
             return new(ReceivableCaseOutcome.ReviewUnavailable, null, null);
-        if (review.ExtractionRevision != current.CurrentExtractionRevision
-            || !review.SourceIdentity.Equals(current.SourceIdentity))
+        if (review.ExtractionRevision != current.CurrentExtractionRevision)
         {
             return new(
                 ReceivableCaseOutcome.ReviewInvalid,
                 ReceivableCaseFailureCode.StaleReviewRevision,
+                null);
+        }
+        if (review.SourceIdentity is null
+            || current.SourceIdentity is null
+            || !review.SourceIdentity.Equals(current.SourceIdentity))
+        {
+            return new(
+                ReceivableCaseOutcome.RecoveryRequired,
+                ReceivableCaseFailureCode.SourceIdentityIntegrityFailure,
                 null);
         }
         var fields = review.Fields.ToImmutableDictionary(
@@ -193,12 +201,20 @@ public sealed class ReceivableCaseService
                     null);
             }
             if (review.ExtractionRevision
-                    != current.CurrentExtractionRevision
-                || !review.SourceIdentity.Equals(current.SourceIdentity))
+                != current.CurrentExtractionRevision)
             {
                 return new(
                     ReceivableCaseOutcome.ReviewInvalid,
                     ReceivableCaseFailureCode.StaleReviewRevision,
+                    null);
+            }
+            if (review.SourceIdentity is null
+                || current.SourceIdentity is null
+                || !review.SourceIdentity.Equals(current.SourceIdentity))
+            {
+                return new(
+                    ReceivableCaseOutcome.RecoveryRequired,
+                    ReceivableCaseFailureCode.SourceIdentityIntegrityFailure,
                     null);
             }
             return new(

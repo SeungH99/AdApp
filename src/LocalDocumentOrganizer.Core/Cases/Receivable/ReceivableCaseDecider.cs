@@ -26,6 +26,7 @@ public enum ReceivableCaseFailureCode
     InvalidAmount = 8,
     InvalidCurrency = 9,
     CaseAlreadyExists = 10,
+    SourceIdentityIntegrityFailure = 11,
 }
 
 public sealed record ReceivableEvidence(
@@ -120,11 +121,22 @@ public static class ReceivableCaseDecider
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.IdentityMismatch);
         if (existingCase is not null)
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.CaseAlreadyExists);
-        if (command.ExtractionRevision <= 0 || command.ReviewRevision <= 0
-            || command.CurrentExtractionRevision <= 0
-            || command.ExtractionRevision != command.CurrentExtractionRevision
-            || !SourceBindingMatches(command))
+        if (command.ExtractionRevision <= 0
+            || command.ReviewRevision <= 0
+            || command.CurrentExtractionRevision <= 0)
+        {
+            return ReceivableCaseDecision.Rejected(
+                ReceivableCaseFailureCode.InvalidReview);
+        }
+        if (command.ExtractionRevision != command.CurrentExtractionRevision)
+        {
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.StaleReviewRevision);
+        }
+        if (!SourceBindingMatches(command))
+        {
+            return ReceivableCaseDecision.Rejected(
+                ReceivableCaseFailureCode.SourceIdentityIntegrityFailure);
+        }
         if (command.ConfirmedMarket is not ("ko-KR" or "en-US"))
             return ReceivableCaseDecision.Rejected(ReceivableCaseFailureCode.MarketNotConfirmed);
         if (!command.IsOutboundInvoice)
