@@ -859,17 +859,180 @@ public sealed class SqliteProductCommitStore :
 
     public async Task<InvoiceReviewSnapshot?> LoadCurrentAsync(DocumentId documentId, CancellationToken cancellationToken)
     {
-        var review = await LoadConfirmedAsync(documentId, cancellationToken).ConfigureAwait(false);
-        if (review is null) return null;
-        var state = await ReadProjectedReviewStateAsync(documentId, cancellationToken)
-            .ConfigureAwait(false);
-        if (!state.SourceIdentity.Equals(review.SourceIdentity))
+        try
+        {
+            var state = await ReadProjectedReviewStateAsync(
+                    documentId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var draftProjection = await LoadCurrentDraftAsync(
+                    documentId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var review = await LoadConfirmedAsync(documentId, cancellationToken)
+                .ConfigureAwait(false);
+            if (draftProjection is null)
+            {
+                if (review is null)
+                {
+                    return null;
+                }
+                if (!state.SourceIdentity.Equals(review.SourceIdentity))
+                {
+                    throw new VaultRecoveryRequiredException();
+                }
+
+                var legacyFields = review.Fields.ToImmutableDictionary(
+                    field => field.FieldId,
+                    field => new ReviewExtractionField(
+                        field.FieldId,
+                        field.OriginalNormalizedValue),
+                    StringComparer.Ordinal);
+                return new InvoiceReviewSnapshot(
+                    documentId,
+                    state.SourceIdentity,
+                    state.ExtractionRevision,
+                    review.ReviewRevision,
+                    state.StreamVersion,
+                    state.Status,
+                    legacyFields,
+                    review.Fields
+                        .SelectMany(static field => field.Evidence)
+                        .Select(static evidence => evidence.Box.SourceIndex)
+                        .DefaultIfEmpty(-1)
+                        .Max() + 1);
+            }
+            if (draftProjection.ExtractionRevision != state.ExtractionRevision
+                || draftProjection.StreamVersion != state.StreamVersion)
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+
+            if (review is not null
+                && !state.SourceIdentity.Equals(review.SourceIdentity))
+            {
+                throw new VaultRecoveryRequiredException();
+            }
+
+            var fields = review is null
+                ? ImmutableDictionary.Create<string, ReviewExtractionField>(
+                    StringComparer.Ordinal)
+                : review.Fields.ToImmutableDictionary(
+                    field => field.FieldId,
+                    field => new ReviewExtractionField(
+                        field.FieldId,
+                        field.OriginalNormalizedValue),
+                    StringComparer.Ordinal);
+            var sourcePages = draftProjection.Draft.Extraction.SourcePages;
+            return new InvoiceReviewSnapshot(
+                documentId,
+                state.SourceIdentity,
+                state.ExtractionRevision,
+                review?.ReviewRevision ?? 0,
+                state.StreamVersion,
+                state.Status,
+                fields,
+                sourcePages.Length,
+                draftProjection.Draft,
+                sourcePages);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (VaultRecoveryRequiredException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (
+            exception is ProjectionValueRecoveryRequiredException
+                or ExtractionDraftSerializationException
+                or JsonException
+                or DecoderFallbackException
+                or FormatException
+                or InvalidCastException
+                or OverflowException)
+        {
+            throw new VaultRecoveryRequiredException(exception);
+        }
+    }
+
+    private async Task<ProjectedCurrentDraft?> LoadCurrentDraftAsync(
+        DocumentId documentId,
+        CancellationToken cancellationToken)
+    {
+        await using var lease = await _keyRing.MaintenanceGate
+            .AcquireReadAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection =
+            await SqliteEventStoreSchema.OpenConnectionAsync(
+                _connectionString,
+                _keyRing.MaintenanceGate,
+                cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        await ValidateReadBoundaryAsync(
+            connection,
+            transaction,
+            cancellationToken).ConfigureAwait(false);
+        var administrative = SqliteProjectionContexts.CreateAdministrative(
+            connection,
+            transaction,
+            _keyRing,
+            lease,
+            _registration);
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT extraction_revision,current_stream_version,
+                   owner_kind,owner_id,key_id,encryption_version,
+                   payload_nonce,payload_ciphertext,payload_tag
+            FROM product_review_drafts
+            WHERE document_id=$document;
+            """;
+        var logicalKey = ProductEventPayloads.Canonical(documentId.Value);
+        command.Parameters.AddWithValue("$document", logicalKey);
+        await using var reader = await command.ExecuteReaderAsync(
+            cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            await transaction.CommitAsync(cancellationToken)
+                .ConfigureAwait(false);
+            return null;
+        }
+
+        var extractionRevision = reader.GetInt32(0);
+        var streamVersion = reader.GetInt64(1);
+        var owner = ReadOwner(reader, 2, 3);
+        var keyId = new DataKeyId(
+            ProductEventPayloads.GuidValue(reader.GetString(4)));
+        var encrypted = new EncryptedProjectionValue(
+            reader.GetInt32(5),
+            keyId,
+            (byte[])reader.GetValue(6),
+            (byte[])reader.GetValue(7),
+            (byte[])reader.GetValue(8));
+        if (extractionRevision <= 0
+            || streamVersion < 0
+            || await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
             throw new VaultRecoveryRequiredException();
-        return new InvoiceReviewSnapshot(documentId, state.SourceIdentity, state.ExtractionRevision,
-            review.ReviewRevision, state.StreamVersion, state.Status,
-            review.Fields.ToImmutableDictionary(field => field.FieldId,
-                field => new ReviewExtractionField(field.FieldId, field.OriginalNormalizedValue), StringComparer.Ordinal),
-            review.Fields.SelectMany(field => field.Evidence).Select(e => e.Box.SourceIndex).DefaultIfEmpty(-1).Max() + 1);
+        }
+        await reader.DisposeAsync().ConfigureAwait(false);
+        var payload = await administrative.Values.UnprotectAsync(
+            "product_review_drafts",
+            "payload",
+            logicalKey,
+            owner,
+            keyId,
+            encrypted,
+            (plaintext, _) => ValueTask.FromResult(
+                new UTF8Encoding(false, true).GetString(plaintext.Span)),
+            cancellationToken).ConfigureAwait(false);
+        var draft = AuthenticatedExtractionDraftSerializer.Deserialize(payload);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new ProjectedCurrentDraft(
+            extractionRevision,
+            new StreamVersion(streamVersion),
+            draft);
     }
 
     private Task<int> ReadCurrentExtractionRevisionAsync(
@@ -1370,6 +1533,11 @@ public sealed class SqliteProductCommitStore :
     private sealed record ExistingDocument(
         DocumentId DocumentId,
         InboxId InboxId);
+
+    private sealed record ProjectedCurrentDraft(
+        int ExtractionRevision,
+        StreamVersion StreamVersion,
+        AuthenticatedExtractionDraft Draft);
 
     private sealed record ProjectedReviewState(
         ContentSha256 SourceIdentity,

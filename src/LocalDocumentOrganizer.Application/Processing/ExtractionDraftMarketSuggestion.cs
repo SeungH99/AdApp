@@ -1,5 +1,6 @@
 using System.Collections.Frozen;
 using System.Collections.Immutable;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Text.Json;
 using LocalDocumentOrganizer.Application.Contracts;
@@ -38,12 +39,104 @@ public static class AuthenticatedExtractionDraftSerializer
 
         var serialized = JsonSerializer.Serialize(
             new AuthenticatedExtractionDraft(extraction, marketSuggestion.MarketId, isComplete));
-        if (serialized.Length > DocumentExtractionLimits.MaxSerializedResponseBytes)
+        if (Encoding.UTF8.GetByteCount(serialized)
+            > DocumentExtractionLimits.MaxSerializedResponseBytes)
         {
             throw new ExtractionDraftSerializationException();
         }
 
         return serialized;
+    }
+
+    public static AuthenticatedExtractionDraft Deserialize(string serialized)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(serialized);
+        if (Encoding.UTF8.GetByteCount(serialized)
+            > DocumentExtractionLimits.MaxSerializedResponseBytes)
+        {
+            throw new ExtractionDraftSerializationException();
+        }
+
+        AuthenticatedExtractionDraft draft;
+        try
+        {
+            draft = JsonSerializer.Deserialize<AuthenticatedExtractionDraft>(
+                        serialized)
+                    ?? throw new ExtractionDraftSerializationException();
+        }
+        catch (JsonException)
+        {
+            throw new ExtractionDraftSerializationException();
+        }
+
+        if (draft.Extraction is null
+            || draft.SuggestedMarket is { } marketId
+            && !PilotCatalog.MarketIds.Contains(
+                marketId,
+                StringComparer.Ordinal)
+            || !IsValidExtraction(draft.Extraction))
+        {
+            throw new ExtractionDraftSerializationException();
+        }
+
+        return draft;
+    }
+
+    public static bool TryDeserialize(
+        string serialized,
+        out AuthenticatedExtractionDraft? draft)
+    {
+        try
+        {
+            draft = Deserialize(serialized);
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException
+                or ExtractionDraftSerializationException)
+        {
+            draft = null;
+            return false;
+        }
+    }
+
+    private static bool IsValidExtraction(DocumentExtractionResponse extraction)
+    {
+        var firstPage = extraction.SourcePages.IsDefaultOrEmpty
+            ? null
+            : extraction.SourcePages[0];
+        var containerKind =
+            firstPage?.CoordinateSystem == EvidenceCoordinateSystem.PdfPagePoints
+                ? DocumentContainerKind.Pdf
+                : DocumentContainerKind.RasterImage;
+        var requestedCapabilities = extraction.Fragments.IsDefaultOrEmpty
+            ? ExtractionCapability.EmbeddedText | ExtractionCapability.Ocr
+            : extraction.Fragments.Aggregate(
+                (ExtractionCapability)0,
+                static (capabilities, fragment) =>
+                    capabilities | fragment.ExtractionCapability);
+        if (requestedCapabilities == 0)
+        {
+            requestedCapabilities =
+                ExtractionCapability.EmbeddedText | ExtractionCapability.Ocr;
+        }
+
+        var request = new DocumentExtractionRequest(
+            extraction.ProtocolVersion,
+            extraction.JobId,
+            new DocumentSourceDescriptor(
+                1,
+                containerKind,
+                containerKind == DocumentContainerKind.Pdf
+                    ? "application/pdf"
+                    : "image/png",
+                1,
+                [.. new byte[32]]),
+            requestedCapabilities,
+            []);
+        return DocumentExtractionValidator.ValidateResponse(
+            request,
+            extraction).IsValid;
     }
 }
 

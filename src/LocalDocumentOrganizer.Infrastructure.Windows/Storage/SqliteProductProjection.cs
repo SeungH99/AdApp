@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Application.Products;
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
@@ -69,7 +70,7 @@ internal sealed class SqliteProductProjection(
     IProductCommitFaultInjector? faultInjector = null) : ISqliteProjection
 {
     internal const string ProjectionName = "product";
-    internal const int ProjectionSchemaVersion = 7;
+    internal const int ProjectionSchemaVersion = 8;
 
     private const string SchemaSql = """
         CREATE TABLE IF NOT EXISTS product_documents(
@@ -109,6 +110,19 @@ internal sealed class SqliteProductProjection(
             owner_kind INTEGER NOT NULL, owner_id TEXT NOT NULL CHECK(length(owner_id)=36),
             key_id TEXT NOT NULL CHECK(length(key_id)=36), encryption_version INTEGER NOT NULL CHECK(encryption_version=1),
             payload_nonce BLOB NOT NULL CHECK(length(payload_nonce)=12), payload_ciphertext BLOB NOT NULL,
+            payload_tag BLOB NOT NULL CHECK(length(payload_tag)=16)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS product_review_drafts(
+            document_id TEXT PRIMARY KEY CHECK(length(document_id)=36)
+                REFERENCES product_documents(document_id) ON DELETE CASCADE,
+            extraction_revision INTEGER NOT NULL CHECK(extraction_revision>0),
+            current_stream_version INTEGER NOT NULL CHECK(current_stream_version>=0),
+            owner_kind INTEGER NOT NULL,
+            owner_id TEXT NOT NULL CHECK(length(owner_id)=36),
+            key_id TEXT NOT NULL CHECK(length(key_id)=36),
+            encryption_version INTEGER NOT NULL CHECK(encryption_version=1),
+            payload_nonce BLOB NOT NULL CHECK(length(payload_nonce)=12),
+            payload_ciphertext BLOB NOT NULL,
             payload_tag BLOB NOT NULL CHECK(length(payload_tag)=16)
         ) STRICT;
         CREATE TABLE IF NOT EXISTS product_cases(
@@ -166,6 +180,7 @@ internal sealed class SqliteProductProjection(
         new("product_documents"),
         new("product_inbox"),
         new("product_reviews"),
+        new("product_review_drafts"),
         new("product_cases"),
         new("product_today"),
         new("product_outbox"),
@@ -176,6 +191,7 @@ internal sealed class SqliteProductProjection(
         new("product_inbox", "file_name"),
         new("product_inbox", "metadata"),
         new("product_reviews", "payload"),
+        new("product_review_drafts", "payload"),
         new("product_cases", "metadata"),
     ];
 
@@ -505,6 +521,13 @@ internal sealed class SqliteProductProjection(
                     cancellationToken).ConfigureAwait(false);
             if (currentExtractionRevision <= 0)
                 throw new VaultRecoveryRequiredException();
+            await ReplaceCurrentReviewDraftAsync(
+                context,
+                documentId,
+                currentExtractionRevision.Value,
+                replayEvent.Metadata.StreamVersion,
+                payload.AuthenticatedPayload,
+                cancellationToken).ConfigureAwait(false);
         }
         _faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeInbox);
         await using (var update = context.Connection.CreateCommand())
@@ -549,6 +572,74 @@ internal sealed class SqliteProductProjection(
             null,
             null,
             cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task ReplaceCurrentReviewDraftAsync(
+        SqliteProjectionApplyContext context,
+        Guid documentId,
+        int extractionRevision,
+        StreamVersion currentStreamVersion,
+        string authenticatedPayload,
+        CancellationToken cancellationToken)
+    {
+        await using (var delete = context.Connection.CreateCommand())
+        {
+            delete.Transaction = context.Transaction;
+            delete.CommandText =
+                "DELETE FROM product_review_drafts WHERE document_id=$document;";
+            delete.Parameters.AddWithValue(
+                "$document",
+                ProductEventPayloads.Canonical(documentId));
+            await delete.ExecuteNonQueryAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        if (!AuthenticatedExtractionDraftSerializer.TryDeserialize(
+                authenticatedPayload,
+                out _))
+        {
+            // Historical extraction events predate the authenticated draft
+            // contract. They remain replayable, but do not synthesize review
+            // data that was never persisted.
+            return;
+        }
+
+        var logicalKey = ProductEventPayloads.Canonical(documentId);
+        var encrypted = await context.Values.ProtectAsync(
+            "product_review_drafts",
+            "payload",
+            logicalKey,
+            context.Values.BoundOwner,
+            context.Values.BoundDataKeyId,
+            Encoding.UTF8.GetBytes(authenticatedPayload),
+            cancellationToken).ConfigureAwait(false);
+        await using var insert = context.Connection.CreateCommand();
+        insert.Transaction = context.Transaction;
+        insert.CommandText = """
+            INSERT INTO product_review_drafts(
+                document_id,extraction_revision,current_stream_version,
+                owner_kind,owner_id,key_id,encryption_version,
+                payload_nonce,payload_ciphertext,payload_tag)
+            VALUES(
+                $document,$extraction,$stream,
+                $owner_kind,$owner_id,$key_id,$version,
+                $nonce,$ciphertext,$tag);
+            """;
+        insert.Parameters.AddWithValue("$document", logicalKey);
+        insert.Parameters.AddWithValue("$extraction", extractionRevision);
+        insert.Parameters.AddWithValue(
+            "$stream",
+            currentStreamVersion.Value);
+        AddOwnerAndKey(insert, context.Values.BoundOwner, encrypted);
+        insert.Parameters.Add("$nonce", SqliteType.Blob).Value =
+            encrypted.Nonce.ToArray();
+        insert.Parameters.Add("$ciphertext", SqliteType.Blob).Value =
+            encrypted.Ciphertext.ToArray();
+        insert.Parameters.Add("$tag", SqliteType.Blob).Value =
+            encrypted.Tag.ToArray();
+        RequireSingle(
+            await insert.ExecuteNonQueryAsync(cancellationToken)
+                .ConfigureAwait(false));
     }
 
     private async Task ApplyReceivableCaseAsync(
@@ -1022,8 +1113,9 @@ internal sealed class SqliteProductProjection(
             SELECT COUNT(*) FROM sqlite_master
             WHERE type='table'
               AND name IN (
-                'product_documents','product_inbox','product_cases',
-                'product_today','product_outbox');
+                'product_documents','product_inbox','product_reviews',
+                'product_review_drafts','product_cases','product_today',
+                'product_outbox');
             """;
         return Convert.ToInt32(
             await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),

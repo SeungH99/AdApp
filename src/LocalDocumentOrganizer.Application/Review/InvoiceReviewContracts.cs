@@ -1,7 +1,9 @@
 using System.Collections.Immutable;
 using LocalDocumentOrganizer.Application.Contracts;
+using LocalDocumentOrganizer.Application.Processing;
 using LocalDocumentOrganizer.Application.Products;
 using LocalDocumentOrganizer.Core.Cases;
+using LocalDocumentOrganizer.Core.Documents;
 using LocalDocumentOrganizer.Core.Events;
 using LocalDocumentOrganizer.Core.Security;
 
@@ -19,7 +21,9 @@ public sealed record InvoiceReviewSnapshot(
     StreamVersion CurrentStreamVersion,
     ProductInboxStatus InboxStatus,
     ImmutableDictionary<string, ReviewExtractionField> Fields,
-    int SourcePageCount);
+    int SourcePageCount,
+    AuthenticatedExtractionDraft? CurrentDraft = null,
+    ImmutableArray<DocumentSourcePage> SourcePages = default);
 
 public sealed record ReviewEvidence(
     int ExtractionRevision,
