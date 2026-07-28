@@ -15,6 +15,7 @@ public sealed class SqliteProductCommitStore :
     IProductQueryStore
 {
     private const int DuplicateAppendRetryLimit = 16;
+    private const int ImportBusyRetryLimit = 8;
 
     private readonly string _connectionString;
     private readonly VaultKeyRingStore _keyRing;
@@ -80,85 +81,57 @@ public sealed class SqliteProductCommitStore :
         var fingerprint = ProductEventPayloads.ImportFingerprint(command);
         try
         {
-            var receipt = await ReadReceiptAsync(
-                command.OperationId,
-                cancellationToken).ConfigureAwait(false);
-            if (receipt is not null)
+            for (var attempt = 0; attempt < ImportBusyRetryLimit; attempt++)
             {
-                return ReceiptMatches(receipt, fingerprint)
-                    ? receipt.Kind switch
-                    {
-                        "import-committed" when receipt.InboxId is { } inbox =>
-                            new ImportAlreadyCommitted(inbox),
-                        "already-imported" when receipt.InboxId is { } inbox =>
-                            new AlreadyImported(inbox),
-                        _ => new ImportConflict(
-                            ProductConflictKind.OperationIdentityMismatch),
-                    }
-                    : new ImportConflict(
-                        ProductConflictKind.OperationIdentityMismatch);
-            }
-
-            var existing = await FindDocumentByShaAsync(
-                command.ContentSha256,
-                cancellationToken).ConfigureAwait(false);
-            if (existing is not null)
-            {
-                return await CommitDuplicateImportAsync(
+                var result = await CommitImportOnceAsync(
                     command,
-                    existing,
                     fingerprint,
                     cancellationToken).ConfigureAwait(false);
+                if (result is not ProductRecoveryRequired
+                    {
+                        Kind: ProductRecoveryKind.StorageBusy,
+                    })
+                {
+                    return result;
+                }
+
+                ExistingDocument? winner = null;
+                try
+                {
+                    winner = await FindDocumentByShaAsync(
+                        command.ContentSha256,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                catch (SqliteException exception) when (
+                    exception.SqliteErrorCode is 5 or 6)
+                {
+                }
+
+                if (winner is not null)
+                {
+                    var duplicate = await CommitDuplicateImportAsync(
+                        command,
+                        winner,
+                        fingerprint,
+                        cancellationToken).ConfigureAwait(false);
+                    if (duplicate is not ProductRecoveryRequired
+                        {
+                            Kind: ProductRecoveryKind.StorageBusy,
+                        })
+                    {
+                        return duplicate;
+                    }
+                }
+
+                if (attempt + 1 < ImportBusyRetryLimit)
+                {
+                    await DelayBeforeBusyRetryAsync(
+                        attempt,
+                        cancellationToken).ConfigureAwait(false);
+                }
             }
 
-            try
-            {
-                var append = await _events.AppendAsync(
-                    new AppendEventsCommand(
-                        new StreamId(command.DocumentId.Value),
-                        StreamVersion.NoStream,
-                        command.OperationId,
-                        [
-                            new EventToAppend(
-                                command.EventId,
-                                ProductEventContracts.DocumentImported,
-                                ProductEventContracts.SchemaVersion,
-                                ProductEventPayloads.SerializeImport(
-                                    command,
-                                    fingerprint),
-                                DocumentProtection(command.DocumentId)),
-                        ]),
-                    cancellationToken).ConfigureAwait(false);
-                return append switch
-                {
-                    Appended => new ImportCommitted(command.InboxId),
-                    AlreadyApplied => new ImportAlreadyCommitted(command.InboxId),
-                    ConcurrencyConflict => new ImportConflict(
-                        ProductConflictKind.StreamVersionMismatch),
-                    OperationConflict or OperationComparisonUnavailable =>
-                        new ImportConflict(
-                            ProductConflictKind.OperationIdentityMismatch),
-                    StorageBusy => new ProductRecoveryRequired(
-                        ProductRecoveryKind.StorageBusy),
-                    _ => new ProductRecoveryRequired(
-                        ProductRecoveryKind.StorageFailure),
-                };
-            }
-            catch (SqliteException exception) when (
-                exception.SqliteErrorCode == 19)
-            {
-                existing = await FindDocumentByShaAsync(
-                    command.ContentSha256,
-                    cancellationToken).ConfigureAwait(false);
-                return existing is not null
-                    ? await CommitDuplicateImportAsync(
-                        command,
-                        existing,
-                        fingerprint,
-                        cancellationToken).ConfigureAwait(false)
-                    : new ProductRecoveryRequired(
-                        ProductRecoveryKind.StorageFailure);
-            }
+            return new ProductRecoveryRequired(ProductRecoveryKind.StorageBusy);
         }
         catch (OperationCanceledException)
         {
@@ -184,6 +157,93 @@ public sealed class SqliteProductCommitStore :
         }
     }
 
+    private async Task<ImportCommitResult> CommitImportOnceAsync(
+        CommitImportCommand command,
+        byte[] fingerprint,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var append = await _events.AppendAsync(
+                new AppendEventsCommand(
+                    new StreamId(command.DocumentId.Value),
+                    StreamVersion.NoStream,
+                    command.OperationId,
+                    [
+                        new EventToAppend(
+                            command.EventId,
+                            ProductEventContracts.DocumentImported,
+                            ProductEventContracts.SchemaVersion,
+                            ProductEventPayloads.SerializeImport(
+                                command,
+                                fingerprint),
+                            DocumentProtection(command.DocumentId)),
+                    ]),
+                cancellationToken).ConfigureAwait(false);
+            if (append is Appended)
+            {
+                return new ImportCommitted(command.InboxId);
+            }
+
+            if (append is AlreadyApplied)
+            {
+                return new ImportAlreadyCommitted(command.InboxId);
+            }
+
+            if (append is StorageBusy)
+            {
+                return new ProductRecoveryRequired(
+                    ProductRecoveryKind.StorageBusy);
+            }
+
+            if (append is OperationConflict
+                or OperationComparisonUnavailable
+                or ConcurrencyConflict)
+            {
+                var existing = await FindDocumentByShaAsync(
+                    command.ContentSha256,
+                    cancellationToken).ConfigureAwait(false);
+                if (existing is not null)
+                {
+                    return await CommitDuplicateImportAsync(
+                        command,
+                        existing,
+                        fingerprint,
+                        cancellationToken).ConfigureAwait(false);
+                }
+
+                return append is ConcurrencyConflict
+                    ? new ImportConflict(
+                        ProductConflictKind.StreamVersionMismatch)
+                    : new ImportConflict(
+                        ProductConflictKind.OperationIdentityMismatch);
+            }
+
+            return new ProductRecoveryRequired(
+                ProductRecoveryKind.StorageFailure);
+        }
+        catch (SqliteException exception) when (
+            exception.SqliteErrorCode == 19)
+        {
+            var existing = await FindDocumentByShaAsync(
+                command.ContentSha256,
+                cancellationToken).ConfigureAwait(false);
+            return existing is not null
+                ? await CommitDuplicateImportAsync(
+                    command,
+                    existing,
+                    fingerprint,
+                    cancellationToken).ConfigureAwait(false)
+                : new ProductRecoveryRequired(
+                    ProductRecoveryKind.StorageFailure);
+        }
+        catch (SqliteException exception) when (
+            exception.SqliteErrorCode is 5 or 6)
+        {
+            return new ProductRecoveryRequired(ProductRecoveryKind.StorageBusy);
+        }
+    }
+
     public Task<ProductCommitResult> CommitExtractionAsync(
         CommitExtractionCommand command,
         CancellationToken cancellationToken)
@@ -197,7 +257,6 @@ public sealed class SqliteProductCommitStore :
             command.ExpectedVersion,
             ProductEventContracts.ExtractionCommitted,
             ProductEventPayloads.SerializeExtraction(command, fingerprint),
-            fingerprint,
             cancellationToken);
     }
 
@@ -214,7 +273,6 @@ public sealed class SqliteProductCommitStore :
             command.ExpectedVersion,
             ProductEventContracts.ReviewCommitted,
             ProductEventPayloads.SerializeReview(command, fingerprint),
-            fingerprint,
             cancellationToken);
     }
 
@@ -227,32 +285,6 @@ public sealed class SqliteProductCommitStore :
             ProductEventPayloads.ReceivableCaseFingerprint(command);
         try
         {
-            var receipt = await ReadReceiptAsync(
-                command.OperationId,
-                cancellationToken).ConfigureAwait(false);
-            if (receipt is not null)
-            {
-                return ReceiptMatches(receipt, fingerprint)
-                    && string.Equals(
-                        receipt.Kind,
-                        "receivable-case-committed",
-                        StringComparison.Ordinal)
-                    ? new ProductAlreadyCommitted(
-                        new StreamVersion(receipt.StreamVersion))
-                    : new ProductConflict(
-                        ProductConflictKind.OperationIdentityMismatch);
-            }
-
-            var existing = await FindCaseBySourceDocumentAsync(
-                command.SourceDocumentId,
-                cancellationToken).ConfigureAwait(false);
-            if (existing is not null)
-            {
-                return new ProductConflict(
-                    ProductConflictKind.SourceDocumentAlreadyHasCase,
-                    existing.Value);
-            }
-
             try
             {
                 return MapGeneralAppend(
@@ -271,13 +303,12 @@ public sealed class SqliteProductCommitStore :
                                         fingerprint),
                                     CaseProtection(command.CaseId)),
                             ]),
-                        cancellationToken).ConfigureAwait(false),
-                    command.OperationId);
+                        cancellationToken).ConfigureAwait(false));
             }
             catch (SqliteException exception) when (
                 exception.SqliteErrorCode == 19)
             {
-                existing = await FindCaseBySourceDocumentAsync(
+                var existing = await FindCaseBySourceDocumentAsync(
                     command.SourceDocumentId,
                     cancellationToken).ConfigureAwait(false);
                 return existing is not null
@@ -509,23 +540,10 @@ public sealed class SqliteProductCommitStore :
         StreamVersion expectedVersion,
         string eventType,
         byte[] payload,
-        byte[] fingerprint,
         CancellationToken cancellationToken)
     {
         try
         {
-            var receipt = await ReadReceiptAsync(
-                operationId,
-                cancellationToken).ConfigureAwait(false);
-            if (receipt is not null)
-            {
-                return ReceiptMatches(receipt, fingerprint)
-                    ? new ProductAlreadyCommitted(
-                        new StreamVersion(receipt.StreamVersion))
-                    : new ProductConflict(
-                        ProductConflictKind.OperationIdentityMismatch);
-            }
-
             var append = await _events.AppendAsync(
                 new AppendEventsCommand(
                     new StreamId(documentId.Value),
@@ -540,7 +558,7 @@ public sealed class SqliteProductCommitStore :
                             DocumentProtection(documentId)),
                     ]),
                 cancellationToken).ConfigureAwait(false);
-            return MapGeneralAppend(append, operationId);
+            return MapGeneralAppend(append);
         }
         catch (OperationCanceledException)
         {
@@ -560,113 +578,105 @@ public sealed class SqliteProductCommitStore :
     {
         for (var attempt = 0; attempt < DuplicateAppendRetryLimit; attempt++)
         {
-            var receipt = await ReadReceiptAsync(
-                command.OperationId,
-                cancellationToken).ConfigureAwait(false);
-            if (receipt is not null)
+            try
             {
-                return ReceiptMatches(receipt, fingerprint)
-                    && receipt.InboxId is { } inbox
-                    ? new AlreadyImported(inbox)
-                    : new ImportConflict(
-                        ProductConflictKind.OperationIdentityMismatch);
-            }
+                var streamId = new StreamId(existing.DocumentId.Value);
+                var events = await _events.ReadStreamAsync(
+                    streamId,
+                    cancellationToken).ConfigureAwait(false);
+                if (events.Count == 0)
+                {
+                    return new ProductRecoveryRequired(
+                        ProductRecoveryKind.StorageFailure);
+                }
 
-            var events = await _events.ReadStreamAsync(
-                new StreamId(existing.DocumentId.Value),
-                cancellationToken).ConfigureAwait(false);
-            if (events.Count == 0)
+                EventForReplay? committedOperation = null;
+                foreach (var replayEvent in events)
+                {
+                    if (replayEvent.Metadata.OperationId != command.OperationId)
+                    {
+                        continue;
+                    }
+
+                    if (committedOperation is not null)
+                    {
+                        return new ProductRecoveryRequired(
+                            ProductRecoveryKind.StorageFailure);
+                    }
+
+                    committedOperation = replayEvent;
+                }
+
+                StreamVersion expectedVersion;
+                if (committedOperation is not null)
+                {
+                    if (!string.Equals(
+                            committedOperation.Metadata.EventType,
+                            ProductEventContracts.DocumentImportDuplicate,
+                            StringComparison.Ordinal))
+                    {
+                        return new ImportConflict(
+                            ProductConflictKind.OperationIdentityMismatch);
+                    }
+
+                    expectedVersion = new StreamVersion(
+                        checked(
+                            committedOperation.Metadata.StreamVersion.Value
+                            - 1));
+                }
+                else
+                {
+                    expectedVersion = events[^1].Metadata.StreamVersion;
+                }
+
+                var result = await _events.AppendAsync(
+                    new AppendEventsCommand(
+                        streamId,
+                        expectedVersion,
+                        command.OperationId,
+                        [
+                            new EventToAppend(
+                                command.EventId,
+                                ProductEventContracts.DocumentImportDuplicate,
+                                ProductEventContracts.SchemaVersion,
+                                ProductEventPayloads.SerializeDuplicate(
+                                    existing.DocumentId,
+                                    existing.InboxId,
+                                    command.ContentSha256,
+                                    fingerprint),
+                                new PayloadProtection.DurableStructural()),
+                        ]),
+                    cancellationToken).ConfigureAwait(false);
+                switch (result)
+                {
+                    case Appended:
+                    case AlreadyApplied:
+                        return new AlreadyImported(existing.InboxId);
+                    case ConcurrencyConflict:
+                        continue;
+                    case OperationConflict:
+                    case OperationComparisonUnavailable:
+                        return new ImportConflict(
+                            ProductConflictKind.OperationIdentityMismatch);
+                    case StorageBusy:
+                        return new ProductRecoveryRequired(
+                            ProductRecoveryKind.StorageBusy);
+                }
+            }
+            catch (SqliteException exception) when (
+                exception.SqliteErrorCode is 5 or 6)
+            {
+                return new ProductRecoveryRequired(
+                    ProductRecoveryKind.StorageBusy);
+            }
+            catch (OverflowException)
             {
                 return new ProductRecoveryRequired(
                     ProductRecoveryKind.StorageFailure);
             }
-
-            var result = await _events.AppendAsync(
-                new AppendEventsCommand(
-                    new StreamId(existing.DocumentId.Value),
-                    new StreamVersion(events.Count - 1L),
-                    command.OperationId,
-                    [
-                        new EventToAppend(
-                            command.EventId,
-                            ProductEventContracts.DocumentImportDuplicate,
-                            ProductEventContracts.SchemaVersion,
-                            ProductEventPayloads.SerializeDuplicate(
-                                existing.DocumentId,
-                                existing.InboxId,
-                                command.ContentSha256,
-                                fingerprint),
-                            new PayloadProtection.DurableStructural()),
-                    ]),
-                cancellationToken).ConfigureAwait(false);
-            switch (result)
-            {
-                case Appended:
-                case AlreadyApplied:
-                    return new AlreadyImported(existing.InboxId);
-                case ConcurrencyConflict:
-                    continue;
-                case OperationConflict:
-                case OperationComparisonUnavailable:
-                    return new ImportConflict(
-                        ProductConflictKind.OperationIdentityMismatch);
-                case StorageBusy:
-                    return new ProductRecoveryRequired(
-                        ProductRecoveryKind.StorageBusy);
-            }
         }
 
         return new ProductRecoveryRequired(ProductRecoveryKind.StorageBusy);
-    }
-
-    private async Task<OutboxReceipt?> ReadReceiptAsync(
-        OperationId operationId,
-        CancellationToken cancellationToken)
-    {
-        return await ReadStructuralAsync<OutboxReceipt?>(
-            async (connection, transaction, token) =>
-            {
-                await using var command = connection.CreateCommand();
-                command.Transaction = transaction;
-                command.CommandText = """
-                    SELECT commit_kind,inbox_id,commit_fingerprint,stream_version
-                    FROM product_outbox WHERE operation_id=$operation;
-                    """;
-                command.Parameters.AddWithValue(
-                    "$operation",
-                    ProductEventPayloads.Canonical(operationId.Value));
-                await using var reader = await command.ExecuteReaderAsync(token)
-                    .ConfigureAwait(false);
-                if (!await reader.ReadAsync(token).ConfigureAwait(false))
-                {
-                    return null;
-                }
-
-                if (reader.GetValue(0) is not string kind
-                    || reader.GetValue(2) is not byte[] fingerprint
-                    || fingerprint.Length != 32
-                    || reader.GetValue(3) is not long streamVersion
-                    || streamVersion < 0)
-                {
-                    throw new VaultRecoveryRequiredException();
-                }
-
-                InboxId? inbox = reader.IsDBNull(1)
-                    ? null
-                    : new InboxId(
-                        ProductEventPayloads.GuidValue(reader.GetString(1)));
-                if (await reader.ReadAsync(token).ConfigureAwait(false))
-                {
-                    throw new VaultRecoveryRequiredException();
-                }
-
-                return new OutboxReceipt(
-                    kind,
-                    inbox,
-                    fingerprint,
-                    streamVersion);
-            },
-            cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<ExistingDocument?> FindDocumentByShaAsync(
@@ -849,8 +859,7 @@ public sealed class SqliteProductCommitStore :
                 new SensitiveObjectId(caseId.Value)));
 
     private static ProductCommitResult MapGeneralAppend(
-        AppendEventsResult result,
-        OperationId operationId) =>
+        AppendEventsResult result) =>
         result switch
         {
             Appended appended => new ProductCommitted(appended.NewVersion),
@@ -884,20 +893,15 @@ public sealed class SqliteProductCommitStore :
             or ProjectionValueRecoveryRequiredException
             or CryptographicException;
 
-    private static bool ReceiptMatches(
-        OutboxReceipt receipt,
-        ReadOnlySpan<byte> fingerprint) =>
-        CryptographicOperations.FixedTimeEquals(
-            receipt.Fingerprint,
-            fingerprint);
+    private static Task DelayBeforeBusyRetryAsync(
+        int attempt,
+        CancellationToken cancellationToken) =>
+        Task.Delay(
+            TimeSpan.FromMilliseconds(
+                Math.Min(100, checked((attempt + 1) * 25))),
+            cancellationToken);
 
     private sealed record ExistingDocument(
         DocumentId DocumentId,
         InboxId InboxId);
-
-    private sealed record OutboxReceipt(
-        string Kind,
-        InboxId? InboxId,
-        byte[] Fingerprint,
-        long StreamVersion);
 }

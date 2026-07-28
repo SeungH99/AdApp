@@ -15,6 +15,9 @@ internal enum ProductCommitFaultPoint
     BeforeEvent,
     BeforeDocument,
     BeforeInbox,
+    BeforeCase,
+    BeforeToday,
+    BeforeCaseInbox,
     BeforeOutbox,
     BeforeCheckpoint,
 }
@@ -60,7 +63,7 @@ internal sealed class SqliteProductProjection(
     IProductCommitFaultInjector? faultInjector = null) : ISqliteProjection
 {
     internal const string ProjectionName = "product";
-    internal const int ProjectionSchemaVersion = 1;
+    internal const int ProjectionSchemaVersion = 2;
 
     private const string SchemaSql = """
         CREATE TABLE IF NOT EXISTS product_documents(
@@ -121,8 +124,6 @@ internal sealed class SqliteProductProjection(
             commit_kind TEXT NOT NULL,
             aggregate_id TEXT NOT NULL CHECK(length(aggregate_id)=36),
             inbox_id TEXT NULL CHECK(inbox_id IS NULL OR length(inbox_id)=36),
-            commit_fingerprint BLOB NOT NULL CHECK(length(commit_fingerprint)=32),
-            stream_version INTEGER NOT NULL CHECK(stream_version>=0),
             occurred_at_utc TEXT NOT NULL,
             dispatch_status INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_status BETWEEN 0 AND 1)
         ) STRICT;
@@ -163,10 +164,21 @@ internal sealed class SqliteProductProjection(
     {
         var existing = await ExistingTableCountAsync(context, cancellationToken)
             .ConfigureAwait(false);
+        var removedOperationJournalFields =
+            await OutboxHasOperationJournalFieldsAsync(context, cancellationToken)
+                .ConfigureAwait(false);
+        if (removedOperationJournalFields)
+        {
+            await ExecuteAsync(
+                context.Connection,
+                context.Transaction,
+                "DROP TABLE product_outbox;",
+                cancellationToken).ConfigureAwait(false);
+        }
         await ExecuteAsync(context.Connection, context.Transaction, SchemaSql, cancellationToken)
             .ConfigureAwait(false);
         return new ProjectionCompatibilityResult(
-            existing == Tables.Length
+            existing == Tables.Length && !removedOperationJournalFields
                 ? ProjectionCompatibility.Compatible
                 : ProjectionCompatibility.CreatedEmpty);
     }
@@ -225,7 +237,7 @@ internal sealed class SqliteProductProjection(
         var inboxId = ProductEventPayloads.GuidValue(payload.InboxId);
         var receivedAt = ProductEventPayloads.UtcValue(payload.ReceivedAtUtc);
         var sha = ParseSha(payload.ContentSha256);
-        var fingerprint = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
+        _ = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
         RequireOwner(
             context,
             SensitiveObjectKind.DocumentEvidence,
@@ -300,7 +312,6 @@ internal sealed class SqliteProductProjection(
             "import-committed",
             documentId,
             new InboxId(inboxId),
-            fingerprint,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -314,7 +325,7 @@ internal sealed class SqliteProductProjection(
         var documentId = ProductEventPayloads.GuidValue(payload.ExistingDocumentId);
         var inboxId = ProductEventPayloads.GuidValue(payload.ExistingInboxId);
         _ = ParseSha(payload.ContentSha256);
-        var fingerprint = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
+        _ = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
         _faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeOutbox);
         await InsertOutboxAsync(
             replayEvent,
@@ -322,7 +333,6 @@ internal sealed class SqliteProductProjection(
             "already-imported",
             documentId,
             new InboxId(inboxId),
-            fingerprint,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -365,7 +375,6 @@ internal sealed class SqliteProductProjection(
             kind,
             documentId,
             inboxId,
-            ProductEventPayloads.FingerprintValue(payload.CommitFingerprint),
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -380,7 +389,7 @@ internal sealed class SqliteProductProjection(
         var documentId = ProductEventPayloads.GuidValue(payload.SourceDocumentId);
         var dueDate = ProductEventPayloads.DateValue(payload.DueDate);
         var createdAt = ProductEventPayloads.UtcValue(payload.CreatedAtUtc);
-        var fingerprint = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
+        _ = ProductEventPayloads.FingerprintValue(payload.CommitFingerprint);
         RequireOwner(context, SensitiveObjectKind.Case, caseId);
         var logicalKey = ProductEventPayloads.Canonical(caseId);
         var metadata = await context.Values.ProtectAsync(
@@ -392,6 +401,7 @@ internal sealed class SqliteProductProjection(
             Encoding.UTF8.GetBytes(payload.AuthenticatedMetadata),
             cancellationToken).ConfigureAwait(false);
 
+        _faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeCase);
         await using (var receivableCase = context.Connection.CreateCommand())
         {
             receivableCase.Transaction = context.Transaction;
@@ -430,6 +440,7 @@ internal sealed class SqliteProductProjection(
                     .ConfigureAwait(false));
         }
 
+        _faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeToday);
         await using (var today = context.Connection.CreateCommand())
         {
             today.Transaction = context.Transaction;
@@ -448,6 +459,7 @@ internal sealed class SqliteProductProjection(
             RequireSingle(await today.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false));
         }
 
+        _faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeCaseInbox);
         await using (var inbox = context.Connection.CreateCommand())
         {
             inbox.Transaction = context.Transaction;
@@ -473,7 +485,6 @@ internal sealed class SqliteProductProjection(
             "receivable-case-committed",
             caseId,
             inboxId,
-            fingerprint,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -547,7 +558,7 @@ internal sealed class SqliteProductProjection(
             context.Transaction,
             """
             SELECT operation_id,event_id,commit_kind,aggregate_id,COALESCE(inbox_id,''),
-                   hex(commit_fingerprint),stream_version,occurred_at_utc,dispatch_status
+                   occurred_at_utc,dispatch_status
             FROM product_outbox ORDER BY operation_id COLLATE BINARY;
             """,
             hash,
@@ -759,13 +770,30 @@ internal sealed class SqliteProductProjection(
             CultureInfo.InvariantCulture);
     }
 
+    private static async Task<bool> OutboxHasOperationJournalFieldsAsync(
+        SqliteProjectionAdministrativeContext context,
+        CancellationToken cancellationToken)
+    {
+        await using var command = context.Connection.CreateCommand();
+        command.Transaction = context.Transaction;
+        command.CommandText = """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type='table' AND name='product_outbox';
+            """;
+        var schema = await command.ExecuteScalarAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return schema is string sql
+            && (sql.Contains("commit_fingerprint", StringComparison.OrdinalIgnoreCase)
+                || sql.Contains("stream_version", StringComparison.OrdinalIgnoreCase));
+    }
+
     private static async Task InsertOutboxAsync(
         DecryptedEvent replayEvent,
         SqliteProjectionApplyContext context,
         string kind,
         Guid aggregateId,
         InboxId? inboxId,
-        byte[] fingerprint,
         CancellationToken cancellationToken)
     {
         await using var outbox = context.Connection.CreateCommand();
@@ -773,10 +801,10 @@ internal sealed class SqliteProductProjection(
         outbox.CommandText = """
             INSERT INTO product_outbox(
                 operation_id,event_id,commit_kind,aggregate_id,inbox_id,
-                commit_fingerprint,stream_version,occurred_at_utc,dispatch_status)
+                occurred_at_utc,dispatch_status)
             VALUES(
                 $operation,$event,$kind,$aggregate,$inbox,
-                $fingerprint,$stream_version,$occurred,0);
+                $occurred,0);
             """;
         outbox.Parameters.AddWithValue(
             "$operation",
@@ -792,10 +820,6 @@ internal sealed class SqliteProductProjection(
             inboxId is { } present
                 ? ProductEventPayloads.Canonical(present.Value)
                 : DBNull.Value;
-        outbox.Parameters.Add("$fingerprint", SqliteType.Blob).Value = fingerprint;
-        outbox.Parameters.AddWithValue(
-            "$stream_version",
-            replayEvent.Metadata.StreamVersion.Value);
         outbox.Parameters.AddWithValue(
             "$occurred",
             ProductEventPayloads.Utc(replayEvent.Metadata.RecordedAtUtc));

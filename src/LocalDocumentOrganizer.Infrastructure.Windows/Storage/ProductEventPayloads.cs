@@ -140,6 +140,7 @@ internal static class ProductEventPayloads
     internal static byte[] ImportFingerprint(CommitImportCommand command)
     {
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        Add(hash, "product.commit.import.v1");
         Add(hash, command.OperationId.Value);
         Add(hash, command.EventId.Value);
         Add(hash, command.DocumentId.Value);
@@ -154,6 +155,7 @@ internal static class ProductEventPayloads
     internal static byte[] ExtractionFingerprint(CommitExtractionCommand command)
     {
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        Add(hash, "product.commit.extraction.v1");
         Add(hash, command.OperationId.Value);
         Add(hash, command.EventId.Value);
         Add(hash, command.DocumentId.Value);
@@ -166,6 +168,7 @@ internal static class ProductEventPayloads
     internal static byte[] ReviewFingerprint(CommitReviewCommand command)
     {
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        Add(hash, "product.commit.review.v1");
         Add(hash, command.OperationId.Value);
         Add(hash, command.EventId.Value);
         Add(hash, command.DocumentId.Value);
@@ -178,6 +181,7 @@ internal static class ProductEventPayloads
     internal static byte[] ReceivableCaseFingerprint(CommitReceivableCaseCommand command)
     {
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        Add(hash, "product.commit.receivable-case.v1");
         Add(hash, command.OperationId.Value);
         Add(hash, command.EventId.Value);
         Add(hash, command.CaseId.Value);
