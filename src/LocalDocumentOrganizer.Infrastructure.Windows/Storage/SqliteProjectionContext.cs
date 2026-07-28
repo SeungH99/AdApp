@@ -69,7 +69,7 @@ internal sealed class SqliteProjectionApplyContext
 
     public IProjectionApplyValues Values { get; }
 
-    public ProjectionApplyMode Mode { get; }
+    internal ProjectionApplyMode Mode { get; }
 }
 
 internal enum ProjectionApplyMode
