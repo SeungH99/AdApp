@@ -239,6 +239,8 @@ public sealed record CommitImportCommand
 
 public sealed record CommitExtractionCommand
 {
+    public const int CurrentDraftFormatVersion = 1;
+
     public CommitExtractionCommand(
         OperationId operationId,
         EventId eventId,
@@ -247,7 +249,8 @@ public sealed record CommitExtractionCommand
         DateTimeOffset extractedAtUtc,
         string authenticatedExtraction,
         ProductInboxStatus inboxStatus = ProductInboxStatus.ReadyForReview,
-        ExtractionClaimBinding? claimBinding = null)
+        ExtractionClaimBinding? claimBinding = null,
+        int? extractionDraftFormatVersion = CurrentDraftFormatVersion)
     {
         CommitImportCommand.ValidateOperation(operationId, eventId);
         CommitImportCommand.ValidateDocument(documentId);
@@ -262,6 +265,12 @@ public sealed record CommitExtractionCommand
         {
             throw new ArgumentOutOfRangeException(nameof(inboxStatus));
         }
+        if (extractionDraftFormatVersion is not (
+                null or CurrentDraftFormatVersion))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(extractionDraftFormatVersion));
+        }
         OperationId = operationId;
         EventId = eventId;
         DocumentId = documentId;
@@ -270,6 +279,7 @@ public sealed record CommitExtractionCommand
         AuthenticatedExtraction = authenticatedExtraction;
         InboxStatus = inboxStatus;
         ClaimBinding = claimBinding;
+        ExtractionDraftFormatVersion = extractionDraftFormatVersion;
     }
 
     public OperationId OperationId { get; }
@@ -287,6 +297,8 @@ public sealed record CommitExtractionCommand
     public ProductInboxStatus InboxStatus { get; }
 
     public ExtractionClaimBinding? ClaimBinding { get; }
+
+    public int? ExtractionDraftFormatVersion { get; }
 }
 
 public sealed record ExtractionClaimBinding(

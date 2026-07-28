@@ -959,34 +959,7 @@ public sealed class SqliteProductCommitStore :
                 .ConfigureAwait(false);
             if (draftProjection is null)
             {
-                if (review is null)
-                {
-                    return null;
-                }
-                if (!state.SourceIdentity.Equals(review.SourceIdentity))
-                {
-                    throw new VaultRecoveryRequiredException();
-                }
-
-                var legacyFields = review.Fields.ToImmutableDictionary(
-                    field => field.FieldId,
-                    field => new ReviewExtractionField(
-                        field.FieldId,
-                        field.OriginalNormalizedValue),
-                    StringComparer.Ordinal);
-                return new InvoiceReviewSnapshot(
-                    documentId,
-                    state.SourceIdentity,
-                    state.ExtractionRevision,
-                    review.ReviewRevision,
-                    state.StreamVersion,
-                    state.Status,
-                    legacyFields,
-                    review.Fields
-                        .SelectMany(static field => field.Evidence)
-                        .Select(static evidence => evidence.Box.SourceIndex)
-                        .DefaultIfEmpty(-1)
-                        .Max() + 1);
+                return null;
             }
             if (draftProjection.ExtractionRevision != state.ExtractionRevision
                 || draftProjection.StreamVersion != state.StreamVersion)

@@ -570,6 +570,7 @@ internal sealed class SqliteProductProjection(
                 currentExtractionRevision.Value,
                 replayEvent.Metadata.StreamVersion,
                 payload.AuthenticatedPayload,
+                payload.ExtractionDraftFormatVersion,
                 cancellationToken).ConfigureAwait(false);
         }
         _faults.ThrowIfRequested(ProductCommitFaultPoint.BeforeInbox);
@@ -641,6 +642,7 @@ internal sealed class SqliteProductProjection(
         int extractionRevision,
         StreamVersion currentStreamVersion,
         string authenticatedPayload,
+        int? extractionDraftFormatVersion,
         CancellationToken cancellationToken)
     {
         await using (var delete = context.Connection.CreateCommand())
@@ -655,14 +657,29 @@ internal sealed class SqliteProductProjection(
                 .ConfigureAwait(false);
         }
 
-        if (!AuthenticatedExtractionDraftSerializer.TryDeserialize(
-                authenticatedPayload,
-                out _))
+        if (extractionDraftFormatVersion is null)
         {
             // Historical extraction events predate the authenticated draft
             // contract. They remain replayable, but do not synthesize review
             // data that was never persisted.
             return;
+        }
+        if (extractionDraftFormatVersion
+                != CommitExtractionCommand.CurrentDraftFormatVersion)
+        {
+            throw new VaultRecoveryRequiredException();
+        }
+
+        try
+        {
+            _ = AuthenticatedExtractionDraftSerializer.Deserialize(
+                authenticatedPayload);
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException
+                or ExtractionDraftSerializationException)
+        {
+            throw new VaultRecoveryRequiredException(exception);
         }
 
         var logicalKey = ProductEventPayloads.Canonical(documentId);

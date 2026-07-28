@@ -63,7 +63,8 @@ internal sealed record ProductDocumentProgressPayload(
     string? ClaimLeaseExpiresAtUtc,
     int? ExpectedExtractionRevision,
     int? ReviewRevision,
-    string CommitFingerprint);
+    string CommitFingerprint,
+    int? ExtractionDraftFormatVersion = null);
 
 internal sealed record ProductReceivableCasePayload(
     string CaseId,
@@ -125,7 +126,8 @@ internal static class ProductEventPayloads
                 command.ClaimBinding is { } claim ? Utc(claim.LeaseExpiresAtUtc) : null,
                 null,
                 null,
-                Convert.ToHexString(fingerprint).ToLowerInvariant()));
+                Convert.ToHexString(fingerprint).ToLowerInvariant(),
+                command.ExtractionDraftFormatVersion));
 
     internal static byte[] SerializeReview(
         CommitReviewCommand command,
@@ -215,6 +217,7 @@ internal static class ProductEventPayloads
         Add(hash, Utc(command.ExtractedAtUtc));
         Add(hash, command.AuthenticatedExtraction);
         Add(hash, (int)command.InboxStatus);
+        Add(hash, command.ExtractionDraftFormatVersion ?? 0);
         return hash.GetHashAndReset();
     }
 
